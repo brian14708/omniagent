@@ -1,0 +1,17 @@
+[package]
+name = "oad-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+oad-core.workspace = true
+serde.workspace = true
+utoipa.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

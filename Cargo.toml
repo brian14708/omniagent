@@ -1,0 +1,57 @@
+[workspace]
+members = [
+    "crates/oad",
+    "crates/oad-api",
+    "crates/oad-cli",
+    "crates/oad-core",
+    "crates/oad-oci",
+    "crates/oad-runtime",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1.7"
+clap = { version = "4.5", features = ["derive", "env"] }
+flate2 = "1.0"
+futures-util = "0.3"
+hex = "0.4"
+http = "1.1"
+libc = "0.2"
+oad-api = { path = "crates/oad-api" }
+oad-core = { path = "crates/oad-core" }
+oad-oci = { path = "crates/oad-oci" }
+oad-runtime = { path = "crates/oad-runtime" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rustix = { version = "1.1", features = ["process"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3.12"
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "macros", "serde"] }
+tokio = { version = "1.40", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2.5"
+utoipa = { version = "5.5", features = ["axum_extras", "time"] }
+uuid = { version = "1.10", features = ["serde", "v4"] }
+
+[workspace.lints.rust]
+warnings = "deny"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
