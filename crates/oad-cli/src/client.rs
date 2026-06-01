@@ -5,8 +5,10 @@
 
 use anyhow::{Context, Result, anyhow};
 use oad_api::{
+    BackgroundExecResponse, BackgroundExecStdinRequest, BackgroundExecStdinResponse,
     CreateSandboxRequest, CreateSnapshotRequest, ErrorResponse, ExecRequest, ExecResponse,
-    ListSandboxesResponse, ListSnapshotsResponse, LogsResponse, SandboxResponse, SnapshotResponse,
+    ListBackgroundExecsResponse, ListSandboxesResponse, ListSnapshotsResponse, LogsResponse,
+    SandboxResponse, SnapshotResponse, StartBackgroundExecRequest,
 };
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
@@ -149,6 +151,89 @@ impl OadClient {
             )
             .await?;
         Self::read_json(resp).await
+    }
+
+    /// `POST /v1/sandboxes/{id}/execs` — start a background exec session.
+    pub async fn start_exec(
+        &self,
+        id: &str,
+        request: &StartBackgroundExecRequest,
+    ) -> Result<BackgroundExecResponse> {
+        let resp = self
+            .send(
+                self.http
+                    .post(self.url(&format!("/v1/sandboxes/{id}/execs")))
+                    .json(request),
+            )
+            .await?;
+        Self::read_json(resp).await
+    }
+
+    /// `GET /v1/sandboxes/{id}/execs` — list background exec sessions.
+    pub async fn list_execs(&self, id: &str) -> Result<ListBackgroundExecsResponse> {
+        let resp = self
+            .send(
+                self.http
+                    .get(self.url(&format!("/v1/sandboxes/{id}/execs"))),
+            )
+            .await?;
+        Self::read_json(resp).await
+    }
+
+    /// `GET /v1/sandboxes/{id}/execs/{exec_id}` — get session metadata.
+    pub async fn get_exec(&self, id: &str, exec_id: &str) -> Result<BackgroundExecResponse> {
+        let resp = self
+            .send(
+                self.http
+                    .get(self.url(&format!("/v1/sandboxes/{id}/execs/{exec_id}"))),
+            )
+            .await?;
+        Self::read_json(resp).await
+    }
+
+    /// `DELETE /v1/sandboxes/{id}/execs/{exec_id}` — request session kill.
+    pub async fn kill_exec(&self, id: &str, exec_id: &str) -> Result<BackgroundExecResponse> {
+        let resp = self
+            .send(
+                self.http
+                    .delete(self.url(&format!("/v1/sandboxes/{id}/execs/{exec_id}"))),
+            )
+            .await?;
+        Self::read_json(resp).await
+    }
+
+    /// `POST /v1/sandboxes/{id}/execs/{exec_id}/stdin` — write attached stdin.
+    pub async fn write_exec_stdin(
+        &self,
+        id: &str,
+        exec_id: &str,
+        request: &BackgroundExecStdinRequest,
+    ) -> Result<BackgroundExecStdinResponse> {
+        let resp = self
+            .send(
+                self.http
+                    .post(self.url(&format!("/v1/sandboxes/{id}/execs/{exec_id}/stdin")))
+                    .json(request),
+            )
+            .await?;
+        Self::read_json(resp).await
+    }
+
+    /// `GET /v1/sandboxes/{id}/execs/{exec_id}/events` — open the SSE stream.
+    pub async fn exec_events(&self, id: &str, exec_id: &str, from: u64) -> Result<Response> {
+        let resp = self
+            .send(
+                self.http
+                    .get(self.url(&format!("/v1/sandboxes/{id}/execs/{exec_id}/events")))
+                    .query(&[("from", from.to_string())]),
+            )
+            .await?;
+        if resp.status().is_success() {
+            return Ok(resp);
+        }
+        let status = resp.status();
+        let bytes = resp.bytes().await.context("failed to read response body")?;
+        Err(Self::decode_error(status, &bytes))
     }
 
     /// `POST /v1/sandboxes/{id}/suspend` — checkpoint and tear down a sandbox.

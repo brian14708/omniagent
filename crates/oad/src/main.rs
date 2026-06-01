@@ -1,25 +1,34 @@
+mod background_exec;
 mod config;
 mod registry;
 mod snapshots;
 
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::error::Error as StdError;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use background_exec::BackgroundExecStore;
+use futures_util::{StreamExt, stream};
 use oad_api::{
+    BackgroundExecEvent, BackgroundExecEventKind, BackgroundExecInfo, BackgroundExecResponse,
+    BackgroundExecStatus, BackgroundExecStdinRequest, BackgroundExecStdinResponse,
     CreateSandboxRequest, CreateSnapshotRequest, ErrorBody, ErrorResponse, ExecRequest,
-    ExecResponse, ListSandboxesResponse, ListSnapshotsResponse, LogsQuery, LogsResponse,
-    SandboxResponse, SnapshotInfo, SnapshotResponse,
+    ExecResponse, ListBackgroundExecsResponse, ListSandboxesResponse, ListSnapshotsResponse,
+    LogsQuery, LogsResponse, SandboxResponse, SnapshotInfo, SnapshotResponse,
+    StartBackgroundExecRequest,
 };
 use oad_core::{
     ContainerSpec, EnvVar, OadPaths, PAUSE_CONTAINER, SandboxId, SandboxRecord, SandboxSpec,
@@ -27,8 +36,9 @@ use oad_core::{
 };
 use oad_oci::GvisorManager;
 use oad_runtime::{
-    RestoreSpecValidation, checkpoint_image_complete, checkpoint_sandbox, copy_checkpoint_image,
-    delete_visible_container_sequence, restore_sandbox, snapshot_sandbox, start_container_sequence,
+    RestoreSpecValidation, checkpoint_image_complete_for_containers, checkpoint_sandbox,
+    copy_checkpoint_image, delete_visible_container_sequence, restore_sandbox, snapshot_sandbox,
+    start_container_sequence,
 };
 use registry::{NamedLocks, SandboxRegistry};
 use thiserror::Error;
@@ -47,9 +57,11 @@ struct AppState {
     registry: SandboxRegistry,
     snapshot_locks: NamedLocks,
     gvisor: GvisorManager,
+    background_execs: BackgroundExecStore,
 }
 
 const LOG_TAIL_READ_BYTES: u64 = 8 * 1024 * 1024;
+const BACKGROUND_EXEC_KILL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -73,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
         registry,
         snapshot_locks: NamedLocks::default(),
         gvisor,
+        background_execs: BackgroundExecStore::default(),
     };
 
     let shutdown_state = state.clone();
@@ -126,8 +139,11 @@ async fn reconcile_sandboxes(registry: &SandboxRegistry, paths: &OadPaths) {
         ) {
             continue;
         }
-        let checkpoint_available =
-            checkpoint_image_complete(&paths.checkpoint_dir(&record.id)).await;
+        let checkpoint_available = checkpoint_image_complete_for_containers(
+            &paths.checkpoint_dir(&record.id),
+            &record.containers,
+        )
+        .await;
         let (mut status, mut last_error) = match oad_runtime::container_running_result(
             paths,
             &record.id,
@@ -217,6 +233,22 @@ fn router(state: AppState) -> Router {
         )
         .route("/v1/sandboxes/{id}/logs", get(get_logs))
         .route("/v1/sandboxes/{id}/exec", post(exec_in_sandbox))
+        .route(
+            "/v1/sandboxes/{id}/execs",
+            post(start_background_exec).get(list_background_execs),
+        )
+        .route(
+            "/v1/sandboxes/{id}/execs/{exec_id}",
+            get(get_background_exec).delete(kill_background_exec),
+        )
+        .route(
+            "/v1/sandboxes/{id}/execs/{exec_id}/stdin",
+            post(write_background_exec_stdin),
+        )
+        .route(
+            "/v1/sandboxes/{id}/execs/{exec_id}/events",
+            get(stream_background_exec_events),
+        )
         .route("/v1/sandboxes/{id}/suspend", post(suspend_sandbox))
         .route("/v1/sandboxes/{id}/resume", post(resume_sandbox))
         .route(
@@ -257,6 +289,12 @@ fn router(state: AppState) -> Router {
         delete_sandbox,
         get_logs,
         exec_in_sandbox,
+        start_background_exec,
+        list_background_execs,
+        get_background_exec,
+        kill_background_exec,
+        write_background_exec_stdin,
+        stream_background_exec_events,
         suspend_sandbox,
         resume_sandbox,
         snapshot_sandbox_handler,
@@ -270,6 +308,15 @@ fn router(state: AppState) -> Router {
         LogsResponse,
         ExecRequest,
         ExecResponse,
+        StartBackgroundExecRequest,
+        BackgroundExecStatus,
+        BackgroundExecInfo,
+        BackgroundExecResponse,
+        ListBackgroundExecsResponse,
+        BackgroundExecStdinRequest,
+        BackgroundExecStdinResponse,
+        BackgroundExecEvent,
+        BackgroundExecEventKind,
         ErrorResponse,
         ErrorBody,
         SandboxRecord,
@@ -750,6 +797,7 @@ async fn delete_sandbox(
         .get(&id)
         .await
         .ok_or_else(|| AppError::NotFound(format!("sandbox {id} not found")))?;
+    state.background_execs.kill_for_sandbox(id.as_str()).await;
 
     state
         .registry
@@ -920,6 +968,13 @@ async fn resolve_running_container(
     Ok(container)
 }
 
+/// Render exec environment variables as `KEY=VALUE` strings for the runtime.
+fn render_env(env: &[EnvVar]) -> Vec<String> {
+    env.iter()
+        .map(|var| format!("{}={}", var.name, var.value))
+        .collect()
+}
+
 /// Run a one-off command inside a running container and return its output.
 #[utoipa::path(
     post,
@@ -958,11 +1013,7 @@ async fn exec_in_sandbox(
     let container =
         resolve_running_container(&state, &record, &id, request.container.clone()).await?;
 
-    let env: Vec<String> = request
-        .env
-        .iter()
-        .map(|var| format!("{}={}", var.name, var.value))
-        .collect();
+    let env = render_env(&request.env);
     let output = oad_runtime::exec_in_container(
         &state.paths,
         &id,
@@ -980,6 +1031,319 @@ async fn exec_in_sandbox(
         stdout: output.stdout,
         stderr: output.stderr,
     }))
+}
+
+/// Start a long-running command inside a container and keep its streams
+/// attached to the daemon for later control.
+#[utoipa::path(
+    post,
+    path = "/v1/sandboxes/{id}/execs",
+    params(("id" = String, Path, description = "Sandbox id")),
+    request_body = StartBackgroundExecRequest,
+    responses(
+        (status = 201, description = "Background exec started", body = BackgroundExecResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Sandbox or container not found", body = ErrorResponse),
+        (status = 409, description = "Sandbox or container is not running", body = ErrorResponse),
+        (status = 500, description = "Failed to start background exec", body = ErrorResponse),
+    ),
+    security(("bearer_token" = [])),
+    tag = "sandboxes",
+)]
+async fn start_background_exec(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<StartBackgroundExecRequest>,
+) -> Result<(StatusCode, Json<BackgroundExecResponse>), AppError> {
+    let id = parse_sandbox_id(id)?;
+    if request.command.is_empty() {
+        return Err(AppError::BadRequest(
+            "command must not be empty".to_string(),
+        ));
+    }
+    let _guard = state.registry.acquire_lifecycle(&id).await;
+    let record = state
+        .registry
+        .get(&id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("sandbox {id} not found")))?;
+    let record = ensure_running(&state, &id, record).await?;
+    let container =
+        resolve_running_container(&state, &record, &id, request.container.clone()).await?;
+
+    let env = render_env(&request.env);
+    let exec_id = uuid::Uuid::new_v4().to_string();
+    let log_path = state
+        .paths
+        .logs_dir(&id)
+        .join(format!("exec-{exec_id}.jsonl"));
+    let process = oad_runtime::spawn_exec_in_container(
+        &state.paths,
+        &id,
+        &container,
+        &request.command,
+        &env,
+        request.cwd.as_deref(),
+        Some(&log_path),
+    )
+    .await?;
+    let info = BackgroundExecInfo {
+        id: exec_id,
+        sandbox_id: id.to_string(),
+        container,
+        command: request.command,
+        status: BackgroundExecStatus::Running,
+        exit_code: None,
+        last_error: None,
+    };
+    let session = state.background_execs.insert(info, process).await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(BackgroundExecResponse {
+            exec: session.info().await,
+        }),
+    ))
+}
+
+/// List background exec sessions for a sandbox.
+#[utoipa::path(
+    get,
+    path = "/v1/sandboxes/{id}/execs",
+    params(("id" = String, Path, description = "Sandbox id")),
+    responses(
+        (status = 200, description = "Known background exec sessions", body = ListBackgroundExecsResponse),
+        (status = 400, description = "Invalid sandbox id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Sandbox not found", body = ErrorResponse),
+    ),
+    security(("bearer_token" = [])),
+    tag = "sandboxes",
+)]
+async fn list_background_execs(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ListBackgroundExecsResponse>, AppError> {
+    let id = parse_sandbox_id(id)?;
+    if !state.registry.contains(&id).await {
+        return Err(AppError::NotFound(format!("sandbox {id} not found")));
+    }
+    Ok(Json(ListBackgroundExecsResponse {
+        execs: state.background_execs.list_for_sandbox(id.as_str()).await,
+    }))
+}
+
+/// Fetch a single background exec session.
+#[utoipa::path(
+    get,
+    path = "/v1/sandboxes/{id}/execs/{exec_id}",
+    params(
+        ("id" = String, Path, description = "Sandbox id"),
+        ("exec_id" = String, Path, description = "Background exec session id"),
+    ),
+    responses(
+        (status = 200, description = "Background exec session", body = BackgroundExecResponse),
+        (status = 400, description = "Invalid sandbox id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Sandbox or background exec not found", body = ErrorResponse),
+    ),
+    security(("bearer_token" = [])),
+    tag = "sandboxes",
+)]
+async fn get_background_exec(
+    State(state): State<AppState>,
+    AxumPath((id, exec_id)): AxumPath<(String, String)>,
+) -> Result<Json<BackgroundExecResponse>, AppError> {
+    let id = parse_sandbox_id(id)?;
+    let session = background_exec_session(&state, &id, &exec_id).await?;
+    Ok(Json(BackgroundExecResponse {
+        exec: session.info().await,
+    }))
+}
+
+/// Kill a running background exec session.
+#[utoipa::path(
+    delete,
+    path = "/v1/sandboxes/{id}/execs/{exec_id}",
+    params(
+        ("id" = String, Path, description = "Sandbox id"),
+        ("exec_id" = String, Path, description = "Background exec session id"),
+    ),
+    responses(
+        (status = 200, description = "Background exec kill requested", body = BackgroundExecResponse),
+        (status = 400, description = "Invalid sandbox id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Sandbox or background exec not found", body = ErrorResponse),
+    ),
+    security(("bearer_token" = [])),
+    tag = "sandboxes",
+)]
+async fn kill_background_exec(
+    State(state): State<AppState>,
+    AxumPath((id, exec_id)): AxumPath<(String, String)>,
+) -> Result<Json<BackgroundExecResponse>, AppError> {
+    let id = parse_sandbox_id(id)?;
+    let session = background_exec_session(&state, &id, &exec_id).await?;
+    if session.kill().await {
+        let _ = tokio::time::timeout(
+            BACKGROUND_EXEC_KILL_RESPONSE_TIMEOUT,
+            session.wait_finished(),
+        )
+        .await;
+    }
+    Ok(Json(BackgroundExecResponse {
+        exec: session.info().await,
+    }))
+}
+
+/// Write bytes to a background exec session's stdin.
+#[utoipa::path(
+    post,
+    path = "/v1/sandboxes/{id}/execs/{exec_id}/stdin",
+    params(
+        ("id" = String, Path, description = "Sandbox id"),
+        ("exec_id" = String, Path, description = "Background exec session id"),
+    ),
+    request_body = BackgroundExecStdinRequest,
+    responses(
+        (status = 200, description = "Stdin write accepted", body = BackgroundExecStdinResponse),
+        (status = 400, description = "Invalid sandbox id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Sandbox or background exec not found", body = ErrorResponse),
+        (status = 409, description = "Background exec stdin is closed", body = ErrorResponse),
+        (status = 500, description = "Failed to write stdin", body = ErrorResponse),
+    ),
+    security(("bearer_token" = [])),
+    tag = "sandboxes",
+)]
+async fn write_background_exec_stdin(
+    State(state): State<AppState>,
+    AxumPath((id, exec_id)): AxumPath<(String, String)>,
+    Json(request): Json<BackgroundExecStdinRequest>,
+) -> Result<Json<BackgroundExecStdinResponse>, AppError> {
+    let id = parse_sandbox_id(id)?;
+    if request.data.is_empty() && !request.close {
+        return Err(AppError::BadRequest(
+            "stdin request must include data or close=true".to_string(),
+        ));
+    }
+    let session = background_exec_session(&state, &id, &exec_id).await?;
+    let accepted = session
+        .write_stdin(&request.data, request.close)
+        .await
+        .map_err(AppError::Io)?;
+    if !accepted {
+        return Err(AppError::Conflict(format!(
+            "stdin for background exec {exec_id} is closed"
+        )));
+    }
+    Ok(Json(BackgroundExecStdinResponse { accepted }))
+}
+
+/// Stream background exec session events as Server-Sent Events.
+#[utoipa::path(
+    get,
+    path = "/v1/sandboxes/{id}/execs/{exec_id}/events",
+    params(
+        ("id" = String, Path, description = "Sandbox id"),
+        ("exec_id" = String, Path, description = "Background exec session id"),
+        BackgroundExecEventsQuery,
+    ),
+    responses(
+        (status = 200, description = "SSE stream of background exec events"),
+        (status = 400, description = "Invalid sandbox id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Sandbox or background exec not found", body = ErrorResponse),
+    ),
+    security(("bearer_token" = [])),
+    tag = "sandboxes",
+)]
+async fn stream_background_exec_events(
+    State(state): State<AppState>,
+    AxumPath((id, exec_id)): AxumPath<(String, String)>,
+    Query(query): Query<BackgroundExecEventsQuery>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let id = parse_sandbox_id(id)?;
+    let session = background_exec_session(&state, &id, &exec_id).await?;
+    let from = query.from.unwrap_or(1);
+    let receiver = session.subscribe();
+    let replay = session.events_since(from).await;
+    let replay_terminal = replay.last().is_some_and(|event| event.event.is_terminal());
+    let next_live_sequence = replay
+        .last()
+        .map_or(from, |event| event.sequence.saturating_add(1));
+    let live = if replay_terminal {
+        stream::empty::<BackgroundExecEvent>().left_stream()
+    } else {
+        stream::unfold(
+            (receiver, next_live_sequence, false),
+            |(mut receiver, next_sequence, done)| async move {
+                if done {
+                    return None;
+                }
+                loop {
+                    match receiver.recv().await {
+                        Ok(event) if event.sequence < next_sequence => {}
+                        Ok(event) => {
+                            let done = event.event.is_terminal();
+                            return Some((event, (receiver, next_sequence, done)));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            },
+        )
+        .right_stream()
+    };
+    let events = stream::iter(replay).chain(live).map(|event| {
+        Ok(Event::default()
+            .event(background_exec_event_name(&event.event))
+            .id(event.sequence.to_string())
+            .json_data(event)
+            .expect("background exec event serializes to JSON"))
+    });
+
+    Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
+}
+
+#[derive(Debug, Clone, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct BackgroundExecEventsQuery {
+    /// First event sequence to replay before live streaming (default 1).
+    from: Option<u64>,
+}
+
+async fn background_exec_session(
+    state: &AppState,
+    id: &SandboxId,
+    exec_id: &str,
+) -> Result<Arc<background_exec::BackgroundExecSession>, AppError> {
+    if !state.registry.contains(id).await {
+        return Err(AppError::NotFound(format!("sandbox {id} not found")));
+    }
+    let session = state
+        .background_execs
+        .get(exec_id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("background exec {exec_id} not found")))?;
+    let info = session.info().await;
+    if info.sandbox_id != id.as_str() {
+        return Err(AppError::NotFound(format!(
+            "background exec {exec_id} not found in sandbox {id}"
+        )));
+    }
+    Ok(session)
+}
+
+const fn background_exec_event_name(event: &BackgroundExecEventKind) -> &'static str {
+    match event {
+        BackgroundExecEventKind::Stdout { .. } => "stdout",
+        BackgroundExecEventKind::Stderr { .. } => "stderr",
+        BackgroundExecEventKind::Exited { .. } => "exited",
+        BackgroundExecEventKind::Failed { .. } => "failed",
+    }
 }
 
 /// Suspend a running sandbox: checkpoint it to disk and tear down its
@@ -1016,6 +1380,7 @@ async fn suspend_sandbox(
             record.status
         )));
     }
+    state.background_execs.kill_for_sandbox(id.as_str()).await;
 
     let record = suspend_locked(&state, &id, &record).await?;
     Ok(Json(SandboxResponse { sandbox: record }))
@@ -1031,7 +1396,11 @@ async fn suspend_locked(
 ) -> Result<SandboxRecord, AppError> {
     let image_dir = state.paths.checkpoint_dir(id);
     if let Err(err) = checkpoint_sandbox(&state.paths, id, &record.containers, &image_dir).await {
-        let checkpoint_available = checkpoint_image_complete(&state.paths.checkpoint_dir(id)).await;
+        let checkpoint_available = checkpoint_image_complete_for_containers(
+            &state.paths.checkpoint_dir(id),
+            &record.containers,
+        )
+        .await;
         let message = format!("checkpoint failed: {err}");
         let status = if checkpoint_available {
             SandboxStatus::Suspended
@@ -1273,8 +1642,17 @@ async fn snapshot_sandbox_handler(
 
     let image_dir = state.paths.snapshot_checkpoint_dir(&name);
     let captured = match record.status {
-        SandboxStatus::Running => snapshot_sandbox(&state.paths, &id, &image_dir).await,
-        _ => copy_checkpoint_image(&state.paths.checkpoint_dir(&id), &image_dir).await,
+        SandboxStatus::Running => {
+            snapshot_sandbox(&state.paths, &id, &record.containers, &image_dir).await
+        }
+        _ => {
+            copy_checkpoint_image(
+                &state.paths.checkpoint_dir(&id),
+                &image_dir,
+                &record.containers,
+            )
+            .await
+        }
     };
     if let Err(err) = captured {
         snapshot_cleanup.cleanup_now().await;
@@ -1657,6 +2035,10 @@ mod tests {
             "/v1/sandboxes/{id}",
             "/v1/sandboxes/{id}/logs",
             "/v1/sandboxes/{id}/exec",
+            "/v1/sandboxes/{id}/execs",
+            "/v1/sandboxes/{id}/execs/{exec_id}",
+            "/v1/sandboxes/{id}/execs/{exec_id}/stdin",
+            "/v1/sandboxes/{id}/execs/{exec_id}/events",
             "/v1/sandboxes/{id}/suspend",
             "/v1/sandboxes/{id}/resume",
             "/v1/sandboxes/{id}/snapshot",

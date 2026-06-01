@@ -858,6 +858,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
  "oad-api",
  "oad-core",
  "oad-oci",
@@ -894,6 +895,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
  "oad-api",
  "oad-core",
  "reqwest",

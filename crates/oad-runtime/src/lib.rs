@@ -8,7 +8,7 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::process::Command;
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::debug;
 
 /// gVisor runtime program name, resolved from `PATH` at invocation time.
@@ -54,6 +54,14 @@ pub struct ExecOutput {
     pub exit_code: i32,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+/// Running `runsc exec` process with attached standard streams.
+pub struct ExecProcess {
+    pub child: Child,
+    pub stdin: ChildStdin,
+    pub stdout: ChildStdout,
+    pub stderr: ChildStderr,
 }
 
 impl Runsc {
@@ -350,6 +358,62 @@ impl Runsc {
         })
     }
 
+    /// Starts `argv` inside `container` and returns attached process streams.
+    ///
+    /// The returned child is the host-side `runsc exec` process. Its standard
+    /// streams are connected to the executed process inside the container.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Spawn`] if `runsc` cannot be spawned.
+    pub async fn spawn_exec(
+        &self,
+        container: &str,
+        command: &[String],
+        env: &[String],
+        cwd: Option<&str>,
+        log_path: Option<&Path>,
+    ) -> Result<ExecProcess, RuntimeError> {
+        if let Some(parent) = log_path.and_then(Path::parent) {
+            fs::create_dir_all(parent).await.map_err(RuntimeError::Io)?;
+        }
+        let args = self.exec_args(container, command, env, cwd, log_path);
+        debug!(runsc = RUNSC, args = ?args, "spawning runsc exec");
+        let mut child = Command::new(RUNSC)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(RuntimeError::Spawn)?;
+
+        let Some(stdin) = child.stdin.take() else {
+            let _ = child.start_kill();
+            return Err(RuntimeError::Io(std::io::Error::other(
+                "spawned runsc exec without stdin pipe",
+            )));
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.start_kill();
+            return Err(RuntimeError::Io(std::io::Error::other(
+                "spawned runsc exec without stdout pipe",
+            )));
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.start_kill();
+            return Err(RuntimeError::Io(std::io::Error::other(
+                "spawned runsc exec without stderr pipe",
+            )));
+        };
+
+        Ok(ExecProcess {
+            child,
+            stdin,
+            stdout,
+            stderr,
+        })
+    }
+
     async fn run_logged(&self, args: Vec<String>, log_path: &Path) -> Result<(), RuntimeError> {
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent).await.map_err(RuntimeError::Io)?;
@@ -494,8 +558,13 @@ async fn delete_visible_containers(
 /// Checkpoints an entire sandbox into `image_dir`, then tears its containers
 /// down (freeing memory) while leaving the bundles on disk for a later restore.
 ///
-/// gVisor checkpoints the whole sandbox via its root (`pause`) container, which
-/// captures the state of every container including their writable overlays.
+/// Each container gets its own checkpoint image under `image_dir/<container>`.
+/// `runsc checkpoint` saves the named container's current process set; a single
+/// checkpoint of the root `pause` container is not enough to preserve processes
+/// created in workload containers via `runsc exec`. The root container is
+/// checkpointed first with `--leave-running`, so restore can put the sandbox
+/// into restore mode before subcontainers are restored. Workload containers are
+/// checkpointed afterward, with only the final checkpoint stopping the sandbox.
 /// `runsc state` is queried before each delete (mirroring containerd) to avoid
 /// a delete that races the freshly stopped sandbox.
 ///
@@ -516,13 +585,9 @@ pub async fn checkpoint_sandbox(
             .await
             .map_err(RuntimeError::Io)?;
 
-        let runsc = runsc_for_sandbox(paths, sandbox_id);
-        let pause_overlay = paths.rootfs_overlay_dir(sandbox_id, PAUSE_CONTAINER);
-        let log = paths.container_log(sandbox_id, PAUSE_CONTAINER);
-        runsc
-            .checkpoint(PAUSE_CONTAINER, &tmp_image_dir, &pause_overlay, &log, false)
-            .await?;
+        checkpoint_suspend_images(paths, sandbox_id, containers, &tmp_image_dir).await?;
 
+        let runsc = runsc_for_sandbox(paths, sandbox_id);
         let failures =
             delete_visible_containers(&runsc, sandbox_id, containers, "post-checkpoint teardown")
                 .await;
@@ -543,10 +608,10 @@ pub async fn checkpoint_sandbox(
 
 /// Snapshots a running sandbox into `image_dir` without stopping it.
 ///
-/// Like [`checkpoint_sandbox`], gVisor captures the whole sandbox via its root
-/// (`pause`) container, but `--leave-running` keeps the live sandbox executing
-/// afterward, so the snapshot is a point-in-time fork source rather than a
-/// suspend. The containers are *not* torn down.
+/// Like [`checkpoint_sandbox`], each workload container gets its own image, but
+/// `--leave-running` keeps the live sandbox executing afterward, so the
+/// snapshot is a point-in-time fork source rather than a suspend. The
+/// containers are *not* torn down.
 ///
 /// # Errors
 ///
@@ -555,6 +620,7 @@ pub async fn checkpoint_sandbox(
 pub async fn snapshot_sandbox(
     paths: &OadPaths,
     sandbox_id: &SandboxId,
+    containers: &[String],
     image_dir: &Path,
 ) -> Result<(), RuntimeError> {
     let tmp_image_dir = temp_path(image_dir);
@@ -564,12 +630,13 @@ pub async fn snapshot_sandbox(
             .await
             .map_err(RuntimeError::Io)?;
 
-        let runsc = runsc_for_sandbox(paths, sandbox_id);
-        let pause_overlay = paths.rootfs_overlay_dir(sandbox_id, PAUSE_CONTAINER);
-        let log = paths.container_log(sandbox_id, PAUSE_CONTAINER);
-        runsc
-            .checkpoint(PAUSE_CONTAINER, &tmp_image_dir, &pause_overlay, &log, true)
-            .await?;
+        checkpoint_container_images(
+            paths,
+            sandbox_id,
+            checkpoint_targets(containers),
+            &tmp_image_dir,
+        )
+        .await?;
 
         publish_checkpoint_dir(&tmp_image_dir, image_dir).await?;
         Ok(())
@@ -580,6 +647,107 @@ pub async fn snapshot_sandbox(
         let _ = fs::remove_dir_all(&tmp_image_dir).await;
     }
     snapshotted
+}
+
+async fn checkpoint_container_images(
+    paths: &OadPaths,
+    sandbox_id: &SandboxId,
+    containers: Vec<(String, bool)>,
+    image_dir: &Path,
+) -> Result<(), RuntimeError> {
+    let runsc = runsc_for_sandbox(paths, sandbox_id);
+    for (container, leave_running) in containers {
+        let container_image_dir = container_checkpoint_dir(image_dir, &container);
+        fs::create_dir_all(&container_image_dir)
+            .await
+            .map_err(RuntimeError::Io)?;
+        let overlay = paths.rootfs_overlay_dir(sandbox_id, &container);
+        let log = paths.container_log(sandbox_id, &container);
+        runsc
+            .checkpoint(
+                &container,
+                &container_image_dir,
+                &overlay,
+                &log,
+                leave_running,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn checkpoint_suspend_images(
+    paths: &OadPaths,
+    sandbox_id: &SandboxId,
+    containers: &[String],
+    image_dir: &Path,
+) -> Result<(), RuntimeError> {
+    checkpoint_container_images(
+        paths,
+        sandbox_id,
+        checkpoint_suspend_targets(containers),
+        image_dir,
+    )
+    .await
+}
+
+fn checkpoint_targets(containers: &[String]) -> Vec<(String, bool)> {
+    checkpoint_target_names(containers)
+        .into_iter()
+        .map(|container| (container, true))
+        .collect()
+}
+
+fn checkpoint_suspend_targets(containers: &[String]) -> Vec<(String, bool)> {
+    let names = checkpoint_target_names(containers);
+    let last_index = names.len().saturating_sub(1);
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(index, container)| (container, index != last_index))
+        .collect()
+}
+
+fn checkpoint_target_names(containers: &[String]) -> Vec<String> {
+    let workloads = containers
+        .iter()
+        .filter(|container| container.as_str() != PAUSE_CONTAINER)
+        .cloned()
+        .collect::<Vec<_>>();
+    if containers
+        .iter()
+        .any(|container| container.as_str() == PAUSE_CONTAINER)
+    {
+        let mut targets = vec![PAUSE_CONTAINER.to_string()];
+        targets.extend(workloads);
+        targets
+    } else {
+        workloads
+    }
+}
+
+fn container_checkpoint_dir(image_dir: &Path, container: &str) -> PathBuf {
+    image_dir.join(container)
+}
+
+async fn checkpoint_image_dir_for_container(
+    image_dir: &Path,
+    container: &str,
+) -> Result<PathBuf, RuntimeError> {
+    let container_image_dir = container_checkpoint_dir(image_dir, container);
+    if checkpoint_dir_has_image(&container_image_dir).await {
+        return Ok(container_image_dir);
+    }
+    if checkpoint_dir_has_image(image_dir).await {
+        return Ok(image_dir.to_path_buf());
+    }
+    Err(RuntimeError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!(
+            "no checkpoint image for container {container} under {}",
+            image_dir.display()
+        ),
+    )))
 }
 
 /// Copies an existing checkpoint image from `src_image_dir` into `dst_image_dir`,
@@ -596,8 +764,9 @@ pub async fn snapshot_sandbox(
 pub async fn copy_checkpoint_image(
     src_image_dir: &Path,
     dst_image_dir: &Path,
+    containers: &[String],
 ) -> Result<(), RuntimeError> {
-    if !checkpoint_image_complete(src_image_dir).await {
+    if !checkpoint_image_complete_for_containers(src_image_dir, containers).await {
         return Err(RuntimeError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("no checkpoint image at {}", src_image_dir.display()),
@@ -702,9 +871,27 @@ async fn publish_checkpoint_dir(
 }
 
 async fn sync_checkpoint_dir(image_dir: &Path) -> Result<(), RuntimeError> {
-    sync_file(&image_dir.join(RUNSC_CHECKPOINT_IMAGE))
+    let top_level_image = image_dir.join(RUNSC_CHECKPOINT_IMAGE);
+    if fs::try_exists(&top_level_image)
         .await
-        .map_err(RuntimeError::Io)?;
+        .map_err(RuntimeError::Io)?
+    {
+        sync_file(&top_level_image)
+            .await
+            .map_err(RuntimeError::Io)?;
+    } else {
+        let mut entries = fs::read_dir(image_dir).await.map_err(RuntimeError::Io)?;
+        while let Some(entry) = entries.next_entry().await.map_err(RuntimeError::Io)? {
+            if !entry.file_type().await.map_err(RuntimeError::Io)?.is_dir() {
+                continue;
+            }
+            let container_dir = entry.path();
+            sync_file(&container_dir.join(RUNSC_CHECKPOINT_IMAGE))
+                .await
+                .map_err(RuntimeError::Io)?;
+            sync_dir(&container_dir).await.map_err(RuntimeError::Io)?;
+        }
+    }
     sync_dir(image_dir).await.map_err(RuntimeError::Io)
 }
 
@@ -716,8 +903,12 @@ fn backup_checkpoint_dir(image_dir: &Path) -> PathBuf {
     image_dir.with_file_name(format!(".{dir_name}.backup"))
 }
 
-/// Restores an entire sandbox from a checkpoint image, recreating each container
-/// (root `pause` first) from its on-disk bundle and the shared image.
+/// Restores an entire sandbox from a checkpoint image, recreating each
+/// container (root `pause` first) from its on-disk bundle.
+///
+/// New checkpoints store one image per container under
+/// `image_dir/<container>`; legacy checkpoints used one top-level image and are
+/// still accepted.
 ///
 /// # Errors
 ///
@@ -741,36 +932,61 @@ pub async fn restore_sandbox(
         .map_err(RuntimeError::Io)?;
 
     let runsc = runsc_for_sandbox(paths, sandbox_id);
+    let legacy_checkpoint = checkpoint_dir_has_image(image_dir).await;
     for container in containers {
         let bundle = paths.bundle_dir(sandbox_id, container);
         let pidfile = paths.pidfile(sandbox_id, container);
         let overlay = paths.rootfs_overlay_dir(sandbox_id, container);
         let log = paths.container_log(sandbox_id, container);
-        runsc
-            .restore(
-                container,
-                RestoreConfig {
-                    bundle_dir: &bundle,
-                    image_dir,
-                    pidfile: &pidfile,
-                    overlay_dir: &overlay,
-                    spec_validation,
-                    log_path: &log,
-                },
-            )
-            .await?;
+        if legacy_checkpoint
+            || checkpoint_dir_has_image(&container_checkpoint_dir(image_dir, container)).await
+        {
+            let container_image_dir =
+                checkpoint_image_dir_for_container(image_dir, container).await?;
+            runsc
+                .restore(
+                    container,
+                    RestoreConfig {
+                        bundle_dir: &bundle,
+                        image_dir: &container_image_dir,
+                        pidfile: &pidfile,
+                        overlay_dir: &overlay,
+                        spec_validation,
+                        log_path: &log,
+                    },
+                )
+                .await?;
+        } else if container == PAUSE_CONTAINER {
+            runsc
+                .create(&bundle, &pidfile, container, &overlay, &log)
+                .await?;
+            runsc.start(container, &overlay, &log).await?;
+        } else {
+            return Err(RuntimeError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "no checkpoint image for container {container} under {}",
+                    image_dir.display()
+                ),
+            )));
+        }
     }
     Ok(())
 }
 
-/// Returns true when the checkpoint image exists, recovering a backup left by
-/// an interrupted publish when possible.
-pub async fn checkpoint_image_complete(image_dir: &Path) -> bool {
-    if checkpoint_dir_has_image(image_dir).await {
+/// Returns true when the expected checkpoint images exist, recovering a backup
+/// left by an interrupted publish when possible.
+pub async fn checkpoint_image_complete_for_containers(
+    image_dir: &Path,
+    containers: &[String],
+) -> bool {
+    if checkpoint_dir_has_image(image_dir).await
+        || checkpoint_tree_complete_for_containers(image_dir, containers).await
+    {
         let _ = remove_dir_if_exists(&backup_checkpoint_dir(image_dir)).await;
         return true;
     }
-    recover_backup_checkpoint_dir(image_dir).await
+    recover_backup_checkpoint_dir_for_containers(image_dir, containers).await
 }
 
 async fn checkpoint_dir_has_image(image_dir: &Path) -> bool {
@@ -779,9 +995,28 @@ async fn checkpoint_dir_has_image(image_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-async fn recover_backup_checkpoint_dir(image_dir: &Path) -> bool {
+async fn checkpoint_tree_complete_for_containers(image_dir: &Path, containers: &[String]) -> bool {
+    let targets = checkpoint_target_names(containers);
+    if targets.is_empty() {
+        return false;
+    }
+
+    for container in targets {
+        if !checkpoint_dir_has_image(&container_checkpoint_dir(image_dir, &container)).await {
+            return false;
+        }
+    }
+    true
+}
+
+async fn recover_backup_checkpoint_dir_for_containers(
+    image_dir: &Path,
+    containers: &[String],
+) -> bool {
     let backup = backup_checkpoint_dir(image_dir);
-    if !checkpoint_dir_has_image(&backup).await {
+    if !checkpoint_dir_has_image(&backup).await
+        && !checkpoint_tree_complete_for_containers(&backup, containers).await
+    {
         return false;
     }
 
@@ -793,7 +1028,10 @@ async fn recover_backup_checkpoint_dir(image_dir: &Path) -> bool {
             }
             true
         }
-        Err(_) => checkpoint_dir_has_image(image_dir).await,
+        Err(_) => {
+            checkpoint_dir_has_image(image_dir).await
+                || checkpoint_tree_complete_for_containers(image_dir, containers).await
+        }
     }
 }
 
@@ -815,6 +1053,25 @@ pub async fn exec_in_container(
 ) -> Result<ExecOutput, RuntimeError> {
     let runsc = runsc_for_sandbox(paths, sandbox_id);
     runsc.exec(container, argv, env, cwd).await
+}
+
+/// Starts a command inside a running container and returns attached process
+/// streams for background control.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError::Spawn`] if `runsc` cannot be spawned.
+pub async fn spawn_exec_in_container(
+    paths: &OadPaths,
+    sandbox_id: &SandboxId,
+    container: &str,
+    argv: &[String],
+    env: &[String],
+    cwd: Option<&str>,
+    log_path: Option<&Path>,
+) -> Result<ExecProcess, RuntimeError> {
+    let runsc = runsc_for_sandbox(paths, sandbox_id);
+    runsc.spawn_exec(container, argv, env, cwd, log_path).await
 }
 
 /// Reports whether `container` in the sandbox is currently running according to
@@ -1050,30 +1307,117 @@ mod tests {
         );
     }
 
+    #[test]
+    fn checkpoint_targets_leave_all_containers_running_for_snapshots() {
+        assert_eq!(
+            checkpoint_targets(&["pause".to_string(), "main".to_string()]),
+            vec![("pause".to_string(), true), ("main".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn checkpoint_suspend_targets_stop_only_last_container() {
+        assert_eq!(
+            checkpoint_suspend_targets(&["pause".to_string(), "main".to_string()]),
+            vec![("pause".to_string(), true), ("main".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn checkpoint_targets_include_pause_when_it_is_only_container() {
+        assert_eq!(
+            checkpoint_targets(&["pause".to_string()]),
+            vec![("pause".to_string(), true)]
+        );
+    }
+
     #[tokio::test]
     async fn checkpoint_image_complete_requires_image() {
         let temp = tempfile::tempdir().unwrap();
         let image_dir = temp.path();
+        let containers = vec!["pause".to_string(), "main".to_string()];
 
-        assert!(!checkpoint_image_complete(image_dir).await);
+        assert!(!checkpoint_image_complete_for_containers(image_dir, &containers).await);
 
         fs::write(image_dir.join(RUNSC_CHECKPOINT_IMAGE), b"checkpoint")
             .await
             .unwrap();
-        assert!(checkpoint_image_complete(image_dir).await);
+        assert!(checkpoint_image_complete_for_containers(image_dir, &containers).await);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_image_complete_requires_all_per_container_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_dir = temp.path();
+        let containers = vec!["pause".to_string(), "main".to_string()];
+
+        fs::create_dir_all(image_dir.join("main")).await.unwrap();
+        fs::write(
+            image_dir.join("main").join(RUNSC_CHECKPOINT_IMAGE),
+            b"checkpoint",
+        )
+        .await
+        .unwrap();
+
+        assert!(!checkpoint_image_complete_for_containers(image_dir, &containers).await);
+
+        fs::create_dir_all(image_dir.join("pause")).await.unwrap();
+        fs::write(
+            image_dir.join("pause").join(RUNSC_CHECKPOINT_IMAGE),
+            b"checkpoint",
+        )
+        .await
+        .unwrap();
+
+        assert!(checkpoint_image_complete_for_containers(image_dir, &containers).await);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_image_dir_prefers_container_specific_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_dir = temp.path();
+        let main_image_dir = image_dir.join("main");
+        fs::create_dir_all(&main_image_dir).await.unwrap();
+        fs::write(main_image_dir.join(RUNSC_CHECKPOINT_IMAGE), b"main")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            checkpoint_image_dir_for_container(image_dir, "main")
+                .await
+                .unwrap(),
+            main_image_dir
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_image_dir_falls_back_to_legacy_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_dir = temp.path();
+        fs::write(image_dir.join(RUNSC_CHECKPOINT_IMAGE), b"legacy")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            checkpoint_image_dir_for_container(image_dir, "main")
+                .await
+                .unwrap(),
+            image_dir
+        );
     }
 
     #[tokio::test]
     async fn checkpoint_image_complete_recovers_backup_after_interrupted_publish() {
         let temp = tempfile::tempdir().unwrap();
         let image_dir = temp.path().join("checkpoint");
+        let containers = vec!["pause".to_string(), "main".to_string()];
         let backup = backup_checkpoint_dir(&image_dir);
         fs::create_dir_all(&backup).await.unwrap();
         fs::write(backup.join(RUNSC_CHECKPOINT_IMAGE), b"old")
             .await
             .unwrap();
 
-        assert!(checkpoint_image_complete(&image_dir).await);
+        assert!(checkpoint_image_complete_for_containers(&image_dir, &containers).await);
         assert_eq!(
             fs::read(image_dir.join(RUNSC_CHECKPOINT_IMAGE))
                 .await
