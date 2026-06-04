@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use oad_core::{ContainerSpec, EnvVar, SandboxRecord};
+use oad_core::{ContainerSpec, EnvVar, SandboxNetworkSpec, SandboxRecord};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde::{Deserializer, Serializer};
@@ -20,6 +20,10 @@ pub struct CreateSandboxRequest {
     /// containers.
     #[serde(default)]
     pub from_snapshot: Option<String>,
+    /// Optional per-sandbox network policy. When omitted, the daemon default is used
+    /// for fresh sandboxes and snapshot forks inherit the snapshot policy.
+    #[serde(default)]
+    pub network: Option<SandboxNetworkSpec>,
 }
 
 /// Request to capture a snapshot of a running sandbox. The snapshot's
@@ -276,6 +280,7 @@ mod tests {
 
         assert_eq!(req.containers[0].name, "web");
         assert!(req.containers[0].command.is_empty());
+        assert!(req.network.is_none());
     }
 
     #[test]

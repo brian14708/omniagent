@@ -175,6 +175,25 @@ pub struct SandboxSpec {
     pub pause_image: String,
     /// User container specs (excluding the reserved `pause` container).
     pub containers: Vec<ContainerSpec>,
+    /// Network policy and shaping applied to this sandbox.
+    #[serde(default)]
+    pub network: SandboxNetworkSpec,
+    /// runsc network mode resolved at create time. Persisted so resume/restore
+    /// replays the same mode the checkpoint was taken with, instead of
+    /// recomputing it from daemon config that may have changed. `None` for
+    /// specs written before this field existed (resume falls back to the
+    /// recomputed mode in that case).
+    #[serde(default)]
+    pub network_mode: Option<NetworkMode>,
+}
+
+/// runsc networking mode for a sandbox, mirrored in `oad-core` (rather than
+/// `oad-runtime`) so it can be serialized into the persisted [`SandboxSpec`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    Sandbox,
+    Host,
 }
 
 /// Full container list for a sandbox: the reserved `pause` container first,
@@ -194,11 +213,164 @@ pub struct EnvVar {
     pub value: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct SandboxNetworkSpec {
+    pub egress: EgressPolicy,
+    pub shaping: TrafficShapingPolicy,
+    pub l7: L7EgressPolicy,
+    pub udp: UdpEgressPolicy,
+}
+
+impl Default for SandboxNetworkSpec {
+    fn default() -> Self {
+        Self {
+            egress: EgressPolicy::AllowAll,
+            shaping: TrafficShapingPolicy::default(),
+            l7: L7EgressPolicy::default(),
+            udp: UdpEgressPolicy::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum EgressPolicy {
+    #[default]
+    AllowAll,
+    DenyAll,
+    Rules {
+        #[serde(default)]
+        rules: Vec<EgressRule>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct EgressRule {
+    pub destination: EgressDestination,
+    #[serde(default)]
+    pub protocol: Protocol,
+    #[serde(default)]
+    pub ports: Vec<PortRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EgressDestination {
+    Cidr { cidr: String },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol {
+    #[default]
+    All,
+    Tcp,
+    Udp,
+    Icmp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct TrafficShapingPolicy {
+    pub upload_bps: Option<u64>,
+    pub download_bps: Option<u64>,
+    pub burst_bytes: Option<u64>,
+    pub latency_ms: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct L7EgressPolicy {
+    pub transparent_tcp: bool,
+}
+
+impl Default for L7EgressPolicy {
+    fn default() -> Self {
+        Self {
+            transparent_tcp: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct UdpEgressPolicy {
+    pub dns_redirect: bool,
+    pub block_quic: bool,
+    pub allow: Vec<EgressRule>,
+}
+
+impl Default for UdpEgressPolicy {
+    fn default() -> Self {
+        Self {
+            dns_redirect: true,
+            block_quic: true,
+            allow: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub base_dir: PathBuf,
     pub pause_image: String,
     pub network_namespace: Option<PathBuf>,
+    pub network: NetworkRuntimeConfig,
+    pub observability: ObservabilityConfig,
+}
+
+/// Daemon-level toggle for egress observability.
+///
+/// The OTLP exporter itself is configured through the canonical
+/// `OTEL_EXPORTER_OTLP_*` environment variables (endpoint, protocol, headers,
+/// timeout) read by the OpenTelemetry SDK; this only controls whether the
+/// daemon emits spans at all.
+#[derive(Debug, Clone)]
+pub struct ObservabilityConfig {
+    pub enabled: bool,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkRuntimeConfig {
+    pub enabled: bool,
+    pub backend: ManagedNetworkBackend,
+    pub sandbox_cidr: String,
+    pub envoy_listener: String,
+    pub dns_listener: String,
+    pub dns_upstream: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedNetworkBackend {
+    Hostinet,
+    Netstack,
+}
+
+impl Default for NetworkRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backend: ManagedNetworkBackend::Netstack,
+            sandbox_cidr: "10.90.0.0/16".to_string(),
+            envoy_listener: "0.0.0.0:15001".to_string(),
+            dns_listener: "0.0.0.0:15053".to_string(),
+            dns_upstream: "1.1.1.1:53".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +474,36 @@ impl OadPaths {
     #[must_use]
     pub fn sandbox_spec(&self, id: &SandboxId) -> PathBuf {
         self.sandbox_dir(id).join("spec.json")
+    }
+
+    #[must_use]
+    pub fn network_dir(&self) -> PathBuf {
+        self.base_dir.join("network")
+    }
+
+    #[must_use]
+    pub fn sandbox_network_state(&self, id: &SandboxId) -> PathBuf {
+        self.sandbox_dir(id).join("network.json")
+    }
+
+    #[must_use]
+    pub fn sandbox_resolv_conf(&self, id: &SandboxId) -> PathBuf {
+        self.sandbox_dir(id).join("resolv.conf")
+    }
+
+    #[must_use]
+    pub fn envoy_config(&self) -> PathBuf {
+        self.network_dir().join("envoy.json")
+    }
+
+    #[must_use]
+    pub fn envoy_log(&self) -> PathBuf {
+        self.network_dir().join("envoy.log")
+    }
+
+    #[must_use]
+    pub fn envoy_access_log_socket(&self) -> PathBuf {
+        self.network_dir().join("envoy-access.sock")
     }
 
     /// Root of the immutable, sandbox-independent snapshot store. Lives under
@@ -510,6 +712,24 @@ fn validate_id_segment(value: &str) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_managed_network_backend_supports_checkpoints() {
+        assert_eq!(
+            NetworkRuntimeConfig::default().backend,
+            ManagedNetworkBackend::Netstack
+        );
+    }
+
+    #[test]
+    fn sandboxes_dir_is_under_base_dir() {
+        let paths = OadPaths::new("/run/omniagent");
+
+        assert_eq!(
+            paths.sandboxes_dir(),
+            PathBuf::from("/run/omniagent/sandboxes")
+        );
+    }
 
     #[test]
     fn rejects_reserved_container_names() {

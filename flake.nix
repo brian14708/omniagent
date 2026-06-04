@@ -41,6 +41,14 @@
         let
           rustToolchain = p: p.rust-bin.stable.latest.default;
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+          cargoSrc = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: type:
+              (craneLib.filterCargoSources path type)
+              || pkgs.lib.hasInfix "/crates/oad/migrations/" (toString path)
+              || pkgs.lib.hasInfix "/crates/oad/proto/" (toString path);
+          };
           pname = "oad";
         in
         {
@@ -51,9 +59,15 @@
           devShells.default = craneLib.devShell {
             # gVisor (provides `runsc`) is Linux-only; skip it on darwin so the
             # shell still evaluates there.
-            packages = pkgs.lib.optionals pkgs.stdenv.isLinux [
+            packages = [
+              pkgs.protobuf
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.envoy-bin
               pkgs.erofs-utils
               pkgs.gvisor
+              pkgs.iproute2
+              pkgs.nftables
             ];
           };
 
@@ -72,12 +86,15 @@
           packages.default = craneLib.buildPackage {
             inherit pname;
             version = "0.1.0";
-            src = craneLib.cleanCargoSource ./.;
+            src = cargoSrc;
             cargoVendorDir = craneLib.vendorCargoDeps {
-              src = craneLib.cleanCargoSource ./.;
+              src = cargoSrc;
               cargoLock = ./Cargo.lock;
             };
             cargoExtraArgs = "-p oad";
+            nativeBuildInputs = [
+              pkgs.protobuf
+            ];
           };
 
           checks = {

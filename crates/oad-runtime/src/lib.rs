@@ -18,6 +18,30 @@ const RUNSC_ERROR_LOG_TAIL_BYTES: u64 = 64 * 1024;
 const SAVE_RESTORE_NETSTACK_ARG: &str = "-save-restore-netstack=true";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunscNetworkMode {
+    Sandbox,
+    Host,
+}
+
+impl From<oad_core::NetworkMode> for RunscNetworkMode {
+    fn from(mode: oad_core::NetworkMode) -> Self {
+        match mode {
+            oad_core::NetworkMode::Sandbox => Self::Sandbox,
+            oad_core::NetworkMode::Host => Self::Host,
+        }
+    }
+}
+
+impl From<RunscNetworkMode> for oad_core::NetworkMode {
+    fn from(mode: RunscNetworkMode) -> Self {
+        match mode {
+            RunscNetworkMode::Sandbox => Self::Sandbox,
+            RunscNetworkMode::Host => Self::Host,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreSpecValidation {
     Enforce,
     Warning,
@@ -35,6 +59,7 @@ impl RestoreSpecValidation {
 #[derive(Debug, Clone)]
 pub struct Runsc {
     state_dir: PathBuf,
+    network_mode: RunscNetworkMode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +93,17 @@ impl Runsc {
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         Self {
             state_dir: state_dir.into(),
+            network_mode: RunscNetworkMode::Sandbox,
+        }
+    }
+
+    pub fn with_network_mode(
+        state_dir: impl Into<PathBuf>,
+        network_mode: RunscNetworkMode,
+    ) -> Self {
+        Self {
+            state_dir: state_dir.into(),
+            network_mode,
         }
     }
 
@@ -176,6 +212,14 @@ impl Runsc {
         args
     }
 
+    fn base_args_with_network(&self, log_path: Option<&Path>) -> Vec<String> {
+        let mut args = self.base_args(log_path);
+        if matches!(self.network_mode, RunscNetworkMode::Host) {
+            args.extend(["-network".to_string(), "host".to_string()]);
+        }
+        args
+    }
+
     /// Builds the `--overlay2` global flag backing the read-only EROFS rootfs
     /// with a writable overlay in `overlay_dir`.
     ///
@@ -200,7 +244,7 @@ impl Runsc {
         container: &str,
         overlay_dir: &Path,
     ) -> Vec<String> {
-        let mut args = self.base_args(None);
+        let mut args = self.base_args_with_network(None);
         args.push(Self::overlay_arg(overlay_dir));
         args.extend([
             "create".to_string(),
@@ -215,7 +259,7 @@ impl Runsc {
 
     #[must_use]
     pub fn start_args(&self, container: &str, overlay_dir: &Path) -> Vec<String> {
-        let mut args = self.base_args(None);
+        let mut args = self.base_args_with_network(None);
         args.extend([
             "-net-disconnect-ok=true".to_string(),
             SAVE_RESTORE_NETSTACK_ARG.to_string(),
@@ -257,7 +301,7 @@ impl Runsc {
         overlay_dir: &Path,
         spec_validation: RestoreSpecValidation,
     ) -> Vec<String> {
-        let mut args = self.base_args(None);
+        let mut args = self.base_args_with_network(None);
         args.push(SAVE_RESTORE_NETSTACK_ARG.to_string());
         args.push(Self::overlay_arg(overlay_dir));
         args.extend([
@@ -472,6 +516,14 @@ fn runsc_for_sandbox(paths: &OadPaths, sandbox_id: &SandboxId) -> Runsc {
     Runsc::new(paths.runsc_state_dir(sandbox_id))
 }
 
+fn runsc_for_sandbox_with_network(
+    paths: &OadPaths,
+    sandbox_id: &SandboxId,
+    network_mode: RunscNetworkMode,
+) -> Runsc {
+    Runsc::with_network_mode(paths.runsc_state_dir(sandbox_id), network_mode)
+}
+
 /// Creates and starts every container in a sandbox, in order.
 ///
 /// # Errors
@@ -482,6 +534,7 @@ pub async fn start_container_sequence(
     paths: &OadPaths,
     sandbox_id: &SandboxId,
     containers: &[String],
+    network_mode: RunscNetworkMode,
 ) -> Result<(), RuntimeError> {
     fs::create_dir_all(paths.runsc_state_dir(sandbox_id))
         .await
@@ -493,7 +546,7 @@ pub async fn start_container_sequence(
         .await
         .map_err(RuntimeError::Io)?;
 
-    let runsc = runsc_for_sandbox(paths, sandbox_id);
+    let runsc = runsc_for_sandbox_with_network(paths, sandbox_id, network_mode);
     for container in containers {
         let bundle = paths.bundle_dir(sandbox_id, container);
         let pidfile = paths.pidfile(sandbox_id, container);
@@ -920,6 +973,7 @@ pub async fn restore_sandbox(
     containers: &[String],
     image_dir: &Path,
     spec_validation: RestoreSpecValidation,
+    network_mode: RunscNetworkMode,
 ) -> Result<(), RuntimeError> {
     fs::create_dir_all(paths.runsc_state_dir(sandbox_id))
         .await
@@ -931,7 +985,7 @@ pub async fn restore_sandbox(
         .await
         .map_err(RuntimeError::Io)?;
 
-    let runsc = runsc_for_sandbox(paths, sandbox_id);
+    let runsc = runsc_for_sandbox_with_network(paths, sandbox_id, network_mode);
     let legacy_checkpoint = checkpoint_dir_has_image(image_dir).await;
     for container in containers {
         let bundle = paths.bundle_dir(sandbox_id, container);
@@ -1188,6 +1242,19 @@ mod tests {
     }
 
     #[test]
+    fn create_args_can_use_host_network_mode() {
+        let runsc = Runsc::with_network_mode("/tmp/state", RunscNetworkMode::Host);
+        let args = runsc.create_args(
+            Path::new("/tmp/bundle"),
+            Path::new("/tmp/pid"),
+            "web",
+            Path::new("/tmp/bundle/rootfs-overlay"),
+        );
+
+        assert!(args.windows(2).any(|pair| pair == ["-network", "host"]));
+    }
+
+    #[test]
     fn start_args_carry_overlay_and_checkpoint_netstack_flags() {
         let runsc = Runsc::new("/tmp/state");
         assert_eq!(
@@ -1204,6 +1271,14 @@ mod tests {
                 "web",
             ]
         );
+    }
+
+    #[test]
+    fn start_args_can_use_host_network_mode() {
+        let runsc = Runsc::with_network_mode("/tmp/state", RunscNetworkMode::Host);
+        let args = runsc.start_args("web", Path::new("/tmp/bundle/rootfs-overlay"));
+
+        assert!(args.windows(2).any(|pair| pair == ["-network", "host"]));
     }
 
     #[test]
@@ -1228,6 +1303,19 @@ mod tests {
                 "pause",
             ]
         );
+    }
+
+    #[test]
+    fn checkpoint_args_ignore_host_network_mode() {
+        let runsc = Runsc::with_network_mode("/tmp/state", RunscNetworkMode::Host);
+        let args = runsc.checkpoint_args(
+            "pause",
+            Path::new("/tmp/ckpt"),
+            Path::new("/tmp/bundle/rootfs-overlay"),
+            false,
+        );
+
+        assert!(!args.windows(2).any(|pair| pair == ["-network", "host"]));
     }
 
     #[test]

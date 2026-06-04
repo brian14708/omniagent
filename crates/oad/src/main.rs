@@ -1,5 +1,7 @@
 mod background_exec;
 mod config;
+mod network;
+mod observability;
 mod registry;
 mod snapshots;
 
@@ -31,14 +33,16 @@ use oad_api::{
     StartBackgroundExecRequest,
 };
 use oad_core::{
-    ContainerSpec, EnvVar, OadPaths, PAUSE_CONTAINER, SandboxId, SandboxRecord, SandboxSpec,
-    SandboxStatus, validate_container_name, validate_snapshot_name,
+    ContainerSpec, EgressDestination, EgressPolicy, EgressRule, EnvVar, L7EgressPolicy,
+    ManagedNetworkBackend, OadPaths, PAUSE_CONTAINER, PortRange, Protocol, SandboxId,
+    SandboxNetworkSpec, SandboxRecord, SandboxSpec, SandboxStatus, TrafficShapingPolicy,
+    UdpEgressPolicy, validate_container_name, validate_snapshot_name,
 };
 use oad_oci::GvisorManager;
 use oad_runtime::{
-    RestoreSpecValidation, checkpoint_image_complete_for_containers, checkpoint_sandbox,
-    copy_checkpoint_image, delete_visible_container_sequence, restore_sandbox, snapshot_sandbox,
-    start_container_sequence,
+    RestoreSpecValidation, RunscNetworkMode, checkpoint_image_complete_for_containers,
+    checkpoint_sandbox, copy_checkpoint_image, delete_visible_container_sequence, restore_sandbox,
+    snapshot_sandbox, start_container_sequence,
 };
 use registry::{NamedLocks, SandboxRegistry};
 use thiserror::Error;
@@ -57,6 +61,8 @@ struct AppState {
     registry: SandboxRegistry,
     snapshot_locks: NamedLocks,
     gvisor: GvisorManager,
+    network: network::NetworkManager,
+    telemetry: observability::EgressTelemetry,
     background_execs: BackgroundExecStore,
 }
 
@@ -79,14 +85,33 @@ async fn main() -> anyhow::Result<()> {
     let registry = SandboxRegistry::recover(&paths).await;
     reconcile_sandboxes(&registry, &paths).await;
     let gvisor = GvisorManager::new();
+    let network = network::NetworkManager::new(
+        config.runtime.network.clone(),
+        config.runtime.observability.enabled,
+    )
+    .context("failed to initialize network manager")?;
+    let telemetry = observability::EgressTelemetry::new(&config.runtime.observability)
+        .context("failed to initialize egress telemetry")?;
+    // Only run the access-log sink when managed networking is actually enabled:
+    // with networking off, Envoy is never started (reconcile early-returns) and
+    // emits no access logs, so binding the socket would falsely report
+    // `audit_active = true` while nothing is being audited.
+    if config.runtime.network.enabled && config.runtime.observability.enabled {
+        telemetry.spawn_envoy_access_log_server(paths.clone(), network.ip_map());
+    }
     let state = AppState {
         config: config.clone(),
         paths,
         registry,
         snapshot_locks: NamedLocks::default(),
         gvisor,
+        network,
+        telemetry,
         background_execs: BackgroundExecStore::default(),
     };
+    if let Err(err) = state.network.reconcile_all(&state.paths).await {
+        warn!(error = %err, "failed to reconcile managed network state at startup");
+    }
 
     let shutdown_state = state.clone();
     let app = router(state);
@@ -105,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("http server failed");
     checkpoint_running_sandboxes_for_shutdown(&shutdown_state).await;
+    shutdown_state.telemetry.shutdown().await;
     result
 }
 
@@ -323,6 +349,15 @@ fn router(state: AppState) -> Router {
         SandboxStatus,
         ContainerSpec,
         EnvVar,
+        SandboxNetworkSpec,
+        EgressPolicy,
+        EgressRule,
+        EgressDestination,
+        Protocol,
+        PortRange,
+        TrafficShapingPolicy,
+        L7EgressPolicy,
+        UdpEgressPolicy,
         CreateSnapshotRequest,
         SnapshotInfo,
         SnapshotResponse,
@@ -420,7 +455,7 @@ async fn create_sandbox(
     }
 
     let record = if let Some(snapshot) = from_snapshot {
-        fork_from_snapshot(&state, &id, &snapshot).await?
+        fork_from_snapshot(&state, &id, request.network.clone(), &snapshot).await?
     } else {
         boot_fresh_sandbox(&state, &id, &request).await?
     };
@@ -438,27 +473,49 @@ async fn boot_fresh_sandbox(
     request: &CreateSandboxRequest,
 ) -> Result<SandboxRecord, AppError> {
     let container_names = oad_core::container_names(&request.containers);
+    let network = effective_fresh_network(state, request)?;
 
     let record = SandboxRecord::new_pending(id.clone(), container_names.clone());
     state.registry.insert(&state.paths, record).await?;
     let mut cleanup = SandboxCreateGuard::new(state, id, container_names.clone());
 
+    let network_namespace = match prepare_sandbox_network(state, id, &network).await {
+        Ok(network_namespace) => network_namespace,
+        Err(err) => {
+            cleanup.cleanup_now().await;
+            return Err(err);
+        }
+    };
+
+    let runsc_network_mode = runsc_network_mode(state, network_namespace.as_deref());
     let spec = SandboxSpec {
         pause_image: state.config.runtime.pause_image.clone(),
         containers: request.containers.clone(),
+        network: network.clone(),
+        network_mode: Some(runsc_network_mode.into()),
     };
     if let Err(err) = persist_sandbox_spec(state, id, &spec).await {
         cleanup.cleanup_now().await;
         return Err(err);
     }
 
-    if let Err(err) = prepare_bundles(state, id, request).await {
+    if let Err(err) = prepare_bundles(
+        state,
+        id,
+        &state.config.runtime.pause_image,
+        &request.containers,
+        network_namespace.as_deref(),
+    )
+    .await
+    {
         cleanup.cleanup_now().await;
         return Err(err);
     }
 
     cleanup.delete_containers();
-    if let Err(err) = start_container_sequence(&state.paths, id, &container_names).await {
+    if let Err(err) =
+        start_container_sequence(&state.paths, id, &container_names, runsc_network_mode).await
+    {
         cleanup.cleanup_now().await;
         return Err(err.into());
     }
@@ -482,6 +539,7 @@ async fn boot_fresh_sandbox(
 async fn fork_from_snapshot(
     state: &AppState,
     id: &SandboxId,
+    request_network: Option<SandboxNetworkSpec>,
     snapshot_name: &str,
 ) -> Result<SandboxRecord, AppError> {
     validate_snapshot_name(snapshot_name).map_err(|err| AppError::BadRequest(err.to_string()))?;
@@ -493,38 +551,44 @@ async fn fork_from_snapshot(
     }
     let manifest = snapshots::read_manifest(&state.paths, snapshot_name).await?;
     let container_names = manifest.container_names();
+    let network = effective_fork_network(state, request_network, &manifest.network)?;
 
     let mut record = SandboxRecord::new_pending(id.clone(), container_names.clone());
     record.origin_snapshot = Some(snapshot_name.to_string());
     state.registry.insert(&state.paths, record).await?;
     let mut cleanup = SandboxCreateGuard::new(state, id, container_names.clone());
 
-    // Persist the spec so a fork can itself be snapshotted later.
+    let network_namespace = match prepare_sandbox_network(state, id, &network).await {
+        Ok(network_namespace) => network_namespace,
+        Err(err) => {
+            cleanup.cleanup_now().await;
+            return Err(err);
+        }
+    };
+
+    // Persist the spec (with the resolved network mode) so a fork can itself be
+    // snapshotted/resumed later with the same runsc network mode.
+    let runsc_network_mode = runsc_network_mode(state, network_namespace.as_deref());
     let spec = SandboxSpec {
         pause_image: manifest.pause_image.clone(),
         containers: manifest.containers.clone(),
+        network: network.clone(),
+        network_mode: Some(runsc_network_mode.into()),
     };
     if let Err(err) = persist_sandbox_spec(state, id, &spec).await {
         cleanup.cleanup_now().await;
         return Err(err);
     }
 
-    let netns = state.config.runtime.network_namespace.as_deref();
-    let prepared = async {
-        state
-            .gvisor
-            .prepare_pause_bundle(&state.paths, id, &manifest.pause_image, netns)
-            .await?;
-        for container in &manifest.containers {
-            state
-                .gvisor
-                .prepare_container_bundle(&state.paths, id, container, netns)
-                .await?;
-        }
-        Ok::<(), AppError>(())
-    }
-    .await;
-    if let Err(err) = prepared {
+    if let Err(err) = prepare_bundles(
+        state,
+        id,
+        &manifest.pause_image,
+        &manifest.containers,
+        network_namespace.as_deref(),
+    )
+    .await
+    {
         cleanup.cleanup_now().await;
         return Err(err);
     }
@@ -537,6 +601,7 @@ async fn fork_from_snapshot(
         &container_names,
         &image_dir,
         RestoreSpecValidation::Warning,
+        runsc_network_mode,
     )
     .await
     {
@@ -590,26 +655,117 @@ async fn read_sandbox_spec(state: &AppState, id: &SandboxId) -> Result<SandboxSp
     })
 }
 
+fn effective_fresh_network(
+    state: &AppState,
+    request: &CreateSandboxRequest,
+) -> Result<SandboxNetworkSpec, AppError> {
+    let network = request.network.clone().unwrap_or_default();
+    validate_network_available(state, &network)?;
+    network::validate_spec(&network)?;
+    Ok(network)
+}
+
+fn effective_fork_network(
+    state: &AppState,
+    requested: Option<SandboxNetworkSpec>,
+    inherited: &SandboxNetworkSpec,
+) -> Result<SandboxNetworkSpec, AppError> {
+    let network = requested.unwrap_or_else(|| inherited.clone());
+    validate_network_available(state, &network)?;
+    network::validate_spec(&network)?;
+    Ok(network)
+}
+
+/// Rejects any sandbox whose effective network policy needs managed networking
+/// to enforce it while managed networking is disabled. We check the *resolved*
+/// spec (not merely whether the request set one) so a restrictive policy
+/// inherited from a snapshot can't silently run with unrestricted egress.
+fn validate_network_available(
+    state: &AppState,
+    network: &SandboxNetworkSpec,
+) -> Result<(), AppError> {
+    if !state.network.enabled() && *network != SandboxNetworkSpec::default() {
+        return Err(AppError::BadRequest(
+            "per-sandbox network policy requires managed networking; remove runtime.network_namespace or enable runtime.network.enabled".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+const fn runsc_network_mode(
+    state: &AppState,
+    network_namespace: Option<&std::path::Path>,
+) -> RunscNetworkMode {
+    if state.network.enabled() {
+        return match state.network.backend() {
+            ManagedNetworkBackend::Hostinet => RunscNetworkMode::Host,
+            ManagedNetworkBackend::Netstack => RunscNetworkMode::Sandbox,
+        };
+    }
+    if network_namespace.is_some() {
+        RunscNetworkMode::Host
+    } else {
+        RunscNetworkMode::Sandbox
+    }
+}
+
+fn runtime_supports_checkpoints(state: &AppState) -> bool {
+    if state.network.enabled() {
+        return matches!(state.network.backend(), ManagedNetworkBackend::Netstack);
+    }
+    state.config.runtime.network_namespace.is_none()
+}
+
+fn hostinet_checkpoint_unsupported_message() -> String {
+    "checkpoint, suspend, and live snapshot require managed network backend \"netstack\" or default runsc sandbox networking".to_string()
+}
+
+async fn prepare_sandbox_network(
+    state: &AppState,
+    id: &SandboxId,
+    network: &SandboxNetworkSpec,
+) -> Result<Option<std::path::PathBuf>, AppError> {
+    if state.network.enabled() {
+        return Ok(state
+            .network
+            .reconcile_sandbox(&state.paths, id, network)
+            .await?);
+    }
+    Ok(state.config.runtime.network_namespace.clone())
+}
+
 async fn prepare_bundles(
     state: &AppState,
     id: &SandboxId,
-    request: &CreateSandboxRequest,
+    pause_image: &str,
+    containers: &[ContainerSpec],
+    network_namespace: Option<&std::path::Path>,
 ) -> Result<(), AppError> {
-    let network_namespace = state.config.runtime.network_namespace.as_deref();
+    let resolv_conf = state
+        .network
+        .enabled()
+        .then(|| state.paths.sandbox_resolv_conf(id));
     state
         .gvisor
         .prepare_pause_bundle(
             &state.paths,
             id,
-            &state.config.runtime.pause_image,
+            pause_image,
             network_namespace,
+            resolv_conf.as_deref(),
         )
         .await?;
 
-    for container in &request.containers {
+    for container in containers {
         state
             .gvisor
-            .prepare_container_bundle(&state.paths, id, container, network_namespace)
+            .prepare_container_bundle(
+                &state.paths,
+                id,
+                container,
+                network_namespace,
+                resolv_conf.as_deref(),
+            )
             .await?;
     }
     Ok(())
@@ -659,6 +815,10 @@ async fn cleanup_failed_sandbox(
             error!(%id, %err, "failed to persist failed sandbox cleanup status");
         }
         return;
+    }
+
+    if let Err(err) = state.network.delete_sandbox(&state.paths, id).await {
+        error!(%id, %err, "failed to remove sandbox network while cleaning up failed sandbox");
     }
 
     if let Err(err) = tokio::fs::remove_dir_all(state.paths.sandbox_dir(id)).await
@@ -824,6 +984,17 @@ async fn delete_sandbox(
             .await?;
         error!(%id, ?failures, "sandbox delete left containers running; retaining state");
         return Err(AppError::TeardownFailed(message));
+    }
+
+    if let Err(err) = state.network.delete_sandbox(&state.paths, &id).await {
+        let message = format!("failed to delete sandbox network: {err}");
+        state
+            .registry
+            .update(&state.paths, &id, |record| {
+                record.set_error(message.clone());
+            })
+            .await?;
+        return Err(err.into());
     }
 
     // Remove the sandbox directory (state.json, bundles, EROFS images, logs) so
@@ -1277,19 +1448,51 @@ async fn stream_background_exec_events(
         stream::empty::<BackgroundExecEvent>().left_stream()
     } else {
         stream::unfold(
-            (receiver, next_live_sequence, false),
-            |(mut receiver, next_sequence, done)| async move {
+            (
+                session.clone(),
+                receiver,
+                next_live_sequence,
+                VecDeque::new(),
+                false,
+            ),
+            |(session, mut receiver, mut next_sequence, mut pending, done): (
+                Arc<background_exec::BackgroundExecSession>,
+                tokio::sync::broadcast::Receiver<BackgroundExecEvent>,
+                u64,
+                VecDeque<BackgroundExecEvent>,
+                bool,
+            )| async move {
                 if done {
                     return None;
                 }
                 loop {
+                    // Drain any events recovered from the in-memory buffer after
+                    // a lag before going back to the live channel.
+                    if let Some(event) = pending.pop_front() {
+                        if event.sequence < next_sequence {
+                            continue;
+                        }
+                        next_sequence = event.sequence.saturating_add(1);
+                        let done = event.event.is_terminal();
+                        return Some((event, (session, receiver, next_sequence, pending, done)));
+                    }
                     match receiver.recv().await {
                         Ok(event) if event.sequence < next_sequence => {}
                         Ok(event) => {
+                            next_sequence = event.sequence.saturating_add(1);
                             let done = event.event.is_terminal();
-                            return Some((event, (receiver, next_sequence, done)));
+                            return Some((
+                                event,
+                                (session, receiver, next_sequence, pending, done),
+                            ));
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        // A slow consumer fell behind the broadcast buffer.
+                        // Rather than silently dropping events, refill from the
+                        // session's retained buffer; only events already evicted
+                        // from that buffer are unrecoverable.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            pending = session.events_since(next_sequence).await.into();
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                     }
                 }
@@ -1379,6 +1582,9 @@ async fn suspend_sandbox(
             "sandbox {id} is {:?}, not running",
             record.status
         )));
+    }
+    if !runtime_supports_checkpoints(&state) {
+        return Err(AppError::Conflict(hostinet_checkpoint_unsupported_message()));
     }
     state.background_execs.kill_for_sandbox(id.as_str()).await;
 
@@ -1484,13 +1690,24 @@ async fn resume_locked(
     id: &SandboxId,
     record: &SandboxRecord,
 ) -> Result<SandboxRecord, AppError> {
+    let spec = read_sandbox_spec(state, id).await?;
+    let network_namespace = prepare_sandbox_network(state, id, &spec.network).await?;
     let image_dir = state.paths.checkpoint_dir(id);
+    // Replay the network mode the checkpoint was taken with. Recomputing it from
+    // current daemon config would mismatch the checkpoint if the config changed
+    // since create/suspend; fall back only for specs persisted before the field
+    // existed.
+    let network_mode = spec.network_mode.map_or_else(
+        || runsc_network_mode(state, network_namespace.as_deref()),
+        RunscNetworkMode::from,
+    );
     if let Err(err) = restore_sandbox(
         &state.paths,
         id,
         &record.containers,
         &image_dir,
         RestoreSpecValidation::Enforce,
+        network_mode,
     )
     .await
     {
@@ -1641,25 +1858,30 @@ async fn snapshot_sandbox_handler(
     let mut snapshot_cleanup = SnapshotReservationGuard::new(&state, name.clone());
 
     let image_dir = state.paths.snapshot_checkpoint_dir(&name);
-    let captured = match record.status {
+    let captured: Result<(), AppError> = match record.status {
+        SandboxStatus::Running if runtime_supports_checkpoints(&state) => {
+            snapshot_sandbox(&state.paths, &id, &record.containers, &image_dir)
+                .await
+                .map_err(Into::into)
+        }
         SandboxStatus::Running => {
-            snapshot_sandbox(&state.paths, &id, &record.containers, &image_dir).await
+            Err(AppError::Conflict(hostinet_checkpoint_unsupported_message()))
         }
-        _ => {
-            copy_checkpoint_image(
-                &state.paths.checkpoint_dir(&id),
-                &image_dir,
-                &record.containers,
-            )
-            .await
-        }
+        _ => copy_checkpoint_image(
+            &state.paths.checkpoint_dir(&id),
+            &image_dir,
+            &record.containers,
+        )
+        .await
+        .map_err(Into::into),
     };
     if let Err(err) = captured {
         snapshot_cleanup.cleanup_now().await;
-        return Err(err.into());
+        return Err(err);
     }
 
-    let manifest = snapshots::SnapshotManifest::new(name, spec.pause_image, spec.containers);
+    let manifest =
+        snapshots::SnapshotManifest::new(name, spec.pause_image, spec.containers, spec.network);
     if let Err(err) = snapshots::write_manifest(&state.paths, &manifest).await {
         snapshot_cleanup.cleanup_now().await;
         return Err(err.into());
@@ -1852,6 +2074,8 @@ enum AppError {
     #[error(transparent)]
     Runtime(#[from] oad_runtime::RuntimeError),
     #[error(transparent)]
+    Network(#[from] network::NetworkError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
@@ -1886,9 +2110,12 @@ impl IntoResponse for AppError {
                 "payload_too_large",
                 self.to_string(),
             ),
+            Self::Network(network::NetworkError::InvalidConfig(_)) => {
+                (StatusCode::BAD_REQUEST, "bad_request", self.to_string())
+            }
             // Internal-class errors keep their typed source for the log but
             // return a generic message so internals are not leaked to clients.
-            Self::Oci(_) | Self::Runtime(_) | Self::Io(_) => {
+            Self::Oci(_) | Self::Runtime(_) | Self::Network(_) | Self::Io(_) => {
                 error!(error = %self, source_chain = %error_source_chain(&self), "request failed");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1958,6 +2185,23 @@ async fn shutdown_signal() {
 
 async fn checkpoint_running_sandboxes_for_shutdown(state: &AppState) {
     let mut failed = 0usize;
+
+    if !runtime_supports_checkpoints(state) {
+        let running = state
+            .registry
+            .list()
+            .await
+            .into_iter()
+            .filter(|record| matches!(record.status, SandboxStatus::Running))
+            .count();
+        if running > 0 {
+            info!(
+                running,
+                "skipping daemon-shutdown checkpoints because runsc host networking does not support checkpoint"
+            );
+        }
+        return;
+    }
 
     for recovered in state.registry.list().await {
         if !matches!(recovered.status, SandboxStatus::Running) {

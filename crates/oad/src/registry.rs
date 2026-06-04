@@ -42,11 +42,47 @@ impl NamedLocks {
             slot.holders += 1;
             slot.lock.clone()
         };
+        // If the caller is cancelled while waiting on the contended lock below,
+        // this releases the holder count we just incremented so the slot can
+        // still be pruned. Disarmed once the real guard is built.
+        let pending = PendingHolder {
+            inner: Some(self.inner.clone()),
+            key,
+        };
         let guard = lock.lock_owned().await;
+        pending.disarm();
         NamedLockGuard {
             inner: self.inner.clone(),
             key: key.to_string(),
             _guard: guard,
+        }
+    }
+}
+
+/// Decrements a lock slot's holder count (pruning the slot at zero) unless
+/// `disarm`ed. Guards the window between incrementing `holders` and acquiring
+/// the owned mutex, where a cancelled future would otherwise leak the count.
+struct PendingHolder<'a> {
+    inner: Option<Arc<StdMutex<BTreeMap<String, NamedLockSlot>>>>,
+    key: &'a str,
+}
+
+impl PendingHolder<'_> {
+    fn disarm(mut self) {
+        self.inner = None;
+    }
+}
+
+impl Drop for PendingHolder<'_> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            let mut locks = inner.lock().expect("named lock map poisoned");
+            if let Some(slot) = locks.get_mut(self.key) {
+                slot.holders -= 1;
+                if slot.holders == 0 {
+                    locks.remove(self.key);
+                }
+            }
         }
     }
 }
@@ -101,6 +137,34 @@ impl Drop for LifecycleGuard {
             slot.holders -= 1;
             if slot.holders == 0 {
                 locks.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// Cancellation-safety counterpart to [`LifecycleGuard`]: decrements the slot's
+/// holder count (pruning at zero) unless `disarm`ed after the owned mutex is
+/// acquired.
+struct PendingLifecycleHolder<'a> {
+    inner: Option<Arc<RegistryInner>>,
+    id: &'a str,
+}
+
+impl PendingLifecycleHolder<'_> {
+    fn disarm(mut self) {
+        self.inner = None;
+    }
+}
+
+impl Drop for PendingLifecycleHolder<'_> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            let mut locks = inner.locks.lock().expect("lifecycle lock map poisoned");
+            if let Some(slot) = locks.get_mut(self.id) {
+                slot.holders -= 1;
+                if slot.holders == 0 {
+                    locks.remove(self.id);
+                }
             }
         }
     }
@@ -167,7 +231,14 @@ impl SandboxRegistry {
             slot.holders += 1;
             slot.lock.clone()
         };
+        // Release the holder count if the caller is cancelled while waiting on
+        // the contended lifecycle lock; disarmed once the guard is built.
+        let pending = PendingLifecycleHolder {
+            inner: Some(self.inner.clone()),
+            id: id.as_str(),
+        };
         let guard = lock.lock_owned().await;
+        pending.disarm();
         LifecycleGuard {
             inner: self.inner.clone(),
             id: id.to_string(),

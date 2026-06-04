@@ -8,7 +8,7 @@
 
 use std::io;
 
-use oad_core::{ContainerSpec, OadPaths};
+use oad_core::{ContainerSpec, OadPaths, SandboxNetworkSpec};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -23,17 +23,26 @@ pub struct SnapshotManifest {
     pub pause_image: String,
     /// User container specs (excluding the reserved `pause` container).
     pub containers: Vec<ContainerSpec>,
+    /// Network policy inherited by forks unless explicitly overridden.
+    #[serde(default)]
+    pub network: SandboxNetworkSpec,
     pub created_at: OffsetDateTime,
 }
 
 impl SnapshotManifest {
     /// Builds a manifest stamped with the current UTC time.
     #[must_use]
-    pub fn new(name: String, pause_image: String, containers: Vec<ContainerSpec>) -> Self {
+    pub fn new(
+        name: String,
+        pause_image: String,
+        containers: Vec<ContainerSpec>,
+        network: SandboxNetworkSpec,
+    ) -> Self {
         Self {
             name,
             pause_image,
             containers,
+            network,
             created_at: OffsetDateTime::now_utc(),
         }
     }
@@ -127,8 +136,12 @@ mod tests {
     async fn reserve_is_atomic_for_existing_snapshot_dir() {
         let temp = tempfile::tempdir().unwrap();
         let paths = OadPaths::new(temp.path());
-        let manifest =
-            SnapshotManifest::new("golden".to_string(), "pause:latest".to_string(), Vec::new());
+        let manifest = SnapshotManifest::new(
+            "golden".to_string(),
+            "pause:latest".to_string(),
+            Vec::new(),
+            SandboxNetworkSpec::default(),
+        );
 
         assert!(reserve(&paths, "golden").await.unwrap());
         write_manifest(&paths, &manifest).await.unwrap();
@@ -149,8 +162,12 @@ mod tests {
     async fn write_manifest_uses_final_manifest_path_only() {
         let temp = tempfile::tempdir().unwrap();
         let paths = OadPaths::new(temp.path());
-        let manifest =
-            SnapshotManifest::new("golden".to_string(), "pause:latest".to_string(), Vec::new());
+        let manifest = SnapshotManifest::new(
+            "golden".to_string(),
+            "pause:latest".to_string(),
+            Vec::new(),
+            SandboxNetworkSpec::default(),
+        );
 
         write_manifest(&paths, &manifest).await.unwrap();
 

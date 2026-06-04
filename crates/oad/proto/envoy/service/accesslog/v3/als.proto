@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package envoy.service.accesslog.v3;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/wrappers.proto";
+
+service AccessLogService {
+  rpc StreamAccessLogs(stream StreamAccessLogsMessage) returns (StreamAccessLogsResponse);
+}
+
+message StreamAccessLogsResponse {}
+
+message StreamAccessLogsMessage {
+  message HTTPAccessLogEntries {
+    repeated HTTPAccessLogEntry log_entry = 1;
+  }
+
+  message TCPAccessLogEntries {
+    repeated TCPAccessLogEntry log_entry = 1;
+  }
+
+  oneof log_entries {
+    HTTPAccessLogEntries http_logs = 2;
+    TCPAccessLogEntries tcp_logs = 3;
+  }
+}
+
+message HTTPAccessLogEntry {
+  AccessLogCommon common_properties = 1;
+  HTTPVersion protocol_version = 2;
+  HTTPRequestProperties request = 3;
+  HTTPResponseProperties response = 4;
+}
+
+enum HTTPVersion {
+  PROTOCOL_UNSPECIFIED = 0;
+  HTTP10 = 1;
+  HTTP11 = 2;
+  HTTP2 = 3;
+  HTTP3 = 4;
+}
+
+message HTTPRequestProperties {
+  int32 request_method = 1;
+  string scheme = 2;
+  string authority = 3;
+  google.protobuf.UInt32Value port = 4;
+  string path = 5;
+  string user_agent = 6;
+  string referer = 7;
+  string forwarded_for = 8;
+  string request_id = 9;
+  string original_path = 10;
+}
+
+message HTTPResponseProperties {
+  google.protobuf.UInt32Value response_code = 1;
+  uint64 response_headers_bytes = 2;
+  uint64 response_body_bytes = 3;
+  string response_code_details = 6;
+}
+
+message TCPAccessLogEntry {
+  AccessLogCommon common_properties = 1;
+  ConnectionProperties connection_properties = 2;
+}
+
+message ConnectionProperties {
+  uint64 received_bytes = 1;
+  uint64 sent_bytes = 2;
+}
+
+message AccessLogCommon {
+  Address downstream_remote_address = 2;
+  TLSProperties tls_properties = 4;
+  google.protobuf.Timestamp start_time = 5;
+  // Total time from connection start to the last downstream tx byte. Used to
+  // derive the egress span's end timestamp. Field number 12 matches Envoy's
+  // proto (field 9 there is time_to_first_upstream_rx_byte); a mismatch would
+  // leave this unset on the wire and collapse every span to zero length.
+  google.protobuf.Duration time_to_last_downstream_tx_byte = 12;
+  Address upstream_remote_address = 13;
+  ResponseFlags response_flags = 16;
+  string upstream_transport_failure_reason = 18;
+  // Total request/connection duration. For TCP this is the downstream
+  // connection duration and is more reliable for span length than
+  // time_to_last_downstream_tx_byte, which Envoy may omit.
+  google.protobuf.Duration duration = 23;
+}
+
+message TLSProperties {
+  string tls_sni_hostname = 3;
+}
+
+message Address {
+  oneof address {
+    SocketAddress socket_address = 1;
+  }
+}
+
+message SocketAddress {
+  string address = 2;
+  oneof port_specifier {
+    uint32 port_value = 3;
+  }
+}
+
+message ResponseFlags {
+  bool failed_local_healthcheck = 1;
+  bool no_healthy_upstream = 2;
+  bool upstream_request_timeout = 3;
+  bool local_reset = 4;
+  bool upstream_remote_reset = 5;
+  bool upstream_connection_failure = 6;
+  bool upstream_connection_termination = 7;
+  bool upstream_overflow = 8;
+  bool no_route_found = 9;
+  bool delay_injected = 10;
+  bool fault_injected = 11;
+  bool rate_limited = 12;
+  bool rate_limit_service_error = 14;
+  bool downstream_connection_termination = 15;
+  bool upstream_retry_limit_exceeded = 16;
+  bool stream_idle_timeout = 17;
+  bool invalid_envoy_request_headers = 18;
+  bool downstream_protocol_error = 19;
+  bool upstream_max_stream_duration_reached = 20;
+  bool response_from_cache_filter = 21;
+  bool no_filter_config_found = 22;
+  bool duration_timeout = 23;
+  bool upstream_protocol_error = 24;
+  bool no_cluster_found = 25;
+  bool overload_manager = 26;
+  bool dns_resolution_failure = 27;
+  bool downstream_remote_reset = 28;
+}

@@ -564,6 +564,7 @@ fn build_create_request(args: CreateArgs) -> Result<CreateSandboxRequest> {
             id: args.id,
             containers: Vec::new(),
             from_snapshot: Some(snapshot),
+            network: None,
         });
     }
 
@@ -589,6 +590,7 @@ fn build_create_request(args: CreateArgs) -> Result<CreateSandboxRequest> {
             env,
         }],
         from_snapshot: None,
+        network: None,
     })
 }
 

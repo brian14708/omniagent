@@ -40,8 +40,14 @@ const REGISTRY_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 const DEFAULT_MANIFEST_CACHE_TTL: Duration = Duration::from_mins(5);
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TOKEN_BYTES: u64 = 1024 * 1024;
 const MAX_LAYER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_UNPACKED_LAYER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Total unpacked bytes allowed across *all* layers of one image. Enforced as a
+/// single image-wide budget (not per layer) so a manifest with many layers
+/// cannot multiply the cap and fill the host filesystem.
+const MAX_UNPACKED_IMAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Maximum number of layer descriptors accepted in a single image manifest.
+const MAX_LAYERS: usize = 512;
 const MAX_REGISTRY_REDIRECTS: usize = 5;
 
 const MANIFEST_ACCEPT: &str = concat!(
@@ -76,6 +82,7 @@ impl GvisorManager {
         sandbox_id: &SandboxId,
         image: &str,
         network_namespace: Option<&Path>,
+        resolv_conf: Option<&Path>,
     ) -> Result<(), OciError> {
         let staging = paths.rootfs_staging_dir(sandbox_id, PAUSE_CONTAINER);
         let pulled = self
@@ -100,6 +107,7 @@ impl GvisorManager {
             rootfs,
             rootfs_overlay,
             network_namespace: network_namespace.map(Path::to_path_buf),
+            resolv_conf: resolv_conf.map(Path::to_path_buf),
             annotations: BTreeMap::from([
                 (
                     "io.kubernetes.cri.container-type".to_string(),
@@ -126,6 +134,7 @@ impl GvisorManager {
         sandbox_id: &SandboxId,
         container: &ContainerSpec,
         network_namespace: Option<&Path>,
+        resolv_conf: Option<&Path>,
     ) -> Result<(), OciError> {
         let staging = paths.rootfs_staging_dir(sandbox_id, &container.name);
         let pulled = self
@@ -152,6 +161,7 @@ impl GvisorManager {
             rootfs,
             rootfs_overlay,
             network_namespace: network_namespace.map(Path::to_path_buf),
+            resolv_conf: resolv_conf.map(Path::to_path_buf),
             annotations: BTreeMap::from([
                 (
                     "io.kubernetes.cri.container-type".to_string(),
@@ -237,6 +247,12 @@ impl RegistryClient {
             }
             None => manifest,
         };
+
+        if manifest.layers.len() > MAX_LAYERS {
+            return Err(OciError::InvalidManifest(
+                "image manifest has too many layers",
+            ));
+        }
 
         let config_descriptor = manifest.config.ok_or(OciError::InvalidManifest(
             "image manifest is missing config descriptor",
@@ -651,7 +667,8 @@ impl RegistryClient {
             query.append_pair("scope", &scope);
         }
         let response = self.http.get(url).send().await?.error_for_status()?;
-        let token = response.json::<TokenResponse>().await?;
+        let bytes = read_response_limited(response, "token", MAX_TOKEN_BYTES).await?;
+        let token: TokenResponse = parse_json_body("token", &challenge.realm, &bytes)?;
         token
             .token
             .or(token.access_token)
@@ -763,14 +780,28 @@ fn validate_remote_https_url(url: &Url) -> Result<(), ()> {
 }
 
 const fn forbidden_ipv4_host(addr: Ipv4Addr) -> bool {
+    let [a, b, c, _] = addr.octets();
     addr.is_loopback()
         || addr.is_private()
         || addr.is_link_local()
         || addr.is_unspecified()
         || addr.is_multicast()
+        || addr.is_broadcast()
+        // 0.0.0.0/8 "this host on this network"
+        || a == 0
+        // 100.64.0.0/10 carrier-grade NAT
+        || (a == 100 && (b & 0xc0) == 0x40)
+        // 192.0.0.0/24 IETF protocol assignments
+        || (a == 192 && b == 0 && c == 0)
 }
 
 const fn forbidden_ipv6_host(addr: Ipv6Addr) -> bool {
+    // An IPv4-mapped (`::ffff:a.b.c.d`) or IPv4-compatible host resolves to its
+    // embedded IPv4 address, so apply the IPv4 denylist to it — otherwise
+    // `[::ffff:169.254.169.254]` would bypass the link-local/metadata block.
+    if let Some(v4) = addr.to_ipv4() {
+        return forbidden_ipv4_host(v4);
+    }
     addr.is_loopback()
         || addr.is_unspecified()
         || addr.is_unique_local()
@@ -942,6 +973,7 @@ struct GvisorConfig<'a> {
     rootfs: PathBuf,
     rootfs_overlay: PathBuf,
     network_namespace: Option<PathBuf>,
+    resolv_conf: Option<PathBuf>,
     annotations: BTreeMap<String, String>,
 }
 
@@ -982,6 +1014,10 @@ async fn write_gvisor_config_json(path: &Path, config: &GvisorConfig<'_>) -> Res
         GVISOR_ROOTFS_OVERLAY_ANNOTATION.to_string(),
         format!("dir={}", config.rootfs_overlay.display()),
     );
+    let resolv_conf = config
+        .resolv_conf
+        .as_deref()
+        .unwrap_or_else(|| Path::new("/etc/resolv.conf"));
     let config_json = json!({
         "ociVersion": "1.0.2",
         "process": {
@@ -1013,7 +1049,7 @@ async fn write_gvisor_config_json(path: &Path, config: &GvisorConfig<'_>) -> Res
             {
                 "destination": "/etc/resolv.conf",
                 "type": "bind",
-                "source": "/etc/resolv.conf",
+                "source": resolv_conf,
                 "options": ["ro"]
             }
         ],
@@ -1126,6 +1162,12 @@ fn blob_filename(digest: &str) -> Result<String, OciError> {
     let Some(hex_digest) = digest.strip_prefix("sha256:") else {
         return Err(OciError::UnsupportedDigest(digest.to_string()));
     };
+    // The digest comes from an untrusted manifest and is used to build a cache
+    // file path; reject anything that is not a bare sha256 hex string so it can
+    // never contain path separators or `..` traversal components.
+    if hex_digest.len() != 64 || !hex_digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(OciError::UnsupportedDigest(digest.to_string()));
+    }
     Ok(format!("sha256-{hex_digest}.blob"))
 }
 
@@ -1314,13 +1356,20 @@ async fn build_erofs_from_staging(
     remove_dir_if_exists(staging).await?;
     async_fs::create_dir_all(staging).await?;
 
+    // One budget shared across every layer of this image, so the total unpacked
+    // size is bounded regardless of how many layers the manifest lists.
+    let budget = ExtractionBudget::new(MAX_UNPACKED_IMAGE_BYTES);
+
     for (path, media_type) in blobs {
         let staging = staging.to_path_buf();
         let media_type = media_type.clone();
         let path = path.clone();
-        tokio::task::spawn_blocking(move || extract_layer_from_file(&staging, &media_type, &path))
-            .await
-            .map_err(|err| OciError::Join(err.to_string()))??;
+        let budget = budget.clone();
+        tokio::task::spawn_blocking(move || {
+            extract_layer_from_file(&staging, &media_type, &path, &budget)
+        })
+        .await
+        .map_err(|err| OciError::Join(err.to_string()))??;
     }
 
     ensure_mount_points(staging).await?;
@@ -1350,10 +1399,19 @@ fn extract_layer(rootfs: &Path, media_type: &str, bytes: Bytes) -> Result<(), Oc
     } else {
         Box::new(Cursor::new(bytes))
     };
-    extract_layer_from_reader(rootfs, reader)
+    extract_layer_from_reader(
+        rootfs,
+        reader,
+        &ExtractionBudget::new(MAX_UNPACKED_IMAGE_BYTES),
+    )
 }
 
-fn extract_layer_from_file(rootfs: &Path, media_type: &str, path: &Path) -> Result<(), OciError> {
+fn extract_layer_from_file(
+    rootfs: &Path,
+    media_type: &str,
+    path: &Path,
+    budget: &ExtractionBudget,
+) -> Result<(), OciError> {
     let mut file = File::open(path)?;
     let mut magic = [0_u8; 2];
     let read = file.read(&mut magic)?;
@@ -1365,12 +1423,15 @@ fn extract_layer_from_file(rootfs: &Path, media_type: &str, path: &Path) -> Resu
         } else {
             Box::new(file)
         };
-    extract_layer_from_reader(rootfs, reader)
+    extract_layer_from_reader(rootfs, reader, budget)
 }
 
-fn extract_layer_from_reader(rootfs: &Path, reader: Box<dyn Read>) -> Result<(), OciError> {
+fn extract_layer_from_reader(
+    rootfs: &Path,
+    reader: Box<dyn Read>,
+    budget: &ExtractionBudget,
+) -> Result<(), OciError> {
     let mut archive = Archive::new(reader);
-    let mut budget = ExtractionBudget::new(MAX_UNPACKED_LAYER_BYTES);
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.to_path_buf();
@@ -1390,13 +1451,7 @@ fn extract_layer_from_reader(rootfs: &Path, reader: Box<dyn Read>) -> Result<(),
                 ensure_directory(rootfs, &target, Some(entry.header().mode()?))?;
             }
             EntryType::Regular => {
-                write_regular_file(
-                    rootfs,
-                    &target,
-                    entry.header().mode()?,
-                    &mut entry,
-                    &mut budget,
-                )?;
+                write_regular_file(rootfs, &target, entry.header().mode()?, &mut entry, budget)?;
             }
             EntryType::Symlink => {
                 let link_name = entry
@@ -1547,7 +1602,7 @@ fn ensure_regular_file_exists(rootfs: &Path, target: &Path, mode: u32) -> Result
             target,
             mode,
             &mut io::empty(),
-            &mut ExtractionBudget::new(MAX_UNPACKED_LAYER_BYTES),
+            &ExtractionBudget::new(MAX_UNPACKED_IMAGE_BYTES),
         ),
     }
 }
@@ -1557,7 +1612,7 @@ fn write_regular_file(
     target: &Path,
     mode: u32,
     contents: &mut dyn Read,
-    budget: &mut ExtractionBudget,
+    budget: &ExtractionBudget,
 ) -> Result<(), OciError> {
     ensure_parent_safe(rootfs, target)?;
     if let Some(parent) = target.parent() {
@@ -1575,29 +1630,50 @@ fn write_regular_file(
     Ok(())
 }
 
+/// Tracks the total unpacked bytes remaining for one image's extraction. Cheap
+/// to `clone` (shared counter) so it can be threaded through the per-layer
+/// `spawn_blocking` tasks while enforcing a single image-wide cap.
+#[derive(Clone)]
 struct ExtractionBudget {
-    remaining: u64,
+    remaining: std::sync::Arc<AtomicU64>,
 }
 
 impl ExtractionBudget {
-    const fn new(limit: u64) -> Self {
-        Self { remaining: limit }
+    fn new(limit: u64) -> Self {
+        Self {
+            remaining: std::sync::Arc::new(AtomicU64::new(limit)),
+        }
     }
 
-    fn copy(&mut self, reader: &mut dyn Read, writer: &mut File) -> Result<(), OciError> {
+    fn take(&self, amount: u64) -> Result<(), OciError> {
+        let mut current = self.remaining.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_sub(amount) else {
+                return Err(OciError::BodyTooLarge {
+                    kind: "unpacked image",
+                    limit: MAX_UNPACKED_IMAGE_BYTES,
+                });
+            };
+            match self.remaining.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn copy(&self, reader: &mut dyn Read, writer: &mut File) -> Result<(), OciError> {
         let mut buf = vec![0_u8; 128 * 1024].into_boxed_slice();
         loop {
             let read = reader.read(&mut buf)?;
             if read == 0 {
                 return Ok(());
             }
-            self.remaining =
-                self.remaining
-                    .checked_sub(read as u64)
-                    .ok_or(OciError::BodyTooLarge {
-                        kind: "unpacked layer",
-                        limit: MAX_UNPACKED_LAYER_BYTES,
-                    })?;
+            self.take(read as u64)?;
             writer.write_all(&buf[..read])?;
         }
     }
@@ -2096,6 +2172,63 @@ mod tests {
     }
 
     #[test]
+    fn ssrf_guard_rejects_ipv4_mapped_ipv6_metadata_host() {
+        // ::ffff:169.254.169.254 must be blocked just like the bare IPv4 form.
+        for host in [
+            "https://[::ffff:169.254.169.254]/v2/",
+            "https://[::ffff:127.0.0.1]/v2/",
+            "https://[::ffff:10.0.0.1]/v2/",
+        ] {
+            let url = Url::parse(host).unwrap();
+            assert!(
+                validate_remote_https_url(&url).is_err(),
+                "expected {host} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_guard_rejects_extra_ipv4_ranges() {
+        for host in [
+            "https://255.255.255.255/v2/", // limited broadcast
+            "https://100.64.0.1/v2/",      // CGNAT 100.64.0.0/10
+            "https://0.1.2.3/v2/",         // 0.0.0.0/8
+            "https://192.0.0.1/v2/",       // 192.0.0.0/24
+        ] {
+            let url = Url::parse(host).unwrap();
+            assert!(
+                validate_remote_https_url(&url).is_err(),
+                "expected {host} to be rejected"
+            );
+        }
+        // A genuinely public host is still allowed.
+        assert!(
+            validate_remote_https_url(&Url::parse("https://93.184.216.34/v2/").unwrap()).is_ok()
+        );
+    }
+
+    #[test]
+    fn blob_filename_rejects_non_hex_digest() {
+        // Path-traversal and non-sha256 digests must not become cache paths.
+        for digest in [
+            "sha256:../../../../etc/cron.d/x",
+            "sha256:not-hex",
+            "sha256:",
+            "sha512:0000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            assert!(
+                matches!(blob_filename(digest), Err(OciError::UnsupportedDigest(_))),
+                "expected {digest} to be rejected"
+            );
+        }
+        let valid = "sha256:".to_string() + &"a".repeat(64);
+        assert_eq!(
+            blob_filename(&valid).unwrap(),
+            format!("sha256-{}.blob", "a".repeat(64))
+        );
+    }
+
+    #[test]
     fn descriptor_size_caps_large_bodies() {
         let descriptor = Descriptor {
             media_type: None,
@@ -2169,6 +2302,7 @@ mod tests {
             rootfs: PathBuf::from("/tmp/rootfs.erofs"),
             rootfs_overlay: PathBuf::from("/tmp/rootfs-overlay"),
             network_namespace: None,
+            resolv_conf: None,
             annotations: BTreeMap::new(),
         };
         let config_json = write_config_json(&config).await;
@@ -2197,6 +2331,7 @@ mod tests {
             rootfs: PathBuf::from("/tmp/rootfs.erofs"),
             rootfs_overlay: PathBuf::from("/tmp/rootfs-overlay"),
             network_namespace: Some(PathBuf::from("/run/netns/oad")),
+            resolv_conf: None,
             annotations: BTreeMap::new(),
         };
         let config_json = write_config_json(&config).await;
@@ -2218,6 +2353,7 @@ mod tests {
             rootfs: PathBuf::from("/tmp/rootfs.erofs"),
             rootfs_overlay: PathBuf::from("/tmp/rootfs-overlay"),
             network_namespace: None,
+            resolv_conf: None,
             annotations: BTreeMap::new(),
         };
         let config_json = write_config_json(&config).await;
@@ -2234,5 +2370,29 @@ mod tests {
             config_json["annotations"][GVISOR_ROOTFS_OVERLAY_ANNOTATION], "dir=/tmp/rootfs-overlay",
             "rootfs overlay should be backed by the prepared host directory"
         );
+    }
+
+    #[tokio::test]
+    async fn spec_can_bind_custom_resolv_conf() {
+        let config = GvisorConfig {
+            container_name: "web",
+            args: vec!["/bin/sh".to_string()],
+            env: vec![],
+            cwd: "/".to_string(),
+            rootfs: PathBuf::from("/tmp/rootfs.erofs"),
+            rootfs_overlay: PathBuf::from("/tmp/rootfs-overlay"),
+            network_namespace: None,
+            resolv_conf: Some(PathBuf::from("/run/omniagent/sandboxes/s/resolv.conf")),
+            annotations: BTreeMap::new(),
+        };
+        let config_json = write_config_json(&config).await;
+
+        let resolv = config_json["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["destination"] == "/etc/resolv.conf")
+            .unwrap();
+        assert_eq!(resolv["source"], "/run/omniagent/sandboxes/s/resolv.conf");
     }
 }

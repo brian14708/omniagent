@@ -89,15 +89,17 @@ impl BackgroundExecStore {
 
         let mut matching = Vec::new();
         for session in sessions {
-            if session.info().await.sandbox_id == sandbox_id {
-                matching.push(session);
+            let info = session.info().await;
+            if info.sandbox_id == sandbox_id {
+                matching.push((info.id.clone(), session));
             }
         }
 
-        for session in &matching {
+        for (_, session) in &matching {
             let _ = session.kill().await;
         }
-        for session in matching {
+        let mut exec_ids = Vec::with_capacity(matching.len());
+        for (exec_id, session) in matching {
             if tokio::time::timeout(KILL_SESSION_TIMEOUT, session.wait_finished())
                 .await
                 .is_err()
@@ -108,6 +110,16 @@ impl BackgroundExecStore {
                     sandbox_id = %info.sandbox_id,
                     "timed out waiting for background exec to stop"
                 );
+            }
+            exec_ids.push(exec_id);
+        }
+
+        // Drop the finished sessions from the store so their buffers don't
+        // accumulate for the daemon's lifetime once their sandbox is gone.
+        if !exec_ids.is_empty() {
+            let mut sessions = self.sessions.lock().await;
+            for exec_id in exec_ids {
+                sessions.remove(&exec_id);
             }
         }
     }
@@ -195,20 +207,27 @@ impl BackgroundExecSession {
         }
     }
 
+    // The broadcast send must stay inside the events lock to preserve event
+    // ordering, so the drop-tightening lint (which would move it out) does not
+    // apply here.
+    #[allow(clippy::significant_drop_tightening)]
     async fn push_event(&self, exec_id: &str, event: BackgroundExecEventKind) {
+        // Assign the sequence, enqueue, and broadcast while holding the events
+        // lock so concurrent stdout/stderr readers can't interleave: the
+        // sequence order, VecDeque order, and broadcast order all stay
+        // consistent. fetch_add outside the lock would let reader B (seq N+1)
+        // win the lock ahead of reader A (seq N) and publish out of order.
+        let mut events = self.events.lock().await;
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let event = BackgroundExecEvent {
             sequence,
             exec_id: exec_id.to_string(),
             event,
         };
-        {
-            let mut events = self.events.lock().await;
-            if events.len() == EVENT_BUFFER_CAPACITY {
-                events.pop_front();
-            }
-            events.push_back(event.clone());
+        if events.len() == EVENT_BUFFER_CAPACITY {
+            events.pop_front();
         }
+        events.push_back(event.clone());
         let _ = self.tx.send(event);
     }
 
