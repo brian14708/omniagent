@@ -1,7 +1,5 @@
 //! `oadctl` — command-line client for the oad sandbox daemon.
 
-mod client;
-
 use std::io::Read;
 use std::io::Write;
 
@@ -9,12 +7,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt;
 use oad_api::{
-    BackgroundExecEvent, BackgroundExecEventKind, BackgroundExecInfo, BackgroundExecStdinRequest,
-    CreateSandboxRequest, CreateSnapshotRequest, ExecRequest, StartBackgroundExecRequest,
+    BackgroundExecEventKind, BackgroundExecInfo, BackgroundExecStdinRequest, CreateSandboxRequest,
+    CreateSnapshotRequest, ExecRequest, StartBackgroundExecRequest,
 };
 use oad_core::{ContainerSpec, EnvVar, SandboxRecord};
 
-use crate::client::OadClient;
+use oad_cli::client::{OadClient, parse_sse_event, take_sse_frame};
 
 /// Command-line client for the oad sandbox daemon.
 #[derive(Debug, Parser)]
@@ -407,6 +405,9 @@ async fn run_execs(client: &OadClient, cmd: ExecsCommand) -> Result<()> {
                 command: args.argv,
                 env,
                 cwd: args.cwd,
+                pty: false,
+                rows: None,
+                cols: None,
             };
             let resp = client.start_exec(&args.id, &request).await?;
             print_exec_info(&resp.exec);
@@ -479,33 +480,6 @@ async fn attach_exec(client: &OadClient, id: &str, exec_id: &str, from: u64) -> 
         }
     }
     Ok(0)
-}
-
-fn take_sse_frame(buffer: &mut String) -> Option<String> {
-    let idx = buffer.find("\n\n")?;
-    let frame = buffer[..idx].to_string();
-    buffer.drain(..idx + 2);
-    Some(frame)
-}
-
-fn parse_sse_event(frame: &str) -> Result<Option<BackgroundExecEvent>> {
-    let mut data_lines = Vec::new();
-    for line in frame.lines() {
-        if line.starts_with(':') || line.is_empty() {
-            continue;
-        }
-        let Some(rest) = line.strip_prefix("data:") else {
-            continue;
-        };
-        data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
-    }
-    if data_lines.is_empty() {
-        return Ok(None);
-    }
-    let data = data_lines.join("\n");
-    serde_json::from_str(&data)
-        .map(Some)
-        .with_context(|| format!("failed to parse SSE event payload: {data}"))
 }
 
 fn read_stdin_payload(text: Option<&str>, file: Option<&str>) -> Result<Vec<u8>> {

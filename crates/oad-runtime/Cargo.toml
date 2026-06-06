@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 oad-core.workspace = true
+portable-pty.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

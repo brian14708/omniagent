@@ -35,7 +35,13 @@ const SERVICE_NAME: &str = "oad";
 mod envoy {
     pub mod service {
         pub mod accesslog {
-            #[allow(clippy::all, clippy::nursery, clippy::pedantic, warnings)]
+            #[expect(
+                clippy::all,
+                clippy::nursery,
+                clippy::pedantic,
+                warnings,
+                reason = "tonic generates Envoy proto bindings that we do not hand-edit"
+            )]
             pub mod v3 {
                 tonic::include_proto!("envoy.service.accesslog.v3");
             }
@@ -644,10 +650,9 @@ fn start_time_from_proto(timestamp: Option<&prost_types::Timestamp>) -> TimeFiel
     let Ok(nanos) = u32::try_from(timestamp.nanos) else {
         return TimeField::Invalid;
     };
-    match SystemTime::UNIX_EPOCH.checked_add(Duration::new(seconds, nanos)) {
-        Some(time) => TimeField::Valid(time),
-        None => TimeField::Invalid,
-    }
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::new(seconds, nanos))
+        .map_or(TimeField::Invalid, TimeField::Valid)
 }
 
 fn span_duration_from_proto(common: &AccessLogCommon) -> TimeField<Duration> {

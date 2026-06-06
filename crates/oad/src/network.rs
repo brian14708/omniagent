@@ -122,6 +122,12 @@ struct SandboxNetworkState {
     spec: SandboxNetworkSpec,
 }
 
+#[derive(Debug, Clone)]
+pub struct SandboxNetworkInfo {
+    pub host_gateway_ip: Ipv4Addr,
+    pub sandbox_ip: Ipv4Addr,
+}
+
 struct HostFirewallRule {
     chain: &'static str,
     args: Vec<String>,
@@ -268,6 +274,22 @@ impl NetworkManager {
 
     pub const fn backend(&self) -> ManagedNetworkBackend {
         self.config.backend
+    }
+
+    pub async fn sandbox_info(
+        &self,
+        paths: &OadPaths,
+        id: &SandboxId,
+    ) -> Result<Option<SandboxNetworkInfo>, NetworkError> {
+        if !self.config.enabled {
+            return Ok(None);
+        }
+        Ok(read_state(paths, id)
+            .await?
+            .map(|state| SandboxNetworkInfo {
+                host_gateway_ip: state.host_ip,
+                sandbox_ip: state.sandbox_ip,
+            }))
     }
 
     pub async fn reconcile_sandbox(

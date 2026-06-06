@@ -1,9 +1,11 @@
 use std::fs::OpenOptions as StdOpenOptions;
 use std::io::SeekFrom;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
 use oad_core::{OadPaths, PAUSE_CONTAINER, SandboxId, sync_dir, sync_file, temp_path};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::fs;
@@ -87,6 +89,30 @@ pub struct ExecProcess {
     pub stdin: ChildStdin,
     pub stdout: ChildStdout,
     pub stderr: ChildStderr,
+}
+
+/// Running `runsc exec` process connected through a host pseudo-terminal.
+pub struct PtyExecProcess {
+    pub child: Box<dyn portable_pty::Child + Send + Sync>,
+    pub master: Box<dyn MasterPty + Send>,
+    pub reader: Box<dyn Read + Send>,
+    pub writer: Box<dyn Write + Send>,
+    pub killer: Box<dyn ChildKiller + Send + Sync>,
+}
+
+pub struct PtyExecConfig<'a> {
+    pub container: &'a str,
+    pub command: &'a [String],
+    pub env: &'a [String],
+    pub cwd: Option<&'a str>,
+    pub log_path: Option<&'a Path>,
+    pub size: PtySizeSpec,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PtySizeSpec {
+    pub rows: u16,
+    pub cols: u16,
 }
 
 impl Runsc {
@@ -455,6 +481,70 @@ impl Runsc {
             stdin,
             stdout,
             stderr,
+        })
+    }
+
+    /// Starts `argv` inside `container` with `runsc exec` attached to a host
+    /// PTY and returns handles to drive the PTY.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Spawn`] if the PTY or `runsc` process cannot be
+    /// created, or [`RuntimeError::Io`] if PTY handles cannot be cloned.
+    pub async fn spawn_pty_exec(
+        &self,
+        config: PtyExecConfig<'_>,
+    ) -> Result<PtyExecProcess, RuntimeError> {
+        if let Some(parent) = config.log_path.and_then(Path::parent) {
+            fs::create_dir_all(parent).await.map_err(RuntimeError::Io)?;
+        }
+        // runsc detects that its stdio is attached to a host PTY and creates a
+        // TTY for the process inside the sandbox; no extra exec flags are needed.
+        let args = self.exec_args(
+            config.container,
+            config.command,
+            config.env,
+            config.cwd,
+            config.log_path,
+        );
+        debug!(runsc = RUNSC, args = ?args, "spawning pty runsc exec");
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: config.size.rows,
+                cols: config.size.cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|err| RuntimeError::Spawn(std::io::Error::other(err)))?;
+
+        let mut builder = CommandBuilder::new(RUNSC);
+        for arg in &args {
+            builder.arg(arg);
+        }
+
+        let child = pair
+            .slave
+            .spawn_command(builder)
+            .map_err(|err| RuntimeError::Spawn(std::io::Error::other(err)))?;
+        let killer = child.clone_killer();
+        drop(pair.slave);
+
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|err| RuntimeError::Io(std::io::Error::other(err)))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|err| RuntimeError::Io(std::io::Error::other(err)))?;
+
+        Ok(PtyExecProcess {
+            child,
+            master: pair.master,
+            reader,
+            writer,
+            killer,
         })
     }
 
@@ -1126,6 +1216,20 @@ pub async fn spawn_exec_in_container(
 ) -> Result<ExecProcess, RuntimeError> {
     let runsc = runsc_for_sandbox(paths, sandbox_id);
     runsc.spawn_exec(container, argv, env, cwd, log_path).await
+}
+
+/// Starts a command inside a running container attached to a PTY.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError::Spawn`] if `runsc` or the PTY cannot be spawned.
+pub async fn spawn_pty_exec_in_container(
+    paths: &OadPaths,
+    sandbox_id: &SandboxId,
+    config: PtyExecConfig<'_>,
+) -> Result<PtyExecProcess, RuntimeError> {
+    let runsc = runsc_for_sandbox(paths, sandbox_id);
+    runsc.spawn_pty_exec(config).await
 }
 
 /// Reports whether `container` in the sandbox is currently running according to

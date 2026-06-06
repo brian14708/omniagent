@@ -16,6 +16,7 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-semantic-conventions.workspace = true
+portable-pty.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -42,3 +43,8 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+# `prost` is used by the code generated from `tonic::include_proto!` (the
+# generated structs derive `::prost::Message`), so machete can't see the usage.
+[package.metadata.cargo-machete]
+ignored = ["prost"]

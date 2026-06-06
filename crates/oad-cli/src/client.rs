@@ -5,15 +5,17 @@
 
 use anyhow::{Context, Result, anyhow};
 use oad_api::{
+    BackgroundExecEvent, BackgroundExecResizeRequest, BackgroundExecResizeResponse,
     BackgroundExecResponse, BackgroundExecStdinRequest, BackgroundExecStdinResponse,
     CreateSandboxRequest, CreateSnapshotRequest, ErrorResponse, ExecRequest, ExecResponse,
     ListBackgroundExecsResponse, ListSandboxesResponse, ListSnapshotsResponse, LogsResponse,
-    SandboxResponse, SnapshotResponse, StartBackgroundExecRequest,
+    SandboxNetworkResponse, SandboxResponse, SnapshotResponse, StartBackgroundExecRequest,
 };
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 
 /// Client bound to a single daemon base URL and bearer token.
+#[derive(Clone)]
 pub struct OadClient {
     base_url: String,
     token: String,
@@ -25,6 +27,10 @@ impl OadClient {
     ///
     /// `token` may be empty for endpoints that do not require auth (e.g.
     /// `/healthz`); authenticated endpoints will return `401` in that case.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying HTTP client cannot be constructed.
     pub fn new(base_url: &str, token: String) -> Result<Self> {
         let http = Client::builder()
             .build()
@@ -82,12 +88,22 @@ impl OadClient {
     }
 
     /// `GET /healthz` — liveness probe (no auth required).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn health(&self) -> Result<serde_json::Value> {
         let resp = self.send(self.http.get(self.url("/healthz"))).await?;
         Self::read_json(resp).await
     }
 
     /// `POST /v1/sandboxes` — create and start a sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn create(&self, request: &CreateSandboxRequest) -> Result<SandboxResponse> {
         let resp = self
             .send(self.http.post(self.url("/v1/sandboxes")).json(request))
@@ -96,12 +112,22 @@ impl OadClient {
     }
 
     /// `GET /v1/sandboxes` — list all known sandboxes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn list(&self) -> Result<ListSandboxesResponse> {
         let resp = self.send(self.http.get(self.url("/v1/sandboxes"))).await?;
         Self::read_json(resp).await
     }
 
     /// `GET /v1/sandboxes/{id}` — fetch a single sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn get(&self, id: &str) -> Result<SandboxResponse> {
         let resp = self
             .send(self.http.get(self.url(&format!("/v1/sandboxes/{id}"))))
@@ -110,6 +136,11 @@ impl OadClient {
     }
 
     /// `DELETE /v1/sandboxes/{id}` — stop and delete a sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn delete(&self, id: &str) -> Result<SandboxResponse> {
         let resp = self
             .send(self.http.delete(self.url(&format!("/v1/sandboxes/{id}"))))
@@ -118,6 +149,11 @@ impl OadClient {
     }
 
     /// `GET /v1/sandboxes/{id}/logs` — read recent container log lines.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn logs(
         &self,
         id: &str,
@@ -141,7 +177,28 @@ impl OadClient {
         Self::read_json(resp).await
     }
 
+    /// `GET /v1/sandboxes/{id}/network` — managed-network addresses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, managed networking is disabled,
+    /// the daemon rejects the request, or the response body cannot be decoded.
+    pub async fn network(&self, id: &str) -> Result<SandboxNetworkResponse> {
+        let resp = self
+            .send(
+                self.http
+                    .get(self.url(&format!("/v1/sandboxes/{id}/network"))),
+            )
+            .await?;
+        Self::read_json(resp).await
+    }
+
     /// `POST /v1/sandboxes/{id}/exec` — run a command inside a container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn exec(&self, id: &str, request: &ExecRequest) -> Result<ExecResponse> {
         let resp = self
             .send(
@@ -154,6 +211,11 @@ impl OadClient {
     }
 
     /// `POST /v1/sandboxes/{id}/execs` — start a background exec session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn start_exec(
         &self,
         id: &str,
@@ -170,6 +232,11 @@ impl OadClient {
     }
 
     /// `GET /v1/sandboxes/{id}/execs` — list background exec sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn list_execs(&self, id: &str) -> Result<ListBackgroundExecsResponse> {
         let resp = self
             .send(
@@ -181,6 +248,11 @@ impl OadClient {
     }
 
     /// `GET /v1/sandboxes/{id}/execs/{exec_id}` — get session metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn get_exec(&self, id: &str, exec_id: &str) -> Result<BackgroundExecResponse> {
         let resp = self
             .send(
@@ -192,6 +264,11 @@ impl OadClient {
     }
 
     /// `DELETE /v1/sandboxes/{id}/execs/{exec_id}` — request session kill.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn kill_exec(&self, id: &str, exec_id: &str) -> Result<BackgroundExecResponse> {
         let resp = self
             .send(
@@ -203,6 +280,11 @@ impl OadClient {
     }
 
     /// `POST /v1/sandboxes/{id}/execs/{exec_id}/stdin` — write attached stdin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn write_exec_stdin(
         &self,
         id: &str,
@@ -219,7 +301,33 @@ impl OadClient {
         Self::read_json(resp).await
     }
 
+    /// `POST /v1/sandboxes/{id}/execs/{exec_id}/resize` — resize a PTY exec.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the exec is not PTY-backed, the
+    /// daemon rejects the request, or the response body cannot be decoded.
+    pub async fn resize_exec(
+        &self,
+        id: &str,
+        exec_id: &str,
+        request: &BackgroundExecResizeRequest,
+    ) -> Result<BackgroundExecResizeResponse> {
+        let resp = self
+            .send(
+                self.http
+                    .post(self.url(&format!("/v1/sandboxes/{id}/execs/{exec_id}/resize")))
+                    .json(request),
+            )
+            .await?;
+        Self::read_json(resp).await
+    }
+
     /// `GET /v1/sandboxes/{id}/execs/{exec_id}/events` — open the SSE stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails or the daemon rejects it.
     pub async fn exec_events(&self, id: &str, exec_id: &str, from: u64) -> Result<Response> {
         let resp = self
             .send(
@@ -237,6 +345,11 @@ impl OadClient {
     }
 
     /// `POST /v1/sandboxes/{id}/suspend` — checkpoint and tear down a sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn suspend(&self, id: &str) -> Result<SandboxResponse> {
         let resp = self
             .send(
@@ -248,6 +361,11 @@ impl OadClient {
     }
 
     /// `POST /v1/sandboxes/{id}/resume` — restore a suspended sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn resume(&self, id: &str) -> Result<SandboxResponse> {
         let resp = self
             .send(
@@ -259,6 +377,11 @@ impl OadClient {
     }
 
     /// `POST /v1/sandboxes/{id}/snapshot` — snapshot a running sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn snapshot(
         &self,
         id: &str,
@@ -275,12 +398,21 @@ impl OadClient {
     }
 
     /// `GET /v1/snapshots` — list all snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails, the daemon rejects it, or the
+    /// response body cannot be decoded.
     pub async fn list_snapshots(&self) -> Result<ListSnapshotsResponse> {
         let resp = self.send(self.http.get(self.url("/v1/snapshots"))).await?;
         Self::read_json(resp).await
     }
 
     /// `DELETE /v1/snapshots/{name}` — delete a snapshot (204 No Content).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request fails or the daemon rejects it.
     pub async fn delete_snapshot(&self, name: &str) -> Result<()> {
         let resp = self
             .send(self.http.delete(self.url(&format!("/v1/snapshots/{name}"))))
@@ -292,4 +424,41 @@ impl OadClient {
         let bytes = resp.bytes().await.context("failed to read response body")?;
         Err(Self::decode_error(status, &bytes))
     }
+}
+
+/// Splits the next complete SSE frame (terminated by a blank line) off the
+/// front of `buffer`, returning it without the trailing delimiter.
+#[must_use]
+pub fn take_sse_frame(buffer: &mut String) -> Option<String> {
+    let idx = buffer.find("\n\n")?;
+    let frame = buffer[..idx].to_string();
+    buffer.drain(..idx + 2);
+    Some(frame)
+}
+
+/// Parses one SSE frame into a [`BackgroundExecEvent`], joining `data:` lines
+/// and ignoring comments/empty lines. Returns `Ok(None)` for frames with no
+/// data lines (e.g. keep-alive comments).
+///
+/// # Errors
+///
+/// Returns an error when the joined data payload is not valid JSON.
+pub fn parse_sse_event(frame: &str) -> Result<Option<BackgroundExecEvent>> {
+    let mut data_lines = Vec::new();
+    for line in frame.lines() {
+        if line.starts_with(':') || line.is_empty() {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("data:") else {
+            continue;
+        };
+        data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
+    }
+    if data_lines.is_empty() {
+        return Ok(None);
+    }
+    let data = data_lines.join("\n");
+    serde_json::from_str(&data)
+        .map(Some)
+        .with_context(|| format!("failed to parse SSE event payload: {data}"))
 }

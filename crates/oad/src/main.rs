@@ -25,12 +25,13 @@ use axum::{Json, Router};
 use background_exec::BackgroundExecStore;
 use futures_util::{StreamExt, stream};
 use oad_api::{
-    BackgroundExecEvent, BackgroundExecEventKind, BackgroundExecInfo, BackgroundExecResponse,
-    BackgroundExecStatus, BackgroundExecStdinRequest, BackgroundExecStdinResponse,
-    CreateSandboxRequest, CreateSnapshotRequest, ErrorBody, ErrorResponse, ExecRequest,
-    ExecResponse, ListBackgroundExecsResponse, ListSandboxesResponse, ListSnapshotsResponse,
-    LogsQuery, LogsResponse, SandboxResponse, SnapshotInfo, SnapshotResponse,
-    StartBackgroundExecRequest,
+    BackgroundExecEvent, BackgroundExecEventKind, BackgroundExecInfo, BackgroundExecResizeRequest,
+    BackgroundExecResizeResponse, BackgroundExecResponse, BackgroundExecStatus,
+    BackgroundExecStdinRequest, BackgroundExecStdinResponse, CreateSandboxRequest,
+    CreateSnapshotRequest, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, ErrorBody, ErrorResponse,
+    ExecRequest, ExecResponse, ListBackgroundExecsResponse, ListSandboxesResponse,
+    ListSnapshotsResponse, LogsQuery, LogsResponse, SandboxNetworkResponse, SandboxResponse,
+    SnapshotInfo, SnapshotResponse, StartBackgroundExecRequest,
 };
 use oad_core::{
     ContainerSpec, EgressDestination, EgressPolicy, EgressRule, EnvVar, L7EgressPolicy,
@@ -258,6 +259,7 @@ fn router(state: AppState) -> Router {
             get(get_sandbox).delete(delete_sandbox),
         )
         .route("/v1/sandboxes/{id}/logs", get(get_logs))
+        .route("/v1/sandboxes/{id}/network", get(get_sandbox_network))
         .route("/v1/sandboxes/{id}/exec", post(exec_in_sandbox))
         .route(
             "/v1/sandboxes/{id}/execs",
@@ -270,6 +272,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/v1/sandboxes/{id}/execs/{exec_id}/stdin",
             post(write_background_exec_stdin),
+        )
+        .route(
+            "/v1/sandboxes/{id}/execs/{exec_id}/resize",
+            post(resize_background_exec),
         )
         .route(
             "/v1/sandboxes/{id}/execs/{exec_id}/events",
@@ -314,12 +320,14 @@ fn router(state: AppState) -> Router {
         get_sandbox,
         delete_sandbox,
         get_logs,
+        get_sandbox_network,
         exec_in_sandbox,
         start_background_exec,
         list_background_execs,
         get_background_exec,
         kill_background_exec,
         write_background_exec_stdin,
+        resize_background_exec,
         stream_background_exec_events,
         suspend_sandbox,
         resume_sandbox,
@@ -332,6 +340,7 @@ fn router(state: AppState) -> Router {
         SandboxResponse,
         ListSandboxesResponse,
         LogsResponse,
+        SandboxNetworkResponse,
         ExecRequest,
         ExecResponse,
         StartBackgroundExecRequest,
@@ -341,6 +350,8 @@ fn router(state: AppState) -> Router {
         ListBackgroundExecsResponse,
         BackgroundExecStdinRequest,
         BackgroundExecStdinResponse,
+        BackgroundExecResizeRequest,
+        BackgroundExecResizeResponse,
         BackgroundExecEvent,
         BackgroundExecEventKind,
         ErrorResponse,
@@ -1064,6 +1075,47 @@ async fn get_logs(
     }))
 }
 
+/// Return managed-network addresses for a sandbox.
+#[utoipa::path(
+    get,
+    path = "/v1/sandboxes/{id}/network",
+    params(("id" = String, Path, description = "Sandbox id")),
+    responses(
+        (status = 200, description = "Sandbox managed-network addresses", body = SandboxNetworkResponse),
+        (status = 400, description = "Invalid sandbox id", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Sandbox or network state not found", body = ErrorResponse),
+        (status = 409, description = "Managed networking is disabled", body = ErrorResponse),
+    ),
+    security(("bearer_token" = [])),
+    tag = "sandboxes",
+)]
+async fn get_sandbox_network(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<SandboxNetworkResponse>, AppError> {
+    let id = parse_sandbox_id(id)?;
+    if !state.registry.contains(&id).await {
+        return Err(AppError::NotFound(format!("sandbox {id} not found")));
+    }
+    if !state.network.enabled() {
+        return Err(AppError::Conflict(
+            "managed networking is disabled".to_string(),
+        ));
+    }
+    let info = state
+        .network
+        .sandbox_info(&state.paths, &id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("network state for sandbox {id} not found")))?;
+
+    Ok(Json(SandboxNetworkResponse {
+        sandbox_id: id.to_string(),
+        host_gateway_ip: info.host_gateway_ip.to_string(),
+        sandbox_ip: info.sandbox_ip.to_string(),
+    }))
+}
+
 fn parse_sandbox_id(id: String) -> Result<SandboxId, AppError> {
     SandboxId::new(id).map_err(|err| AppError::BadRequest(err.to_string()))
 }
@@ -1233,6 +1285,11 @@ async fn start_background_exec(
             "command must not be empty".to_string(),
         ));
     }
+    if request.pty && (request.rows == Some(0) || request.cols == Some(0)) {
+        return Err(AppError::BadRequest(
+            "PTY rows and cols must be greater than zero".to_string(),
+        ));
+    }
     let _guard = state.registry.acquire_lifecycle(&id).await;
     let record = state
         .registry
@@ -1249,26 +1306,47 @@ async fn start_background_exec(
         .paths
         .logs_dir(&id)
         .join(format!("exec-{exec_id}.jsonl"));
-    let process = oad_runtime::spawn_exec_in_container(
-        &state.paths,
-        &id,
-        &container,
-        &request.command,
-        &env,
-        request.cwd.as_deref(),
-        Some(&log_path),
-    )
-    .await?;
     let info = BackgroundExecInfo {
         id: exec_id,
         sandbox_id: id.to_string(),
         container,
         command: request.command,
+        pty: request.pty,
         status: BackgroundExecStatus::Running,
         exit_code: None,
         last_error: None,
     };
-    let session = state.background_execs.insert(info, process).await;
+    let session = if request.pty {
+        let process = oad_runtime::spawn_pty_exec_in_container(
+            &state.paths,
+            &id,
+            oad_runtime::PtyExecConfig {
+                container: &info.container,
+                command: &info.command,
+                env: &env,
+                cwd: request.cwd.as_deref(),
+                log_path: Some(&log_path),
+                size: oad_runtime::PtySizeSpec {
+                    rows: request.rows.unwrap_or(DEFAULT_PTY_ROWS),
+                    cols: request.cols.unwrap_or(DEFAULT_PTY_COLS),
+                },
+            },
+        )
+        .await?;
+        state.background_execs.insert_pty(info, process).await
+    } else {
+        let process = oad_runtime::spawn_exec_in_container(
+            &state.paths,
+            &id,
+            &info.container,
+            &info.command,
+            &env,
+            request.cwd.as_deref(),
+            Some(&log_path),
+        )
+        .await?;
+        state.background_execs.insert(info, process).await
+    };
 
     Ok((
         StatusCode::CREATED,
@@ -1410,6 +1488,45 @@ async fn write_background_exec_stdin(
         )));
     }
     Ok(Json(BackgroundExecStdinResponse { accepted }))
+}
+
+/// Resize a PTY-backed background exec session.
+#[utoipa::path(
+    post,
+    path = "/v1/sandboxes/{id}/execs/{exec_id}/resize",
+    params(
+        ("id" = String, Path, description = "Sandbox id"),
+        ("exec_id" = String, Path, description = "Background exec session id"),
+    ),
+    request_body = BackgroundExecResizeRequest,
+    responses(
+        (status = 200, description = "Resize accepted", body = BackgroundExecResizeResponse),
+        (status = 400, description = "Invalid sandbox id or size", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 404, description = "Sandbox or background exec not found", body = ErrorResponse),
+        (status = 409, description = "Background exec is not PTY-backed", body = ErrorResponse),
+    ),
+    security(("bearer_token" = [])),
+    tag = "sandboxes",
+)]
+async fn resize_background_exec(
+    State(state): State<AppState>,
+    AxumPath((id, exec_id)): AxumPath<(String, String)>,
+    Json(request): Json<BackgroundExecResizeRequest>,
+) -> Result<Json<BackgroundExecResizeResponse>, AppError> {
+    let id = parse_sandbox_id(id)?;
+    if request.rows == 0 || request.cols == 0 {
+        return Err(AppError::BadRequest(
+            "PTY rows and cols must be greater than zero".to_string(),
+        ));
+    }
+    let session = background_exec_session(&state, &id, &exec_id).await?;
+    if !session.resize(request.rows, request.cols).await {
+        return Err(AppError::Conflict(format!(
+            "background exec {exec_id} is not PTY-backed"
+        )));
+    }
+    Ok(Json(BackgroundExecResizeResponse { accepted: true }))
 }
 
 /// Stream background exec session events as Server-Sent Events.

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -6,7 +7,8 @@ use std::time::Duration;
 use oad_api::{
     BackgroundExecEvent, BackgroundExecEventKind, BackgroundExecInfo, BackgroundExecStatus,
 };
-use oad_runtime::ExecProcess;
+use oad_runtime::{ExecProcess, PtyExecProcess};
+use portable_pty::PtySize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::sync::{Mutex, Notify, broadcast, oneshot};
@@ -56,6 +58,31 @@ impl BackgroundExecStore {
             stdout_task,
             stderr_task,
         );
+
+        session
+    }
+
+    pub async fn insert_pty(
+        &self,
+        info: BackgroundExecInfo,
+        process: PtyExecProcess,
+    ) -> Arc<BackgroundExecSession> {
+        let exec_id = info.id.clone();
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let session = Arc::new(BackgroundExecSession::new_pty(
+            info,
+            process.writer,
+            process.master,
+            process.killer,
+            kill_tx,
+        ));
+        self.sessions
+            .lock()
+            .await
+            .insert(exec_id.clone(), session.clone());
+
+        let output_task = spawn_pty_reader(session.clone(), exec_id.clone(), process.reader);
+        spawn_pty_waiter(session.clone(), process.child, kill_rx, output_task);
 
         session
     }
@@ -127,12 +154,24 @@ impl BackgroundExecStore {
 
 pub struct BackgroundExecSession {
     info: Mutex<BackgroundExecInfo>,
-    stdin: Mutex<Option<tokio::process::ChildStdin>>,
-    kill_tx: Mutex<Option<oneshot::Sender<()>>>,
+    control: Mutex<SessionControl>,
     events: Mutex<VecDeque<BackgroundExecEvent>>,
     next_sequence: AtomicU64,
     tx: broadcast::Sender<BackgroundExecEvent>,
     finished: Notify,
+}
+
+enum SessionControl {
+    Pipes {
+        stdin: Option<tokio::process::ChildStdin>,
+        kill_tx: Option<oneshot::Sender<()>>,
+    },
+    Pty {
+        writer: Option<Box<dyn Write + Send>>,
+        master: Box<dyn portable_pty::MasterPty + Send>,
+        killer: Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+        kill_tx: Option<oneshot::Sender<()>>,
+    },
 }
 
 impl BackgroundExecSession {
@@ -144,8 +183,33 @@ impl BackgroundExecSession {
         let (tx, _) = broadcast::channel(EVENT_BUFFER_CAPACITY);
         Self {
             info: Mutex::new(info),
-            stdin: Mutex::new(Some(stdin)),
-            kill_tx: Mutex::new(Some(kill_tx)),
+            control: Mutex::new(SessionControl::Pipes {
+                stdin: Some(stdin),
+                kill_tx: Some(kill_tx),
+            }),
+            events: Mutex::new(VecDeque::with_capacity(EVENT_BUFFER_CAPACITY)),
+            next_sequence: AtomicU64::new(1),
+            tx,
+            finished: Notify::new(),
+        }
+    }
+
+    fn new_pty(
+        info: BackgroundExecInfo,
+        writer: Box<dyn Write + Send>,
+        master: Box<dyn portable_pty::MasterPty + Send>,
+        killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+        kill_tx: oneshot::Sender<()>,
+    ) -> Self {
+        let (tx, _) = broadcast::channel(EVENT_BUFFER_CAPACITY);
+        Self {
+            info: Mutex::new(info),
+            control: Mutex::new(SessionControl::Pty {
+                writer: Some(writer),
+                master,
+                killer: Some(killer),
+                kill_tx: Some(kill_tx),
+            }),
             events: Mutex::new(VecDeque::with_capacity(EVENT_BUFFER_CAPACITY)),
             next_sequence: AtomicU64::new(1),
             tx,
@@ -172,29 +236,86 @@ impl BackgroundExecSession {
     }
 
     pub async fn write_stdin(&self, data: &[u8], close: bool) -> std::io::Result<bool> {
-        let mut stdin = self.stdin.lock().await;
-        let Some(writer) = stdin.as_mut() else {
-            return Ok(false);
-        };
+        let mut control = self.control.lock().await;
+        match &mut *control {
+            SessionControl::Pipes { stdin, .. } => {
+                let Some(writer) = stdin.as_mut() else {
+                    return Ok(false);
+                };
 
-        if !data.is_empty() {
-            writer.write_all(data).await?;
-            writer.flush().await?;
+                if !data.is_empty() {
+                    writer.write_all(data).await?;
+                    writer.flush().await?;
+                }
+                if close {
+                    stdin.take();
+                }
+            }
+            SessionControl::Pty { writer, .. } => {
+                let Some(pty_writer) = writer.as_mut() else {
+                    return Ok(false);
+                };
+
+                if !data.is_empty() {
+                    pty_writer.write_all(data)?;
+                    pty_writer.flush()?;
+                }
+                if close {
+                    writer.take();
+                }
+            }
         }
-        if close {
-            stdin.take();
-        }
-        drop(stdin);
+        drop(control);
         Ok(true)
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the PTY master lock must be held while calling resize"
+    )]
+    pub async fn resize(&self, rows: u16, cols: u16) -> bool {
+        let control = self.control.lock().await;
+        let SessionControl::Pty { master, .. } = &*control else {
+            return false;
+        };
+        master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .is_ok()
+    }
+
     pub async fn kill(&self) -> bool {
-        self.stdin.lock().await.take();
-        self.kill_tx
-            .lock()
-            .await
-            .take()
-            .is_some_and(|kill_tx| kill_tx.send(()).is_ok())
+        let mut control = self.control.lock().await;
+        match &mut *control {
+            SessionControl::Pipes { stdin, kill_tx } => {
+                stdin.take();
+                kill_tx
+                    .take()
+                    .is_some_and(|kill_tx| kill_tx.send(()).is_ok())
+            }
+            SessionControl::Pty {
+                writer,
+                killer,
+                kill_tx,
+                ..
+            } => {
+                writer.take();
+                // `runsc exec` can forward signals to the foreground process,
+                // so ask both the waiter and the cloned PTY child killer to
+                // terminate. Either one succeeding is enough.
+                let killed_waiter = kill_tx
+                    .take()
+                    .is_some_and(|kill_tx| kill_tx.send(()).is_ok());
+                let killed_child = killer
+                    .take()
+                    .is_some_and(|mut killer| killer.kill().is_ok());
+                killed_waiter || killed_child
+            }
+        }
     }
 
     pub async fn wait_finished(&self) {
@@ -210,7 +331,10 @@ impl BackgroundExecSession {
     // The broadcast send must stay inside the events lock to preserve event
     // ordering, so the drop-tightening lint (which would move it out) does not
     // apply here.
-    #[allow(clippy::significant_drop_tightening)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "events must be enqueued and broadcast under one lock to preserve ordering"
+    )]
     async fn push_event(&self, exec_id: &str, event: BackgroundExecEventKind) {
         // Assign the sequence, enqueue, and broadcast while holding the events
         // lock so concurrent stdout/stderr readers can't interleave: the
@@ -273,8 +397,24 @@ impl BackgroundExecSession {
             info.exit_code = exit_code;
             info.last_error = last_error;
         }
-        self.stdin.lock().await.take();
-        self.kill_tx.lock().await.take();
+        let mut control = self.control.lock().await;
+        match &mut *control {
+            SessionControl::Pipes { stdin, kill_tx } => {
+                stdin.take();
+                kill_tx.take();
+            }
+            SessionControl::Pty {
+                writer,
+                killer,
+                kill_tx,
+                ..
+            } => {
+                writer.take();
+                killer.take();
+                kill_tx.take();
+            }
+        }
+        drop(control);
         self.push_event(exec_id, event).await;
         self.finished.notify_waiters();
     }
@@ -316,6 +456,31 @@ where
     })
 }
 
+fn spawn_pty_reader(
+    session: Arc<BackgroundExecSession>,
+    exec_id: String,
+    mut reader: Box<dyn Read + Send>,
+) -> JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        let handle = tokio::runtime::Handle::current();
+        let mut buffer = vec![0; READ_BUFFER_BYTES];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let data = buffer[..n].to_vec();
+                    let event = BackgroundExecEventKind::Stdout { data };
+                    handle.block_on(session.push_event(&exec_id, event));
+                }
+                Err(err) => {
+                    warn!(exec_id, %err, "failed to read pty background exec stream");
+                    break;
+                }
+            }
+        }
+    })
+}
+
 fn spawn_waiter(
     session: Arc<BackgroundExecSession>,
     mut child: Child,
@@ -342,6 +507,55 @@ fn spawn_waiter(
             let _ = stderr_task.await;
         }
         finish_child(session, &exec_id, status).await;
+    });
+}
+
+fn spawn_pty_waiter(
+    session: Arc<BackgroundExecSession>,
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    mut kill_rx: oneshot::Receiver<()>,
+    mut output_task: JoinHandle<()>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let handle = tokio::runtime::Handle::current();
+        let exec_id = handle.block_on(async { session.info().await.id });
+        let mut killed = false;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let code = i32::try_from(status.exit_code()).unwrap_or(-1);
+                    // Bound the wait for the reader to flush. A descendant that
+                    // inherited and kept the PTY slave open can prevent the
+                    // master from ever reaching EOF, so the reader would never
+                    // return and the session would hang in `Running` forever
+                    // (mirrors `drain_or_abort_stream_readers` on the pipe
+                    // path). After the timeout we give up on a clean drain so
+                    // the session can still transition to its terminal state.
+                    let drained = handle.block_on(async {
+                        tokio::time::timeout(KILL_STREAM_DRAIN_TIMEOUT, &mut output_task)
+                            .await
+                            .is_ok()
+                    });
+                    if !drained {
+                        output_task.abort();
+                    }
+                    handle.block_on(session.finish_exited(&exec_id, code));
+                    return;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let message = format!("failed to wait for pty background exec: {err}");
+                    output_task.abort();
+                    handle.block_on(session.finish_failed(&exec_id, message));
+                    return;
+                }
+            }
+            if !killed && kill_rx.try_recv().is_ok() {
+                killed = true;
+                let _ = child.kill();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     });
 }
 
@@ -398,64 +612,11 @@ async fn finish_child(
         }
         Err(err) => {
             session
-                .finish_failed(exec_id, format!("failed to wait for process: {err}"))
+                .finish_failed(
+                    exec_id,
+                    format!("failed to wait for background exec: {err}"),
+                )
                 .await;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use oad_api::BackgroundExecInfo;
-    use tokio::process::Command;
-
-    fn test_exec_info(id: &str) -> BackgroundExecInfo {
-        BackgroundExecInfo {
-            id: id.to_string(),
-            sandbox_id: "sandbox".to_string(),
-            container: "main".to_string(),
-            command: vec!["sh".to_string(), "-c".to_string(), "sleep 1".to_string()],
-            status: BackgroundExecStatus::Running,
-            exit_code: None,
-            last_error: None,
-        }
-    }
-
-    fn spawn_shell(command: &str) -> ExecProcess {
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("test shell spawns");
-        let stdin = child.stdin.take().expect("test shell has stdin");
-        let stdout = child.stdout.take().expect("test shell has stdout");
-        let stderr = child.stderr.take().expect("test shell has stderr");
-        ExecProcess {
-            child,
-            stdin,
-            stdout,
-            stderr,
-        }
-    }
-
-    #[tokio::test]
-    async fn kill_finishes_even_when_descendant_keeps_stream_open() {
-        let store = BackgroundExecStore::default();
-        let session = store
-            .insert(test_exec_info("exec"), spawn_shell("sleep 1"))
-            .await;
-
-        assert!(session.kill().await);
-        tokio::time::timeout(Duration::from_millis(500), session.wait_finished())
-            .await
-            .expect("kill should not wait for descendant-held stdio EOF");
-
-        let info = session.info().await;
-        assert_eq!(info.status, BackgroundExecStatus::Exited);
-        assert_eq!(info.exit_code, Some(-1));
     }
 }

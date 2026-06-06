@@ -6,6 +6,7 @@ members = [
     "crates/oad-core",
     "crates/oad-oci",
     "crates/oad-runtime",
+    "crates/omniagent-cli",
 ]
 resolver = "3"
 
@@ -26,6 +27,7 @@ hex = "0.4"
 http = "1.1"
 libc = "0.2"
 oad-api = { path = "crates/oad-api" }
+oad-cli = { path = "crates/oad-cli" }
 oad-core = { path = "crates/oad-core" }
 oad-oci = { path = "crates/oad-oci" }
 oad-runtime = { path = "crates/oad-runtime" }
@@ -38,6 +40,7 @@ opentelemetry = { version = "0.32", features = ["trace"] }
 opentelemetry_sdk = { version = "0.32", features = ["trace", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
 opentelemetry-semantic-conventions = "0.32"
+portable-pty = "0.9"
 tar = "0.4"
 tempfile = "3.12"
 thiserror = "2.0"

@@ -61,6 +61,7 @@
             # shell still evaluates there.
             packages = [
               pkgs.protobuf
+              pkgs.pnpm
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
               pkgs.envoy-bin
@@ -76,6 +77,7 @@
             programs = {
               actionlint.enable = true;
               nixfmt.enable = true;
+              prettier.enable = true;
               rustfmt = {
                 enable = true;
                 package = rustToolchain pkgs;

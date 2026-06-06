@@ -73,6 +73,16 @@ pub struct LogsResponse {
     pub lines: Vec<String>,
 }
 
+/// Managed-network addresses assigned to a sandbox.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SandboxNetworkResponse {
+    pub sandbox_id: String,
+    /// Address of the host-side gateway interface reachable from the sandbox.
+    pub host_gateway_ip: String,
+    /// Address assigned to the sandbox-side interface.
+    pub sandbox_ip: String,
+}
+
 /// Request to run a one-off command inside a running container.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ExecRequest {
@@ -108,6 +118,11 @@ pub struct ExecResponse {
     pub stderr: Vec<u8>,
 }
 
+/// Default PTY row count used when a client does not request a specific size.
+pub const DEFAULT_PTY_ROWS: u16 = 40;
+/// Default PTY column count used when a client does not request a specific size.
+pub const DEFAULT_PTY_COLS: u16 = 120;
+
 /// Request to start a long-running command inside a running container.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct StartBackgroundExecRequest {
@@ -122,6 +137,16 @@ pub struct StartBackgroundExecRequest {
     /// Working directory for the executed process.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Attach the process to a pseudo-terminal instead of separate stdout and
+    /// stderr pipes.
+    #[serde(default)]
+    pub pty: bool,
+    /// Initial PTY row count. Ignored unless `pty` is true.
+    #[serde(default)]
+    pub rows: Option<u16>,
+    /// Initial PTY column count. Ignored unless `pty` is true.
+    #[serde(default)]
+    pub cols: Option<u16>,
 }
 
 /// Lifecycle state for a background exec session.
@@ -140,6 +165,9 @@ pub struct BackgroundExecInfo {
     pub sandbox_id: String,
     pub container: String,
     pub command: Vec<String>,
+    /// Whether the session is backed by a pseudo-terminal.
+    #[serde(default)]
+    pub pty: bool,
     pub status: BackgroundExecStatus,
     /// Exit code when the process has exited (-1 if terminated by a signal).
     #[serde(default)]
@@ -175,6 +203,18 @@ pub struct BackgroundExecStdinRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BackgroundExecStdinResponse {
+    pub accepted: bool,
+}
+
+/// Request to resize a PTY-backed background exec session.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BackgroundExecResizeRequest {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BackgroundExecResizeResponse {
     pub accepted: bool,
 }
 
