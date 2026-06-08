@@ -1,17 +1,19 @@
 //! Human-in-the-loop review gate for intercepted LLM calls.
 //!
 //! When enabled, the proxy publishes a pending response item here and waits on
-//! a one-shot decision from the web UI before it releases the response.
+//! a one-shot decision from the central UI before it releases the response.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::oneshot;
 
 use crate::record::{HeaderSnapshot, Provider, Usage};
+
+pub type ReviewForwarder = Arc<dyn Fn(&ReviewEvent) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,12 +78,34 @@ impl ReviewDecision {
     pub const fn approve() -> Self {
         Self::Approve { model: None }
     }
-}
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ReviewList {
-    pub enabled: bool,
-    pub items: Vec<ReviewItem>,
+    #[must_use]
+    pub fn from_server_value(value: &serde_json::Value) -> Self {
+        let action = value
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("approve");
+        match action {
+            "reject" => Self::Reject {
+                message: value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+            },
+            "retry" => Self::Retry {
+                model: value
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+            },
+            _ => Self::Approve {
+                model: value
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,10 +113,8 @@ pub struct ReviewList {
 pub enum ReviewEvent {
     Upsert { item: Box<ReviewItem> },
     Remove { id: String },
-    Reset { items: Vec<ReviewItem> },
 }
 
-#[derive(Debug)]
 pub struct ReviewStore {
     enabled: AtomicBool,
     /// How long `prompt` waits for a human decision before auto-approving.
@@ -100,52 +122,32 @@ pub struct ReviewStore {
     timeout: Option<Duration>,
     items: RwLock<BTreeMap<String, ReviewItem>>,
     sequence: AtomicU64,
-    tx: broadcast::Sender<ReviewEvent>,
     waiters: Mutex<BTreeMap<String, oneshot::Sender<ReviewDecision>>>,
+    forwarder: Option<ReviewForwarder>,
 }
 
 impl ReviewStore {
     #[must_use]
     pub fn new(enabled: bool, timeout: Option<Duration>) -> Self {
-        let (tx, _) = broadcast::channel(256);
         Self {
             enabled: AtomicBool::new(enabled),
             timeout,
             items: RwLock::new(BTreeMap::new()),
             sequence: AtomicU64::new(0),
-            tx,
             waiters: Mutex::new(BTreeMap::new()),
+            forwarder: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_forwarder(mut self, forwarder: ReviewForwarder) -> Self {
+        self.forwarder = Some(forwarder);
+        self
     }
 
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
-    }
-
-    /// Toggles review gating at runtime. The startup screen sets this per the
-    /// chosen mode before the agent is launched.
-    pub fn set_enabled(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::Relaxed);
-    }
-
-    #[must_use]
-    pub fn list(&self) -> ReviewList {
-        let mut items = self
-            .items
-            .read()
-            .map(|items| items.values().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        items.sort_by_key(|item| item.sequence);
-        ReviewList {
-            enabled: self.enabled(),
-            items,
-        }
-    }
-
-    #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<ReviewEvent> {
-        self.tx.subscribe()
     }
 
     pub async fn prompt(&self, mut item: ReviewItem) -> ReviewDecision {
@@ -163,9 +165,10 @@ impl ReviewStore {
         if let Ok(mut items) = self.items.write() {
             items.insert(id.clone(), item.clone());
         }
-        let _ = self.tx.send(ReviewEvent::Upsert {
+        let event = ReviewEvent::Upsert {
             item: Box::new(item),
-        });
+        };
+        self.forward(&event);
 
         let decision = match self.timeout {
             // Auto-approve if no human decides within the window, so unattended
@@ -213,6 +216,13 @@ impl ReviewStore {
         if let Ok(mut items) = self.items.write() {
             items.remove(id);
         }
-        let _ = self.tx.send(ReviewEvent::Remove { id: id.to_string() });
+        let event = ReviewEvent::Remove { id: id.to_string() };
+        self.forward(&event);
+    }
+
+    fn forward(&self, event: &ReviewEvent) {
+        if let Some(forwarder) = &self.forwarder {
+            forwarder(event);
+        }
     }
 }

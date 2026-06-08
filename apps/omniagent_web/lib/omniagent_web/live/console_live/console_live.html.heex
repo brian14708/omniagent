@@ -1,0 +1,557 @@
+<div
+  id="console"
+  phx-hook="Prefs"
+  style={"--left-w: #{@left_w}px; --right-w: #{@right_w}px; --term-basis: #{@term_pct}%"}
+  class="oa-console flex h-screen overflow-hidden text-[var(--text)]"
+>
+  <%!-- ── Left: sessions sidebar ───────────────────────────────────────── --%>
+  <aside class={[
+    "flex flex-none flex-col border-r border-[var(--line)] bg-[var(--panel)]",
+    @sidebar_collapsed && "w-12",
+    !@sidebar_collapsed && "w-[var(--left-w)]"
+  ]}>
+    <%= if @sidebar_collapsed do %>
+      <button
+        type="button"
+        phx-click="toggle_sidebar"
+        title="Expand sidebar"
+        class="flex h-[49px] w-full flex-none items-center justify-center border-b border-[var(--line)] text-[var(--faint)] hover:text-[var(--text)]"
+      >
+        »
+      </button>
+      <div class="flex flex-1 flex-col items-center gap-2 overflow-y-auto py-3">
+        <%= for session <- @sessions do %>
+          <.link
+            patch={~p"/sessions/#{session.id}"}
+            title={session.name || session.id}
+            class={[
+              "relative flex h-9 w-9 flex-none items-center justify-center rounded-full border text-xs font-bold uppercase transition-colors",
+              @session && @session.id == session.id &&
+                "border-[var(--amber)] bg-[var(--amber-soft)] text-[var(--amber)]",
+              !(@session && @session.id == session.id) &&
+                "border-[var(--line)] text-[var(--dim)] hover:bg-[var(--panel-2)]"
+            ]}
+          >
+            {session_initial(session)}
+            <span
+              class={"oa-dot #{if session.status == "online", do: "on", else: ""}"}
+              style="position:absolute;bottom:-1px;right:-1px"
+            >
+            </span>
+          </.link>
+        <% end %>
+        <button
+          type="button"
+          phx-click="open_new_agent"
+          title="New agent"
+          class="flex h-9 w-9 flex-none items-center justify-center rounded-full border border-[var(--line)] text-[var(--faint)] hover:border-[var(--amber)] hover:text-[var(--amber)]"
+        >
+          +
+        </button>
+      </div>
+    <% else %>
+      <div class="flex items-center gap-2 border-b border-[var(--line)] px-3 py-2">
+        <button type="button" phx-click="open_new_agent" class="oa-btn primary flex-1 text-sm">
+          + New agent
+        </button>
+        <button
+          type="button"
+          phx-click="toggle_sidebar"
+          title="Collapse sidebar"
+          class="oa-btn flex-none px-2 text-sm"
+        >
+          «
+        </button>
+      </div>
+
+      <div class="border-b border-[var(--line)] px-4 py-2 text-[11px]">
+        <div class="oa-label mb-1">Daemons</div>
+        <%= if @daemons == [] do %>
+          <p class="font-mono text-[11px] text-[var(--faint)]">
+            none connected — run <code>omniagent daemon</code>
+          </p>
+        <% else %>
+          <ul class="space-y-1">
+            <%= for daemon <- @daemons do %>
+              <li class="flex items-center gap-2 font-mono text-[11px] text-[var(--dim)]">
+                <span class="oa-dot on"></span>
+                <span class="truncate">
+                  {daemon.metadata["hostname"] || "daemon"}
+                  <%= if pid = daemon.metadata["pid"] do %>
+                    <span class="text-[var(--faint)]">:{pid}</span>
+                  <% end %>
+                </span>
+              </li>
+            <% end %>
+          </ul>
+        <% end %>
+      </div>
+
+      <nav class="flex-1 overflow-y-auto px-2 py-2">
+        <%= if @sessions == [] do %>
+          <p class="px-2 py-6 text-center font-mono text-xs text-[var(--faint)]">
+            no sessions yet
+          </p>
+        <% else %>
+          <%= for session <- @sessions do %>
+            <.link
+              patch={~p"/sessions/#{session.id}"}
+              class={[
+                "block rounded-md px-3 py-2 transition-colors",
+                @session && @session.id == session.id && "bg-[var(--amber-soft)]",
+                !(@session && @session.id == session.id) && "hover:bg-[var(--panel-2)]"
+              ]}
+            >
+              <div class="flex items-center gap-2">
+                <span class={"oa-dot #{if session.status == "online", do: "on", else: ""}"}>
+                </span>
+                <span class="truncate text-sm text-[var(--text)]">
+                  {session.name || session.id}
+                </span>
+              </div>
+              <div class="mt-1 truncate pl-4 font-mono text-[11px] text-[var(--faint)]">
+                {Enum.join(session.argv || [], " ")}
+              </div>
+            </.link>
+          <% end %>
+        <% end %>
+      </nav>
+    <% end %>
+  </aside>
+
+  <%= unless @sidebar_collapsed do %>
+    <div
+      id="gutter-left"
+      phx-hook="Resize"
+      data-axis="x"
+      data-var="--left-w"
+      data-prop="left_w"
+      data-min="180"
+      data-max="520"
+      class="oa-gutter oa-gutter-x"
+      title="Drag to resize"
+    >
+    </div>
+  <% end %>
+
+  <%!-- ── Middle: terminal + traces ────────────────────────────────────── --%>
+  <main class="flex min-w-0 flex-1 flex-col bg-[var(--bg)]">
+    <%= if @session do %>
+      <header class="flex flex-none items-center justify-between gap-3 border-b border-[var(--line)] px-4 py-3">
+        <div class="flex min-w-0 items-center gap-3">
+          <h1 class="oa-display truncate text-lg font-bold">{@session.name || @session.id}</h1>
+          <span class={"oa-status #{status_class(@session.status)}"}>{@session.status}</span>
+          <code class="hidden truncate font-mono text-[11px] text-[var(--faint)] md:block">
+            {@session.cwd}
+          </code>
+        </div>
+        <%= if @session.status != "online" do %>
+          <button
+            type="button"
+            phx-click="delete_session"
+            data-confirm="Delete this session and all its recorded data?"
+            class="oa-btn danger text-xs"
+          >
+            Delete
+          </button>
+        <% end %>
+      </header>
+
+      <div
+        class="flex min-h-0 flex-col border-b border-[var(--line)] p-2"
+        style="flex: 0 0 var(--term-basis)"
+      >
+        <%= if @session.status == "online" do %>
+          <div
+            id={"terminal-#{@session.id}"}
+            phx-hook="Terminal"
+            phx-update="ignore"
+            class="oa-terminal min-h-0 flex-1 overflow-hidden rounded-md border border-[var(--line)] bg-black p-2"
+          >
+          </div>
+        <% else %>
+          <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-md border border-[var(--line)] bg-black text-center">
+            <p class="oa-display text-sm font-bold text-[var(--dim)]">Session ended</p>
+            <p class="font-mono text-[11px] text-[var(--faint)]">
+              open the <span class="text-[var(--amber)]">Artifacts</span>
+              tab to replay or download the recording
+            </p>
+          </div>
+        <% end %>
+      </div>
+
+      <div
+        id="gutter-term"
+        phx-hook="Resize"
+        data-axis="y"
+        data-var="--term-basis"
+        data-prop="term_pct"
+        data-unit="%"
+        data-min="20"
+        data-max="85"
+        class="oa-gutter oa-gutter-y"
+        title="Drag to resize"
+      >
+      </div>
+
+      <div class="flex min-h-0 flex-1 flex-col p-2">
+        <div class="oa-label mb-1 px-1">Traces</div>
+        <div
+          id={"traces-#{@session.id}"}
+          phx-hook="Traces"
+          phx-update="ignore"
+          class="oa-traces min-h-0 flex-1 overflow-y-auto"
+        >
+          <div class="oa-trace-empty" data-trace-empty>
+            no LLM calls yet — requests appear as the agent talks to the model
+          </div>
+        </div>
+      </div>
+    <% else %>
+      <div class="flex flex-1 flex-col items-center justify-center gap-4 text-center">
+        <span class="oa-logo" style="width:48px;height:48px;font-size:22px">Ø</span>
+        <div>
+          <p class="oa-display text-lg font-bold">No session selected</p>
+          <p class="mt-1 font-mono text-xs text-[var(--faint)]">
+            pick a session on the left, or start one
+          </p>
+        </div>
+        <button type="button" phx-click="open_new_agent" class="oa-btn primary">
+          + New agent
+        </button>
+      </div>
+    <% end %>
+  </main>
+
+  <%= unless @right_collapsed do %>
+    <div
+      id="gutter-right"
+      phx-hook="Resize"
+      data-axis="x"
+      data-var="--right-w"
+      data-prop="right_w"
+      data-invert="true"
+      data-min="240"
+      data-max="600"
+      class="oa-gutter oa-gutter-x"
+      title="Drag to resize"
+    >
+    </div>
+  <% end %>
+
+  <%!-- ── Right: Changes / Files / Reviews ─────────────────────────────── --%>
+  <aside class={[
+    "flex flex-none flex-col border-l border-[var(--line)] bg-[var(--panel)]",
+    @right_collapsed && "w-10",
+    !@right_collapsed && "w-[var(--right-w)]"
+  ]}>
+    <%= if @right_collapsed do %>
+      <button
+        type="button"
+        phx-click="toggle_right_panel"
+        title="Expand panel"
+        class="flex h-[41px] w-full flex-none items-center justify-center border-b border-[var(--line)] text-[var(--faint)] hover:text-[var(--text)]"
+      >
+        «
+      </button>
+    <% else %>
+      <div class="flex flex-none items-center gap-1 border-b border-[var(--line)] px-2 py-2">
+        <%= for {key, label} <- [{"changes", "Changes"}, {"files", "Files"}, {"reviews", "Reviews"}, {"artifacts", "Artifacts"}] do %>
+          <button
+            type="button"
+            phx-click="select_tab"
+            phx-value-tab={key}
+            class={[
+              "rounded-md px-3 py-1 font-mono text-xs transition-colors",
+              @right_tab == key && "bg-[var(--amber-soft)] text-[var(--amber)]",
+              @right_tab != key && "text-[var(--faint)] hover:text-[var(--dim)]"
+            ]}
+          >
+            {label}
+          </button>
+        <% end %>
+        <button
+          type="button"
+          phx-click="toggle_right_panel"
+          title="Collapse panel"
+          class="ml-auto flex-none px-2 text-[var(--faint)] hover:text-[var(--text)]"
+        >
+          »
+        </button>
+      </div>
+
+    <div class="min-h-0 flex-1 overflow-y-auto p-3">
+      <%= cond do %>
+        <% is_nil(@session) -> %>
+          <p class="font-mono text-xs text-[var(--faint)]">select a session</p>
+        <% @right_tab == "changes" -> %>
+          <div class="mb-2 flex items-center justify-between">
+            <span class="oa-label">Working tree</span>
+            <button type="button" phx-click="refresh_changes" class="oa-btn text-xs">
+              refresh
+            </button>
+          </div>
+          <%= cond do %>
+            <% @changes_loading -> %>
+              <p class="font-mono text-xs text-[var(--faint)]">loading diff…</p>
+            <% @changes_error -> %>
+              <p class="font-mono text-xs text-[var(--prov-red)]">{@changes_error}</p>
+            <% @changed_files == [] -> %>
+              <p class="font-mono text-xs text-[var(--faint)]">no changes</p>
+            <% true -> %>
+              <div class="space-y-3">
+                <%= for file <- @changed_files do %>
+                  <div class="overflow-hidden rounded-md border border-[var(--line)]">
+                    <div class="flex items-center justify-between bg-[var(--panel-2)] px-3 py-1.5 font-mono text-[11px]">
+                      <span class="truncate text-[var(--dim)]">{file.path}</span>
+                      <span class="flex-none">
+                        <span class="text-[var(--prov-green)]">+{file.added}</span>
+                        <span class="text-[var(--prov-red)]">-{file.removed}</span>
+                      </span>
+                    </div>
+                    <pre class="oa-diff overflow-x-auto px-2 py-1 font-mono text-[11px] leading-relaxed"><%= for line <- file.lines do %><span class={diff_line_class(line.type)}>{line.text}
+</span><% end %></pre>
+                  </div>
+                <% end %>
+              </div>
+          <% end %>
+        <% @right_tab == "files" -> %>
+          <%= cond do %>
+            <% not is_nil(@file_result) -> %>
+              <%!-- Single-file viewer (reached by clicking a file or manual path) --%>
+              <div class="mb-2 flex items-center justify-between gap-2">
+                <span class="truncate font-mono text-[11px] text-[var(--dim)]">
+                  {@file_result["path"]}
+                </span>
+                <button type="button" phx-click="close_file" class="oa-btn flex-none text-xs">
+                  ← back
+                </button>
+              </div>
+              <%= cond do %>
+                <% @file_result["loading"] -> %>
+                  <p class="font-mono text-xs text-[var(--faint)]">
+                    loading {@file_result["path"]}…
+                  </p>
+                <% @file_result["ok"] -> %>
+                  <pre class="oa-pre overflow-x-auto text-[11px]">{@file_result["text"]}</pre>
+                <% true -> %>
+                  <p class="font-mono text-xs text-[var(--prov-red)]">{@file_result["error"]}</p>
+              <% end %>
+            <% true -> %>
+              <%!-- File explorer: a lazy-expanding directory tree --%>
+              <form phx-submit="request_file" class="mb-3 flex gap-2">
+                <input name="path" class="oa-input flex-1" placeholder="relative/path" />
+                <button class="oa-btn primary">Read</button>
+              </form>
+              <% rows = file_rows(@dir_tree, @dir_expanded) %>
+              <%= cond do %>
+                <% @dir_tree == %{} and @dir_error -> %>
+                  <p class="font-mono text-xs text-[var(--prov-red)]">{@dir_error}</p>
+                <% @dir_tree == %{} -> %>
+                  <p class="font-mono text-xs text-[var(--faint)]">loading…</p>
+                <% true -> %>
+                  <%= if @dir_error do %>
+                    <p class="mb-2 font-mono text-xs text-[var(--prov-red)]">{@dir_error}</p>
+                  <% end %>
+                  <%= if rows == [] do %>
+                    <p class="font-mono text-xs text-[var(--faint)]">empty</p>
+                  <% else %>
+                    <div class="overflow-hidden rounded-md border border-[var(--line)]">
+                      <%= for row <- rows do %>
+                        <button
+                          type="button"
+                          phx-click={if row.dir, do: "toggle_dir", else: "open_file"}
+                          phx-value-path={row.path}
+                          style={"padding-left: #{row.depth * 14 + 8}px"}
+                          class="flex w-full items-center gap-1.5 py-1 pr-2 text-left font-mono text-[11px] hover:bg-[var(--panel-2)]"
+                        >
+                          <span class="w-3 flex-none text-center text-[var(--faint)]">
+                            {cond do
+                              not row.dir -> ""
+                              row.expanded -> "▾"
+                              true -> "▸"
+                            end}
+                          </span>
+                          <span class={[
+                            "truncate",
+                            row.dir && "text-[var(--amber)]",
+                            !row.dir && "text-[var(--dim)]"
+                          ]}>{row.name}</span>
+                        </button>
+                      <% end %>
+                    </div>
+                  <% end %>
+              <% end %>
+          <% end %>
+        <% @right_tab == "reviews" -> %>
+          <div class="mb-3 flex items-center justify-between">
+            <span class="oa-label">Review gate</span>
+            <button
+              type="button"
+              phx-click="toggle_auto_approve"
+              aria-pressed={@auto_approve}
+              class={"oa-btn text-xs #{if @auto_approve, do: "ok", else: ""}"}
+            >
+              <span class={"oa-dot #{if @auto_approve, do: "on", else: ""}"}></span>
+              Auto {if @auto_approve, do: "on", else: "off"}
+            </button>
+          </div>
+          <div class="space-y-2">
+            <%= for item <- @reviews do %>
+              <div class="oa-panel p-3">
+                <div class="font-mono text-[11px] text-[var(--dim)]">
+                  {item.external_id} · {item.phase} · {item.path}
+                </div>
+                <div class="mt-2 flex flex-wrap gap-2">
+                  <button
+                    phx-click="review_decision"
+                    phx-value-id={item.external_id}
+                    phx-value-action="approve"
+                    class="oa-btn ok text-xs"
+                  >
+                    Approve
+                  </button>
+                  <button
+                    phx-click="review_decision"
+                    phx-value-id={item.external_id}
+                    phx-value-action="retry"
+                    class="oa-btn primary text-xs"
+                  >
+                    Retry
+                  </button>
+                  <button
+                    phx-click="review_decision"
+                    phx-value-id={item.external_id}
+                    phx-value-action="reject"
+                    class="oa-btn danger text-xs"
+                  >
+                    Reject
+                  </button>
+                </div>
+              </div>
+            <% end %>
+            <%= if @reviews == [] do %>
+              <p class="font-mono text-xs text-[var(--faint)]">no pending reviews</p>
+            <% end %>
+          </div>
+        <% @right_tab == "artifacts" -> %>
+          <div class="mb-2 oa-label">Captured artifacts</div>
+          <%= if @artifacts == [] do %>
+            <p class="font-mono text-xs text-[var(--faint)]">
+              no artifacts yet — recording, traces, and logs upload when the session ends
+            </p>
+          <% else %>
+            <ul class="space-y-2">
+              <%= for artifact <- @artifacts do %>
+                <li class="oa-panel flex items-center justify-between gap-3 p-3">
+                  <div class="min-w-0">
+                    <div class="truncate text-sm text-[var(--text)]">
+                      {artifact_label(artifact.kind)}
+                    </div>
+                    <div class="mt-0.5 font-mono text-[11px] text-[var(--faint)]">
+                      {format_bytes(artifact.size)} · {Calendar.strftime(
+                        artifact.inserted_at,
+                        "%Y-%m-%d %H:%M"
+                      )}
+                    </div>
+                  </div>
+                  <div class="flex flex-none items-center gap-2">
+                    <%= if artifact.kind == "recording" do %>
+                      <button
+                        type="button"
+                        phx-click="play_recording"
+                        phx-value-id={artifact.id}
+                        class="oa-btn primary text-xs"
+                      >
+                        Play
+                      </button>
+                    <% end %>
+                    <a
+                      href={~p"/sessions/#{@session.id}/artifacts/#{artifact.id}/download"}
+                      class="oa-btn text-xs"
+                      download
+                    >
+                      Download
+                    </a>
+                  </div>
+                </li>
+              <% end %>
+            </ul>
+          <% end %>
+        <% true -> %>
+      <% end %>
+    </div>
+    <% end %>
+  </aside>
+</div>
+
+<%!-- ── New-agent modal ──────────────────────────────────────────────── --%>
+<%= if @show_new_agent do %>
+  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+    <div class="oa-panel w-full max-w-md p-5" phx-click-away="close_new_agent">
+      <h2 class="oa-display mb-4 text-lg font-bold">New agent</h2>
+      <%= if @daemons == [] do %>
+        <p class="font-mono text-sm text-[var(--dim)]">
+          No daemon is connected. Start one with <code class="text-[var(--amber)]">omniagent daemon</code>, then try again.
+        </p>
+        <div class="mt-4 flex justify-end">
+          <button type="button" phx-click="close_new_agent" class="oa-btn">Close</button>
+        </div>
+      <% else %>
+        <form phx-submit="create_agent" class="space-y-3">
+          <label class="block">
+            <span class="oa-label mb-1">Daemon</span>
+            <select name="daemon_id" class="oa-input w-full">
+              <%= for daemon <- @daemons do %>
+                <option value={daemon.id}>
+                  {daemon.metadata["hostname"] || "daemon"}
+                  <%= if pid = daemon.metadata["pid"] do %>
+                    :{pid}
+                  <% end %>
+                  · {daemon.metadata["cwd"]}
+                </option>
+              <% end %>
+            </select>
+          </label>
+          <label class="block">
+            <span class="oa-label mb-1">Agent command</span>
+            <input name="command" class="oa-input w-full" placeholder="claude" value="claude" />
+          </label>
+          <label class="block">
+            <span class="oa-label mb-1">Working dir (optional)</span>
+            <input name="cwd" class="oa-input w-full" placeholder="defaults to the daemon's cwd" />
+          </label>
+          <label class="block">
+            <span class="oa-label mb-1">Name (optional)</span>
+            <input name="name" class="oa-input w-full" placeholder="my session" />
+          </label>
+          <div class="flex justify-end gap-2 pt-2">
+            <button type="button" phx-click="close_new_agent" class="oa-btn">Cancel</button>
+            <button type="submit" class="oa-btn primary">Start agent</button>
+          </div>
+        </form>
+      <% end %>
+    </div>
+  </div>
+<% end %>
+
+<%!-- ── Recording player ─────────────────────────────────────────────── --%>
+<%= if @playing_artifact do %>
+  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+    <div class="oa-panel w-full max-w-4xl p-4" phx-click-away="close_recording">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="oa-display text-lg font-bold">Terminal recording</h2>
+        <button type="button" phx-click="close_recording" class="oa-btn text-xs">Close</button>
+      </div>
+      <div
+        id={"recording-#{@playing_artifact.id}"}
+        phx-hook="Recording"
+        phx-update="ignore"
+        data-src={~p"/sessions/#{@session.id}/artifacts/#{@playing_artifact.id}/download"}
+      >
+      </div>
+    </div>
+  </div>
+<% end %>
+
+<Layouts.flash_group flash={@flash} />

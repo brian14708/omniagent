@@ -779,6 +779,34 @@ mod tests {
     }
 
     #[test]
+    fn zero_filled_usage_on_trailing_events_does_not_clobber_real_total() {
+        // Some upstreams/gateways serialize a fully-typed event struct, so every
+        // SSE frame carries a top-level `usage` object that is zero-filled on all
+        // but `message_delta`. The real totals live in `message.usage` (on
+        // `message_start`) and the `message_delta` `usage`; the trailing
+        // `message_stop` reports `{input:0, output:0, …}`. A last-wins merge lets
+        // that trailing zero clobber the total back to zero — this guards the
+        // field-wise-max merge that fixes it.
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":35,\"cache_read_input_tokens\":32317,\"cache_creation_input_tokens\":1712}},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}\n\n",
+            "event: ping\n",
+            "data: {\"type\":\"ping\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":2,\"output_tokens\":159,\"cache_read_input_tokens\":32317,\"cache_creation_input_tokens\":1712}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}\n\n",
+        );
+        let (_, usage, _) = reconstruct(Provider::Anthropic, body.as_bytes());
+        assert_eq!(usage.input_tokens, Some(2));
+        assert_eq!(usage.output_tokens, Some(159));
+        assert_eq!(usage.cache_read_tokens, Some(32317));
+        assert_eq!(usage.cache_creation_tokens, Some(1712));
+    }
+
+    #[test]
     fn reconstructs_anthropic_message_with_text_and_usage() {
         let body = concat!(
             "event: message_start\n",

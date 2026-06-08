@@ -3,9 +3,8 @@
 //! The model is deliberately close to the OpenTelemetry `GenAI` span /
 //! `LangSmith` `RunTree` shape: each intercepted request/response pair becomes one
 //! [`LlmSpan`] carrying the provider, model, raw request/response JSON, token
-//! usage, status and timing. [`TraceStore`] keeps spans in memory and fans new
-//! ones out over a `broadcast` channel, mirroring the sequenced-event pattern
-//! used by the daemon's background-exec store.
+//! usage, status and timing. [`TraceStore`] keeps spans in memory, optionally
+//! persists them to JSONL, and can forward new spans to the central server.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -15,9 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::broadcast;
+
+/// Optional observer called whenever a span is recorded.
+pub type TraceForwarder = Arc<dyn Fn(&LlmSpan) + Send + Sync>;
 
 /// LLM provider whose wire protocol was intercepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,27 +128,35 @@ impl Usage {
         }
     }
 
-    /// Folds another reading into this one, keeping any non-`None` field. Used
-    /// to merge usage scattered across multiple streamed events.
+    /// Folds another reading into this one, keeping the larger of each field.
+    ///
+    /// Used to merge usage scattered across multiple streamed events. A
+    /// field-wise max (rather than "last non-`None` wins") is deliberate:
+    /// providers — and instrumented gateways — emit a `usage` object on *every*
+    /// SSE event, zero-filled on all but the authoritative one. Anthropic, for
+    /// instance, sends a real `usage` only on `message_delta`, then a trailing
+    /// `message_stop` whose top-level `usage` is `{input:0, output:0, …}`. With
+    /// last-wins semantics that trailing zero clobbers the real total back to
+    /// zero. Token counts only grow across a stream, so the max is the
+    /// authoritative reading and the zero-filled noise is harmless.
     pub const fn merge_from(&mut self, other: &Self) {
-        if other.input_tokens.is_some() {
-            self.input_tokens = other.input_tokens;
-        }
-        if other.output_tokens.is_some() {
-            self.output_tokens = other.output_tokens;
-        }
-        if other.total_tokens.is_some() {
-            self.total_tokens = other.total_tokens;
-        }
-        if other.reasoning_tokens.is_some() {
-            self.reasoning_tokens = other.reasoning_tokens;
-        }
-        if other.cache_read_tokens.is_some() {
-            self.cache_read_tokens = other.cache_read_tokens;
-        }
-        if other.cache_creation_tokens.is_some() {
-            self.cache_creation_tokens = other.cache_creation_tokens;
-        }
+        self.input_tokens = max_opt(self.input_tokens, other.input_tokens);
+        self.output_tokens = max_opt(self.output_tokens, other.output_tokens);
+        self.total_tokens = max_opt(self.total_tokens, other.total_tokens);
+        self.reasoning_tokens = max_opt(self.reasoning_tokens, other.reasoning_tokens);
+        self.cache_read_tokens = max_opt(self.cache_read_tokens, other.cache_read_tokens);
+        self.cache_creation_tokens =
+            max_opt(self.cache_creation_tokens, other.cache_creation_tokens);
+    }
+}
+
+/// Returns the larger of two optional token counts, treating `None` as absent
+/// (so a present value always wins over `None`, and two `None`s stay `None`).
+const fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if y > x { y } else { x }),
+        (Some(x), None) => Some(x),
+        (None, b) => b,
     }
 }
 
@@ -192,6 +202,185 @@ pub struct StreamEvent {
     pub data: serde_json::Value,
 }
 
+/// A generic, precomputed display tag attached to a span and rendered as a badge
+/// in the trace list. `kind` groups labels (currently only `"result_type"`);
+/// `cls` keys the badge color in the UI (`tool` / `assistant` / `thinking` /
+/// `result`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Label {
+    pub kind: String,
+    pub text: String,
+    pub cls: String,
+}
+
+impl Label {
+    fn new(kind: &str, text: impl Into<String>, cls: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            text: text.into(),
+            cls: cls.into(),
+        }
+    }
+}
+
+/// Builds the display labels for a finalized span. Currently just the
+/// result-type classification; other label kinds (cost tier, cache hit, …) can
+/// be appended here without touching the storage or UI plumbing.
+fn build_labels(draft: &SpanDraft) -> Vec<Label> {
+    let mut labels = Vec::new();
+    if let Some(rt) = classify_result_type(&draft.response) {
+        labels.push(rt);
+    }
+    labels
+}
+
+/// Classifies a (possibly provider-specific) response body into a `result_type`
+/// [`Label`].
+///
+/// Mirrors the precedence of the frontend's old `responseContent`/`resultType`:
+/// a `tool_use` dominates (the turn ended by calling a tool), otherwise text
+/// (an assistant message) or thinking. Covers the proxy's normalized
+/// Anthropic-shape `content` mirror plus raw `OpenAI` Responses/Chat and Gemini
+/// bodies. Returns `None` when nothing classifiable is present.
+fn classify_result_type(body: &serde_json::Value) -> Option<Label> {
+    if !body.is_object() {
+        return None;
+    }
+
+    // 1. Anthropic-shape `content` (also the proxy's normalized streamed mirror).
+    if let Some(content) = body.get("content").and_then(serde_json::Value::as_array)
+        && let Some(rt) = classify_anthropic_blocks(content)
+    {
+        return Some(rt);
+    }
+
+    // 2. OpenAI Responses API `output`.
+    if let Some(output) = body.get("output").and_then(serde_json::Value::as_array)
+        && let Some(rt) = classify_openai_output(output)
+    {
+        return Some(rt);
+    }
+
+    // 3. OpenAI Chat Completions.
+    if let Some(msg) = body.pointer("/choices/0/message") {
+        let tools = collect_strings(msg.get("tool_calls"), "/function/name");
+        if !tools.is_empty() {
+            return Some(tool_label(&tools));
+        }
+        if non_empty_str(msg.get("content")) {
+            return Some(Label::new("result_type", "assistant", "assistant"));
+        }
+        if msg.get("reasoning_content").is_some() {
+            return Some(Label::new("result_type", "thinking", "thinking"));
+        }
+    }
+
+    // 4. Gemini.
+    if let Some(parts) = body
+        .pointer("/candidates/0/content/parts")
+        .and_then(serde_json::Value::as_array)
+        && parts.iter().any(|p| p.get("text").is_some())
+    {
+        return Some(Label::new("result_type", "assistant", "assistant"));
+    }
+
+    None
+}
+
+fn classify_anthropic_blocks(blocks: &[serde_json::Value]) -> Option<Label> {
+    let block_type = |b: &serde_json::Value| {
+        b.get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let tool_names: Vec<String> = blocks
+        .iter()
+        .filter(|b| block_type(b).as_deref() == Some("tool_use"))
+        .filter_map(|b| {
+            b.get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned)
+        })
+        .collect();
+    let has = |ty: &str| blocks.iter().any(|b| block_type(b).as_deref() == Some(ty));
+
+    if has("tool_use") {
+        Some(tool_label(&tool_names))
+    } else if has("text") {
+        Some(Label::new("result_type", "assistant", "assistant"))
+    } else if has("thinking") {
+        Some(Label::new("result_type", "thinking", "thinking"))
+    } else if has("tool_result") {
+        Some(Label::new("result_type", "tool result", "result"))
+    } else {
+        None
+    }
+}
+
+fn classify_openai_output(output: &[serde_json::Value]) -> Option<Label> {
+    let item_type = |it: &serde_json::Value| {
+        it.get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    let tool_names: Vec<String> = output
+        .iter()
+        .filter(|it| item_type(it).ends_with("_call"))
+        .filter_map(|it| {
+            it.get("name")
+                .or_else(|| it.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.strip_suffix("_call").unwrap_or(s).to_owned())
+        })
+        .filter(|n| !n.is_empty())
+        .collect();
+    let has = |ty: &str| output.iter().any(|it| item_type(it) == ty);
+
+    if output.iter().any(|it| item_type(it).ends_with("_call")) {
+        Some(tool_label(&tool_names))
+    } else if has("message") {
+        Some(Label::new("result_type", "assistant", "assistant"))
+    } else if has("reasoning") {
+        Some(Label::new("result_type", "thinking", "thinking"))
+    } else {
+        None
+    }
+}
+
+fn tool_label(names: &[String]) -> Label {
+    let text = if names.is_empty() {
+        "tool".to_string()
+    } else {
+        format!("tool: {}", names.join(", "))
+    };
+    Label::new("result_type", text, "tool")
+}
+
+fn collect_strings(value: Option<&serde_json::Value>, pointer: &str) -> Vec<String> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| {
+                    it.pointer(pointer)
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn non_empty_str(value: Option<&serde_json::Value>) -> bool {
+    value
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+}
+
 /// One intercepted LLM request/response, the unit of "record & visualization".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmSpan {
@@ -231,6 +420,12 @@ pub struct LlmSpan {
     pub stream_events: Vec<StreamEvent>,
     #[serde(default, skip_serializing_if = "Usage::is_empty")]
     pub usage: Usage,
+    /// Generic precomputed display tags, rendered as badges in the trace list.
+    /// Computed here so the UI doesn't reparse bodies. Currently holds the
+    /// result-type classification (`kind = "result_type"`); other kinds can be
+    /// added without a schema change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<Label>,
     /// Upstream HTTP status code (0 if the request never reached upstream).
     pub status: u16,
     /// RFC 3339 start timestamp.
@@ -294,23 +489,21 @@ impl SpanDraft {
 ///
 /// When built with [`TraceStore::with_sink`] each recorded span is also
 /// appended to a JSONL file so a run's traffic survives the process.
-#[derive(Debug)]
 pub struct TraceStore {
     spans: RwLock<Vec<LlmSpan>>,
     sequence: AtomicU64,
-    tx: broadcast::Sender<LlmSpan>,
     /// Optional append-only JSONL sink; one [`LlmSpan`] per line.
     sink: Option<Mutex<fs::File>>,
+    forwarder: Option<TraceForwarder>,
 }
 
 impl Default for TraceStore {
     fn default() -> Self {
-        let (tx, _) = broadcast::channel(1024);
         Self {
             spans: RwLock::new(Vec::new()),
             sequence: AtomicU64::new(0),
-            tx,
             sink: None,
+            forwarder: None,
         }
     }
 }
@@ -319,6 +512,13 @@ impl TraceStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attaches a forwarder that is invoked for every recorded span, letting a
+    /// run mirror its traffic to an external sink (e.g. the central server).
+    pub fn with_forwarder(mut self, forwarder: TraceForwarder) -> Self {
+        self.forwarder = Some(forwarder);
+        self
     }
 
     /// Builds a store that appends every recorded span to `path` as JSONL,
@@ -356,6 +556,7 @@ impl TraceStore {
             .format(&Rfc3339)
             .unwrap_or_else(|_| String::new());
         let id = uuid::Uuid::new_v4().to_string();
+        let labels = build_labels(&draft);
         let span = LlmSpan {
             id: id.clone(),
             sequence,
@@ -372,21 +573,19 @@ impl TraceStore {
             response: draft.response,
             stream_events: draft.stream_events,
             usage: draft.usage,
+            labels,
             status: draft.status,
             started_at,
             latency_ms: draft.latency_ms,
             error: draft.error,
         };
-        // Store (and persist) before broadcasting: a subscriber that recovers
-        // from a broadcast lag via `list_since` must find a span it just saw
-        // announced. The reverse order leaves a window where the recovered
-        // range omits the span and it is never re-delivered.
         if let Ok(mut spans) = self.spans.write() {
             spans.push(span.clone());
         }
         self.persist(&span);
-        // A send error only means nobody is currently subscribed.
-        let _ = self.tx.send(span);
+        if let Some(forwarder) = &self.forwarder {
+            forwarder(&span);
+        }
         id
     }
 
@@ -407,13 +606,23 @@ impl TraceStore {
         }
     }
 
+    /// Returns a snapshot of every recorded span, in `sequence` order.
+    ///
+    /// Used at session close to build an ATIF trajectory from the run's traffic.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<LlmSpan> {
+        self.spans.read().map(|s| s.clone()).unwrap_or_default()
+    }
+
     /// Returns a snapshot of all recorded spans.
+    #[cfg(test)]
     #[must_use]
     pub fn list(&self) -> Vec<LlmSpan> {
         self.spans.read().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// Returns recorded spans with `sequence >= from`.
+    #[cfg(test)]
     #[must_use]
     pub fn list_since(&self, from: u64) -> Vec<LlmSpan> {
         self.spans
@@ -426,12 +635,6 @@ impl TraceStore {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    /// Subscribes to spans recorded from now on.
-    #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<LlmSpan> {
-        self.tx.subscribe()
     }
 }
 
@@ -457,6 +660,42 @@ mod tests {
         let id = store.record(SpanDraft::new(Provider::OpenAI, "/v1/chat/completions"));
         assert!(!id.is_empty());
         assert_eq!(store.list()[0].id, id);
+    }
+
+    #[test]
+    fn classifies_result_type_from_response_shapes() {
+        // Anthropic-shape content (also the proxy's normalized streamed mirror).
+        let tool = classify_result_type(&serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "…"},
+                {"type": "tool_use", "name": "Bash"},
+                {"type": "tool_use", "name": "Read"}
+            ]
+        }))
+        .expect("tool_use dominates");
+        assert_eq!(tool.kind, "result_type");
+        assert_eq!(tool.cls, "tool");
+        assert_eq!(tool.text, "tool: Bash, Read");
+
+        let text = classify_result_type(&serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}]
+        }))
+        .expect("text → assistant");
+        assert_eq!(
+            (text.cls.as_str(), text.text.as_str()),
+            ("assistant", "assistant")
+        );
+
+        // OpenAI chat completion with a tool call.
+        let openai = classify_result_type(&serde_json::json!({
+            "choices": [{"message": {"tool_calls": [{"function": {"name": "get_weather"}}]}}]
+        }))
+        .expect("openai tool call");
+        assert_eq!(openai.cls, "tool");
+        assert_eq!(openai.text, "tool: get_weather");
+
+        // Nothing classifiable.
+        assert!(classify_result_type(&serde_json::json!({"stop_reason": "end_turn"})).is_none());
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Common worker abstraction for the process exposed by `omniagent serve`.
 //!
 //! The web control plane only needs terminal I/O, resize, exit notification,
-//! and shutdown semantics.  Keeping those operations behind this handle lets
-//! the local PTY backend and the remote oad PTY backend evolve independently.
+//! and shutdown semantics. Keeping those operations behind this handle lets the
+//! worker backend evolve independently of the control plane.
 
 use std::sync::Arc;
 
@@ -11,7 +11,6 @@ use futures_util::future::BoxFuture;
 use tokio::sync::broadcast;
 
 use crate::agent::AgentHandle;
-use crate::oad_agent::OadAgentHandle;
 
 /// A point-in-time terminal attachment: retained output first, then live output.
 pub struct TerminalAttachment {
@@ -110,29 +109,6 @@ impl AgentWorker for AgentHandle {
 
     fn shutdown_worker(&self) -> BoxFuture<'_, ()> {
         Box::pin(async move { self.shutdown() })
-    }
-}
-
-impl AgentWorker for OadAgentHandle {
-    fn terminal_attach(&self) -> TerminalAttachment {
-        let (backlog, output) = self.attach();
-        TerminalAttachment::new(backlog, output)
-    }
-
-    fn write_input(&self, data: Bytes) {
-        self.send_input(data);
-    }
-
-    fn resize_pty(&self, rows: u16, cols: u16) {
-        self.resize(rows, cols);
-    }
-
-    fn wait_exit_code(&self) -> BoxFuture<'_, i32> {
-        Box::pin(async move { self.wait_exit().await })
-    }
-
-    fn shutdown_worker(&self) -> BoxFuture<'_, ()> {
-        Box::pin(async move { self.shutdown().await })
     }
 }
 

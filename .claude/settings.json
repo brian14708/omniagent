@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s http://localhost:*)",
+      "Bash(curl -s localhost:*)",
+      "Bash(cargo clippy *)",
+      "Bash(npm view *)"
+    ]
+  }
+}

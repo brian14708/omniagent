@@ -14,9 +14,6 @@ axum = { workspace = true, features = ["ws"] }
 bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
-oad-api.workspace = true
-oad-cli.workspace = true
-oad-core.workspace = true
 portable-pty.workspace = true
 reqwest.workspace = true
 rustix.workspace = true
@@ -25,9 +22,11 @@ serde_json.workspace = true
 time.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+urlencoding.workspace = true
 
 [lints]
 workspace = true

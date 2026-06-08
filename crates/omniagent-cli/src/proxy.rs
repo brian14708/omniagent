@@ -24,7 +24,6 @@ use futures_util::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use crate::compare::{CapturedRequest, CompareStore, CompareVariant, VariantState};
 use crate::record::{HeaderSnapshot, Provider, SpanDraft, TraceStore, Usage};
 use crate::review::{ReviewDecision, ReviewItem, ReviewPhase, ReviewStore};
 
@@ -69,7 +68,6 @@ const ALLOWED_PATH_PREFIXES: &[&str] = &[
 pub struct ProxyState {
     pub traces: Arc<TraceStore>,
     reviews: Arc<ReviewStore>,
-    compare: Arc<CompareStore>,
     client: reqwest::Client,
     anthropic_upstream: String,
     openai_upstream: String,
@@ -79,11 +77,7 @@ pub struct ProxyState {
 impl ProxyState {
     /// Builds proxy state, resolving upstream hosts from the environment.
     #[must_use]
-    pub fn new(
-        traces: Arc<TraceStore>,
-        reviews: Arc<ReviewStore>,
-        compare: Arc<CompareStore>,
-    ) -> Self {
+    pub fn new(traces: Arc<TraceStore>, reviews: Arc<ReviewStore>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_mins(10))
             .build()
@@ -91,7 +85,6 @@ impl ProxyState {
         Self {
             traces,
             reviews,
-            compare,
             client,
             anthropic_upstream: upstream_from_env(&["ANTHROPIC_BASE_URL"], DEFAULT_ANTHROPIC),
             openai_upstream: upstream_from_env(
@@ -156,19 +149,6 @@ impl ReviewContext {
             &mut self.path_and_query,
             model,
         );
-    }
-
-    /// Snapshots the raw request for later replay by the comparison feature.
-    fn captured(&self) -> CapturedRequest {
-        CapturedRequest {
-            method: self.reqwest_method.clone(),
-            path_and_query: self.path_and_query.clone(),
-            headers: self.headers.clone(),
-            body: self.body.clone(),
-            provider: self.provider,
-            upstream_base_url: self.upstream_base_url.clone(),
-            request_json: self.request.clone(),
-        }
     }
 }
 
@@ -340,18 +320,6 @@ async fn proxy_handler(
         return error_response(StatusCode::BAD_REQUEST, "invalid method");
     };
 
-    // Retain the raw request (real headers + body) so the comparison feature can
-    // replay it against other models; stored spans have redacted headers.
-    let captured = CapturedRequest {
-        method: reqwest_method.clone(),
-        path_and_query: path_and_query.clone(),
-        headers: headers.clone(),
-        body: body.clone(),
-        provider,
-        upstream_base_url: upstream_base_url.clone(),
-        request_json: draft.request.clone(),
-    };
-
     let upstream = state
         .client
         .request(reqwest_method, &url)
@@ -377,7 +345,6 @@ async fn proxy_handler(
 
     let mut response_headers = forward_response_headers(resp.headers());
     let traces = Arc::clone(&state.traces);
-    let compare = Arc::clone(&state.compare);
 
     // Tee: forward each chunk to the agent while accumulating a copy. The span
     // is recorded once the upstream body completes.
@@ -401,8 +368,7 @@ async fn proxy_handler(
                 }
             }
         }
-        let span_id = finalize_span(&traces, draft, &acc, provider, streaming, started);
-        compare.capture(span_id, captured);
+        finalize_span(&traces, draft, &acc, provider, streaming, started);
     });
 
     let body = Body::from_stream(ReceiverStream::new(rx));
@@ -564,106 +530,14 @@ async fn run_review_attempt(
 
 fn approve_review_response(
     state: &ProxyState,
-    ctx: &ReviewContext,
+    _ctx: &ReviewContext,
     outcome: ReviewAttempt,
 ) -> Response {
     let status = outcome.status;
     let forwarded_headers = outcome.forwarded_headers;
     let response_bytes = outcome.response_bytes;
-    let span_id = state.traces.record(outcome.completed);
-    state.compare.capture(span_id, ctx.captured());
+    state.traces.record(outcome.completed);
     buffered_response(status, forwarded_headers, response_bytes)
-}
-
-/// Replays the request captured for `span_id` against each model concurrently,
-/// streaming each model's response into the comparison store as it completes.
-/// Returns the new run id, or `None` if the source request is no longer retained.
-pub fn run_comparison(
-    compare: &Arc<CompareStore>,
-    span_id: &str,
-    models: Vec<String>,
-) -> Option<String> {
-    let captured = compare.captured(span_id)?;
-    let path = path_from_path_and_query(&captured.path_and_query);
-    let run_id = compare.create_run(span_id, &captured, path, &models);
-
-    for (index, model) in models.into_iter().enumerate() {
-        let compare = Arc::clone(compare);
-        let captured = captured.clone();
-        let run_id = run_id.clone();
-        tokio::spawn(async move {
-            let variant = run_one_variant(&compare, &captured, model).await;
-            compare.complete_variant(&run_id, index, variant);
-        });
-    }
-    Some(run_id)
-}
-
-/// Sends one model's replay of the captured request and maps the outcome into a
-/// [`CompareVariant`]. Same provider/endpoint/auth as the original — only the
-/// model is overridden.
-async fn run_one_variant(
-    compare: &CompareStore,
-    captured: &CapturedRequest,
-    model: String,
-) -> CompareVariant {
-    let mut request = captured.request_json.clone();
-    let mut body = captured.body.clone();
-    let mut path_and_query = captured.path_and_query.clone();
-    apply_model_override(
-        captured.provider,
-        &mut request,
-        &mut body,
-        &mut path_and_query,
-        &model,
-    );
-    let url = upstream_url(
-        captured.provider,
-        &captured.upstream_base_url,
-        &path_and_query,
-    );
-
-    let mut draft = SpanDraft::new(captured.provider, path_from_path_and_query(&path_and_query));
-    draft.method = captured.method.as_str().to_string();
-    draft
-        .upstream_base_url
-        .clone_from(&captured.upstream_base_url);
-    draft.request = request;
-    draft.model = Some(model.clone());
-
-    match execute_buffered(
-        compare.client(),
-        draft,
-        captured.method.clone(),
-        &url,
-        &captured.headers,
-        body,
-        captured.provider,
-    )
-    .await
-    {
-        Ok(attempt) => {
-            let completed = attempt.completed;
-            CompareVariant {
-                model,
-                state: VariantState::Done,
-                status: (completed.status != 0).then_some(completed.status),
-                response: completed.response,
-                usage: completed.usage,
-                latency_ms: (completed.latency_ms != 0).then_some(completed.latency_ms),
-                error: completed.error,
-            }
-        }
-        Err(errored) => CompareVariant {
-            model,
-            state: VariantState::Error,
-            status: (errored.status != 0).then_some(errored.status),
-            response: serde_json::Value::Null,
-            usage: Usage::default(),
-            latency_ms: (errored.latency_ms != 0).then_some(errored.latency_ms),
-            error: errored.error,
-        },
-    }
 }
 
 fn reject_review_response(

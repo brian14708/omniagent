@@ -1,0 +1,11 @@
+{
+  "name": "omniagent_web",
+  "version": "0.0.0",
+  "private": true,
+  "description": "OmniAgent web assets",
+  "license": "MIT",
+  "dependencies": {
+    "asciinema-player": "^3.15.1",
+    "ghostty-web": "^0.4.0"
+  }
+}
