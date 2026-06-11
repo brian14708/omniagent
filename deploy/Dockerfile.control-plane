@@ -36,7 +36,7 @@ RUN mix release omniagent
 FROM --platform=$TARGETPLATFORM ${DEBIAN_IMAGE} AS runtime
 
 RUN apt-get update -y \
-  && apt-get install -y --no-install-recommends ca-certificates curl libncurses6 libstdc++6 openssl \
+  && apt-get install -y --no-install-recommends ca-certificates libncurses6 libstdc++6 openssl \
   && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system omniagent \
@@ -44,8 +44,7 @@ RUN groupadd --system omniagent \
 
 WORKDIR /app
 
-ENV CLI_BUNDLE_DIR=/cli \
-  HOME=/app \
+ENV HOME=/app \
   LANG=C.UTF-8 \
   PHX_SERVER=true
 

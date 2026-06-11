@@ -5,7 +5,6 @@ metadata:
   labels:
     {{- include "omniagent.labels" . | nindent 4 }}
 data:
-  CLI_BUNDLE_DIR: /cli
   PHX_SERVER: "true"
   PORT: {{ .Values.service.port | quote }}
   POOL_SIZE: {{ .Values.database.poolSize | quote }}

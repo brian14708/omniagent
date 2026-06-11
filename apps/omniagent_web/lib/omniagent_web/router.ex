@@ -26,10 +26,6 @@ defmodule OmniagentWeb.Router do
     get "/login", SessionController, :new
     post "/login", SessionController, :create
     delete "/logout", SessionController, :delete
-
-    # Download the pre-built omniagent CLI for a given platform, e.g.
-    # GET /cli/linux/x86_64, /cli/linux/aarch64, /cli/darwin/aarch64.
-    get "/cli/:os/:arch", CliController, :download
   end
 
   scope "/", OmniagentWeb do

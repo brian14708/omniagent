@@ -155,7 +155,6 @@ jobs:
           images: ${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=nightly
-            type=sha,prefix=nightly-
           labels: |
             org.opencontainers.image.title=OmniAgent control plane
 
