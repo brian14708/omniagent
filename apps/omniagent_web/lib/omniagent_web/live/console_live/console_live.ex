@@ -235,25 +235,28 @@ defmodule OmniagentWeb.ConsoleLive do
   end
 
   def handle_event("create_agent", params, socket) do
-    %{"daemon_id" => daemon_id, "command" => command} = params
-    # Split respecting shell-style quoting so a command like
-    # `pnpm dlx "@anthropic-ai/claude-code"` yields three argv entries with the
-    # quotes stripped, not a literal `"...claude-code"` token.
-    argv = split_command(command)
+    %{"daemon_id" => daemon_id, "agent" => selection} = params
+    # The dropdown folds the codex backend choice into the agent selection:
+    # `codex-app-server` means agent codex driven over the native app-server.
+    {agent, app_server?} = agent_selection(selection)
+    # Extra args are appended to the agent's resolved launch command. Split
+    # respecting shell-style quoting so `--foo "a b"` yields two argv entries.
+    extra = split_command(params["custom_command"])
 
     cond do
       daemon_id == "" ->
         {:noreply, put_flash(socket, :error, "Pick a daemon to run the agent on.")}
 
-      argv == [] ->
-        {:noreply, put_flash(socket, :error, "Enter an agent command, e.g. `claude`.")}
+      agent == nil ->
+        {:noreply, put_flash(socket, :error, "Pick an agent to run.")}
 
       true ->
         payload =
-          %{"argv" => argv}
+          %{"agent" => agent, "custom_command" => extra}
           |> put_present("cwd", params["cwd"])
           |> put_present("name", params["name"])
-          |> put_app_server(params["app_server"])
+          |> put_present("model", params["model"])
+          |> put_app_server(app_server?)
 
         case Daemons.spawn_agent(daemon_id, payload) do
           :ok ->
@@ -261,7 +264,7 @@ defmodule OmniagentWeb.ConsoleLive do
              socket
              |> assign(:show_new_agent, false)
              |> assign(:pending_focus, true)
-             |> put_flash(:info, "Starting #{Enum.join(argv, " ")}…")}
+             |> put_flash(:info, "Starting #{Enum.join([agent | extra], " ")}…")}
 
           {:error, :offline} ->
             {:noreply, put_flash(socket, :error, "That daemon is no longer connected.")}
@@ -614,12 +617,18 @@ defmodule OmniagentWeb.ConsoleLive do
   defp put_present(map, _key, value) when value in [nil, ""], do: map
   defp put_present(map, key, value), do: Map.put(map, key, value)
 
-  # The "app-server (native)" checkbox posts "true"/"on" when ticked; otherwise
-  # the field is absent. Only set the flag when it is on (the daemon ignores it
-  # for non-codex agents).
-  defp put_app_server(map, value) when value in ["true", "on", true],
-    do: Map.put(map, "app_server", true)
+  # Maps the agent dropdown value to a canonical agent name and whether the
+  # codex app-server (native) backend was requested. Unknown selections yield
+  # `{nil, false}` so the handler can flash an error.
+  defp agent_selection("claude"), do: {"claude", false}
+  defp agent_selection("codex"), do: {"codex", false}
+  defp agent_selection("codex-app-server"), do: {"codex", true}
+  defp agent_selection("gemini"), do: {"gemini", false}
+  defp agent_selection(_), do: {nil, false}
 
+  # Only set the app_server flag when on; the daemon ignores it for non-codex
+  # agents.
+  defp put_app_server(map, true), do: Map.put(map, "app_server", true)
   defp put_app_server(map, _value), do: map
 
   # Shell-aware argv split (honours quotes); falls back to whitespace on any

@@ -52,13 +52,15 @@ impl Default for Config {
 
 /// Built-in agent launch commands, used when the config file omits the field.
 fn default_agent_commands() -> BTreeMap<String, Vec<String>> {
-    BTreeMap::from([(
-        "claude".to_string(),
-        ["pnpm", "dlx", "@anthropic-ai/claude-code"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect(),
-    )])
+    let cmd = |parts: &[&str]| parts.iter().map(|s| (*s).to_string()).collect();
+    BTreeMap::from([
+        (
+            "claude".to_string(),
+            cmd(&["pnpm", "dlx", "@anthropic-ai/claude-code"]),
+        ),
+        ("codex".to_string(), cmd(&["codex"])),
+        ("gemini".to_string(), cmd(&["gemini"])),
+    ])
 }
 
 /// Reads and writes the daemon [`Config`] file.

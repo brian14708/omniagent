@@ -98,8 +98,13 @@ pub fn decode_command(event: &str, payload: &Value) -> Option<ServerCommand> {
         }),
         "shutdown" => Some(ServerCommand::Shutdown),
         "spawn_agent" => Some(ServerCommand::SpawnAgent {
-            argv: payload
-                .get("argv")
+            agent: payload
+                .get("agent")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            custom_command: payload
+                .get("custom_command")
                 .and_then(Value::as_array)
                 .map(|items| {
                     items
@@ -120,6 +125,10 @@ pub fn decode_command(event: &str, payload: &Value) -> Option<ServerCommand> {
                 .get("app_server")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            model: payload
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }),
         "codex_input" => Some(ServerCommand::CodexInput {
             text: payload.get("text")?.as_str()?.to_string(),

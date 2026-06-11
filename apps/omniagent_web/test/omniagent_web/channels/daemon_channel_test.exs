@@ -37,11 +37,11 @@ defmodule OmniagentWeb.DaemonChannelTest do
            end)
 
     # A spawn request is pushed down the channel to this daemon process.
-    assert :ok = Daemons.spawn_agent(daemon_id, %{"argv" => ["claude"], "cwd" => "/tmp"})
-    assert_push("spawn_agent", %{"argv" => ["claude"], "cwd" => "/tmp"})
+    assert :ok = Daemons.spawn_agent(daemon_id, %{"agent" => "claude", "cwd" => "/tmp"})
+    assert_push("spawn_agent", %{"agent" => "claude", "cwd" => "/tmp"})
   end
 
   test "spawn_agent on an unknown daemon reports offline" do
-    assert {:error, :offline} = Daemons.spawn_agent("nope", %{"argv" => ["claude"]})
+    assert {:error, :offline} = Daemons.spawn_agent("nope", %{"agent" => "claude"})
   end
 end

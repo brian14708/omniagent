@@ -1,14 +1,13 @@
 //! Agent identification and capability detection.
 //!
-//! The agent a session supervises is otherwise opaque — it is just an `argv`
-//! the user supplied and we spawn verbatim. At session close we need to know
-//! (a) whether it is an agent omniagent recognizes and (b) whether we can build
-//! an ATIF trajectory for it. This mirrors harbor's `AgentName` registry plus
-//! the `SUPPORTS_ATIF` capability flag declared on `BaseAgent`: an agent without
-//! that capability simply produces no `trajectory.json`.
+//! The user selects which agent a session supervises by its canonical name
+//! (`claude`/`codex`/`gemini`); we don't infer it from the spawned `argv`. The
+//! name drives (a) whether omniagent recognizes the agent and (b) whether we can
+//! build an ATIF trajectory for it. This mirrors harbor's `AgentName` registry
+//! plus the `SUPPORTS_ATIF` capability flag declared on `BaseAgent`: an agent
+//! without that capability simply produces no `trajectory.json`.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 /// A recognized coding agent and its capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,20 +18,14 @@ pub struct AgentInfo {
     pub supports_atif: bool,
 }
 
-/// Detects the agent from its command line by matching the program basename.
+/// Looks up an agent by the selector the user picked (`claude`/`codex`/`gemini`).
 ///
-/// Returns `None` for an unrecognized binary: the session is still recorded and
+/// Returns `None` for an unrecognized selector: the session is still recorded and
 /// its terminal recording uploaded, but no ATIF trajectory is built (mirroring
 /// harbor, where an agent without `SUPPORTS_ATIF` produces no `trajectory.json`).
 #[must_use]
-pub fn detect_agent(argv: &[String]) -> Option<AgentInfo> {
-    let program = argv.first()?;
-    let stem = Path::new(program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(program.as_str());
-    let stem = stem.strip_suffix(".exe").unwrap_or(stem);
-    match stem {
+pub fn agent_info(agent: &str) -> Option<AgentInfo> {
+    match agent {
         "claude" => Some(AgentInfo {
             name: "claude-code",
             supports_atif: true,
@@ -49,29 +42,27 @@ pub fn detect_agent(argv: &[String]) -> Option<AgentInfo> {
     }
 }
 
-/// Expands a bare agent name (e.g. `claude`) into its configured launch command
-/// (e.g. `pnpm dlx @anthropic-ai/claude-code`), preserving any trailing args.
+/// Builds the argv to spawn for the selected agent: its configured launch command
+/// (e.g. `pnpm dlx @anthropic-ai/claude-code`) followed by the user's `extra`
+/// args.
 ///
-/// `commands` is the daemon's `agent_commands` map (see [`crate::config`]),
-/// keyed by bare agent name. Only an exact, bare program name is expanded: an
-/// argv whose program is an explicit path (`/usr/local/bin/claude`) or an
-/// already-resolved command is returned unchanged, so a user who has the agent
-/// installed keeps control. Detection ([`detect_agent`]) must be run on the
-/// original argv before calling this, since it matches the basename `claude`
-/// rather than the resolved `pnpm`.
+/// `commands` is the daemon's `agent_commands` map (see [`crate::config`]), keyed
+/// by bare agent name. An agent with no configured command falls back to running
+/// the bare name itself (`codex` → `["codex"]`), so an operator who has the agent
+/// on `PATH` needs no configuration.
 #[must_use]
-pub fn resolve_argv(argv: &[String], commands: &BTreeMap<String, Vec<String>>) -> Vec<String> {
-    let Some(program) = argv.first() else {
-        return argv.to_vec();
-    };
-    match commands.get(program) {
-        Some(command) if !command.is_empty() => {
-            let mut resolved = command.clone();
-            resolved.extend_from_slice(&argv[1..]);
-            resolved
-        }
-        _ => argv.to_vec(),
-    }
+pub fn launch_argv(
+    agent: &str,
+    extra: &[String],
+    commands: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut argv = commands
+        .get(agent)
+        .filter(|command| !command.is_empty())
+        .cloned()
+        .unwrap_or_else(|| vec![agent.to_string()]);
+    argv.extend_from_slice(extra);
+    argv
 }
 
 /// Flags that mean the user is selecting or continuing a session themselves, so
@@ -130,33 +121,18 @@ mod tests {
     }
 
     #[test]
-    fn detects_known_agents_by_basename() {
-        assert_eq!(
-            detect_agent(&argv(&["claude"])).unwrap().name,
-            "claude-code"
-        );
-        assert_eq!(
-            detect_agent(&argv(&["codex", "--flag"])).unwrap().name,
-            "codex"
-        );
-        assert_eq!(detect_agent(&argv(&["gemini"])).unwrap().name, "gemini-cli");
-    }
-
-    #[test]
-    fn matches_through_absolute_paths_and_exe_suffix() {
-        assert_eq!(
-            detect_agent(&argv(&["/usr/local/bin/claude"]))
-                .unwrap()
-                .name,
-            "claude-code"
-        );
-        assert_eq!(detect_agent(&argv(&["codex.exe"])).unwrap().name, "codex");
+    fn looks_up_known_agents_by_name() {
+        assert_eq!(agent_info("claude").unwrap().name, "claude-code");
+        assert_eq!(agent_info("codex").unwrap().name, "codex");
+        assert_eq!(agent_info("gemini").unwrap().name, "gemini-cli");
     }
 
     #[test]
     fn unknown_agent_is_unsupported() {
-        assert_eq!(detect_agent(&argv(&["bash"])), None);
-        assert_eq!(detect_agent(&[]), None);
+        // The resolved program name is not a selector, so it is not recognized.
+        assert_eq!(agent_info("claude-code"), None);
+        assert_eq!(agent_info("bash"), None);
+        assert_eq!(agent_info(""), None);
     }
 
     fn agent_commands() -> BTreeMap<String, Vec<String>> {
@@ -167,8 +143,8 @@ mod tests {
     }
 
     #[test]
-    fn resolves_bare_name_to_configured_command_keeping_args() {
-        let resolved = resolve_argv(&argv(&["claude", "--model", "opus"]), &agent_commands());
+    fn launch_argv_uses_configured_command_and_appends_extra() {
+        let resolved = launch_argv("claude", &argv(&["--model", "opus"]), &agent_commands());
         assert_eq!(
             resolved,
             argv(&[
@@ -182,26 +158,29 @@ mod tests {
     }
 
     #[test]
-    fn leaves_unmapped_or_explicit_programs_unchanged() {
+    fn launch_argv_falls_back_to_bare_name_when_unconfigured() {
         let commands = agent_commands();
-        // an unmapped name (no config entry) is spawned verbatim
-        assert_eq!(resolve_argv(&argv(&["codex"]), &commands), argv(&["codex"]));
-        // an explicit path is not a bare name, so it is never expanded
+        // codex has no config entry → run the bare selector name.
         assert_eq!(
-            resolve_argv(&argv(&["/usr/local/bin/claude"]), &commands),
-            argv(&["/usr/local/bin/claude"])
+            launch_argv("codex", &[], &commands),
+            argv(&["codex"])
         );
-        // empty argv stays empty
-        assert!(resolve_argv(&[], &commands).is_empty());
+        // extra args are appended to the fallback too.
+        assert_eq!(
+            launch_argv("codex", &argv(&["--search"]), &commands),
+            argv(&["codex", "--search"])
+        );
+        // an empty configured command is ignored in favor of the bare name.
+        let empty = BTreeMap::from([("gemini".to_string(), Vec::new())]);
+        assert_eq!(launch_argv("gemini", &[], &empty), argv(&["gemini"]));
     }
 
     #[test]
-    fn detection_then_resolution_preserves_session_injection() {
-        // The realistic spawn order: detect on the original argv, resolve the
-        // program, then inject the claude session id onto the resolved command.
-        let original = argv(&["claude"]);
-        let agent = detect_agent(&original);
-        let resolved = resolve_argv(&original, &agent_commands());
+    fn resolution_then_session_injection_for_claude() {
+        // The realistic spawn order: resolve the launch command for the selected
+        // agent, then inject the claude session id onto the resolved command.
+        let agent = agent_info("claude");
+        let resolved = launch_argv("claude", &[], &agent_commands());
         let (prepared, id) = prepare_argv(agent, &resolved);
         let id = id.expect("claude still gets a session id after resolution");
         assert_eq!(
@@ -218,14 +197,14 @@ mod tests {
 
     #[test]
     fn known_agents_support_atif() {
-        assert!(detect_agent(&argv(&["claude"])).unwrap().supports_atif);
-        assert!(detect_agent(&argv(&["codex"])).unwrap().supports_atif);
-        assert!(detect_agent(&argv(&["gemini"])).unwrap().supports_atif);
+        assert!(agent_info("claude").unwrap().supports_atif);
+        assert!(agent_info("codex").unwrap().supports_atif);
+        assert!(agent_info("gemini").unwrap().supports_atif);
     }
 
     #[test]
     fn injects_session_id_for_claude() {
-        let claude = detect_agent(&argv(&["claude"]));
+        let claude = agent_info("claude");
         let (prepared, id) = prepare_argv(claude, &argv(&["claude", "--model", "opus"]));
         let id = id.expect("a session id is chosen");
         assert_eq!(
@@ -237,7 +216,7 @@ mod tests {
 
     #[test]
     fn skips_injection_when_user_sets_a_session_flag() {
-        let claude = detect_agent(&argv(&["claude"]));
+        let claude = agent_info("claude");
         for flag in [
             "--session-id",
             "-r",
@@ -254,7 +233,7 @@ mod tests {
 
     #[test]
     fn skips_injection_for_equals_joined_session_flags() {
-        let claude = detect_agent(&argv(&["claude"]));
+        let claude = agent_info("claude");
         for arg in ["--session-id=abc", "--resume=x", "--continue=y"] {
             let (prepared, id) = prepare_argv(claude, &argv(&["claude", arg]));
             assert_eq!(
@@ -268,7 +247,7 @@ mod tests {
 
     #[test]
     fn leaves_other_agents_unchanged() {
-        let codex = detect_agent(&argv(&["codex"]));
+        let codex = agent_info("codex");
         let (prepared, id) = prepare_argv(codex, &argv(&["codex"]));
         assert_eq!(prepared, argv(&["codex"]));
         assert!(id.is_none());

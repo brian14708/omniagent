@@ -280,12 +280,13 @@ async fn start_proxy(
     port: u16,
     traces: Arc<TraceStore>,
     reviews: Arc<ReviewStore>,
+    model_override: Option<String>,
 ) -> Result<SocketAddr> {
     let listener = TcpListener::bind(SocketAddr::new(bind, port))
         .await
         .with_context(|| format!("failed to bind proxy on {bind}:{port}"))?;
     let addr = listener.local_addr()?;
-    let app = proxy::router(ProxyState::new(traces, reviews));
+    let app = proxy::router(ProxyState::new(traces, reviews, model_override));
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
             tracing::error!(error = %err, "proxy server stopped");

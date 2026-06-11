@@ -214,13 +214,8 @@ impl CodexWorkerHandle {
 /// command: appends the `app-server` subcommand and stdio transport, then config
 /// overrides that route codex's model calls through omniagent's recording proxy.
 ///
-/// Codex ignores `OPENAI_BASE_URL` for its built-in providers (verified against
-/// codex 0.139), so — unlike the PTY agents — env-var redirection does not put
-/// its LLM traffic through the proxy. Built-in provider ids are reserved and
-/// can't be overridden, but a *custom* provider can, so we inject one whose
-/// `base_url` points at the proxy and select it. Codex then POSTs
-/// `/v1/responses` to the proxy (Responses wire API), which forwards upstream
-/// with the real `OPENAI_API_KEY` like every other agent.
+/// See [`provider_overrides`] for why the config overrides (rather than the
+/// `OPENAI_BASE_URL` env var) are what route codex's traffic through the proxy.
 #[must_use]
 pub fn app_server_argv(resolved: &[String], proxy_url: &str) -> Vec<String> {
     let mut argv = resolved.to_vec();
@@ -231,21 +226,52 @@ pub fn app_server_argv(resolved: &[String], proxy_url: &str) -> Vec<String> {
         argv.push("--listen".to_string());
         argv.push("stdio://".to_string());
     }
+    argv.extend(provider_overrides(proxy_url));
+    // Surface the model's reasoning summary so the console can render it — codex
+    // emits reasoning deltas only when this is enabled (off by default). This is
+    // app-server/console-specific, so it lives here rather than in the shared
+    // `provider_overrides`.
+    argv.push("-c".to_string());
+    argv.push("model_reasoning_summary=\"detailed\"".to_string());
+    argv
+}
+
+/// Builds the argv to launch the interactive codex TUI (the PTY path) through
+/// the proxy: the resolved codex command plus the provider config overrides.
+///
+/// Codex ignores `OPENAI_BASE_URL` for its built-in providers, so — exactly like
+/// the app-server backend — the env-var redirection that works for claude/gemini
+/// does not route codex's LLM traffic through the proxy. We inject the same
+/// custom-provider overrides so the TUI POSTs to the proxy instead of upstream.
+#[must_use]
+pub fn tui_argv(resolved: &[String], proxy_url: &str) -> Vec<String> {
+    let mut argv = resolved.to_vec();
+    argv.extend(provider_overrides(proxy_url));
+    argv
+}
+
+/// Config overrides (`-c key=value` argv tokens) that define and select a custom
+/// `omniagent` provider whose `base_url` points at the recording proxy. Shared by
+/// the app-server backend ([`app_server_argv`]) and the PTY TUI ([`tui_argv`]),
+/// since codex ignores `OPENAI_BASE_URL` for built-in providers (verified against
+/// codex 0.139). Built-in provider ids are reserved and can't be overridden, but
+/// a custom provider can, so codex then POSTs `/v1/responses` to the proxy
+/// (Responses wire API), which forwards upstream with the real `OPENAI_API_KEY`.
+#[must_use]
+fn provider_overrides(proxy_url: &str) -> Vec<String> {
     let base_url = format!("{}/v1", proxy_url.trim_end_matches('/'));
+    let mut args = Vec::new();
     for override_ in [
         "model_provider=omniagent".to_string(),
         "model_providers.omniagent.name=\"omniagent\"".to_string(),
         format!("model_providers.omniagent.base_url=\"{base_url}\""),
         "model_providers.omniagent.wire_api=\"responses\"".to_string(),
         "model_providers.omniagent.env_key=\"OPENAI_API_KEY\"".to_string(),
-        // Surface the model's reasoning summary so the console can render it —
-        // codex emits reasoning deltas only when this is enabled (off by default).
-        "model_reasoning_summary=\"detailed\"".to_string(),
     ] {
-        argv.push("-c".to_string());
-        argv.push(override_);
+        args.push("-c".to_string());
+        args.push(override_);
     }
-    argv
+    args
 }
 
 /// Terminates the app-server process group (SIGTERM, then SIGKILL after a short
@@ -357,6 +383,51 @@ mod tests {
     #[test]
     fn app_server_argv_points_provider_base_url_at_the_proxy() {
         let out = app_server_argv(&argv(&["codex"]), "http://10.0.0.5:9999/");
+        assert!(
+            out.iter()
+                .any(|a| a == "model_providers.omniagent.base_url=\"http://10.0.0.5:9999/v1\""),
+            "base_url should be the proxy url + /v1, with a trailing slash trimmed"
+        );
+    }
+
+    // The TUI overrides are the provider config without the app-server-only
+    // `model_reasoning_summary` token.
+    fn tui_overrides() -> Vec<String> {
+        vec![
+            "-c".to_string(),
+            "model_provider=omniagent".to_string(),
+            "-c".to_string(),
+            "model_providers.omniagent.name=\"omniagent\"".to_string(),
+            "-c".to_string(),
+            "model_providers.omniagent.base_url=\"http://127.0.0.1:7000/v1\"".to_string(),
+            "-c".to_string(),
+            "model_providers.omniagent.wire_api=\"responses\"".to_string(),
+            "-c".to_string(),
+            "model_providers.omniagent.env_key=\"OPENAI_API_KEY\"".to_string(),
+        ]
+    }
+
+    #[test]
+    fn tui_argv_appends_provider_overrides_without_app_server_bits() {
+        let mut expected = argv(&["codex"]);
+        expected.extend(tui_overrides());
+        let out = tui_argv(&argv(&["codex"]), PROXY);
+        assert_eq!(out, expected);
+        // No app-server subcommand/transport, and no console-only reasoning summary.
+        assert!(!out.iter().any(|a| a == "app-server"));
+        assert!(!out.iter().any(|a| a.starts_with("model_reasoning_summary")));
+    }
+
+    #[test]
+    fn tui_argv_preserves_resolved_launcher_and_extra_args() {
+        let out = tui_argv(&argv(&["pnpm", "dlx", "codex", "--search"]), PROXY);
+        assert_eq!(out[..4], argv(&["pnpm", "dlx", "codex", "--search"])[..]);
+        assert!(out.iter().any(|a| a == "model_provider=omniagent"));
+    }
+
+    #[test]
+    fn tui_argv_points_provider_base_url_at_the_proxy() {
+        let out = tui_argv(&argv(&["codex"]), "http://10.0.0.5:9999/");
         assert!(
             out.iter()
                 .any(|a| a == "model_providers.omniagent.base_url=\"http://10.0.0.5:9999/v1\""),

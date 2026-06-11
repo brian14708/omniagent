@@ -78,7 +78,11 @@ pub enum ServerCommand {
     Shutdown,
     /// Daemon control: start a new agent session.
     SpawnAgent {
-        argv: Vec<String>,
+        /// Selected agent: a canonical name (`claude`/`codex`/`gemini`).
+        agent: String,
+        /// Extra args appended to the agent's resolved launch command.
+        #[serde(default)]
+        custom_command: Vec<String>,
         #[serde(default)]
         cwd: Option<String>,
         #[serde(default)]
@@ -86,6 +90,9 @@ pub enum ServerCommand {
         /// Drive codex via `codex app-server` (native, structured) instead of a PTY.
         #[serde(default)]
         app_server: bool,
+        /// Optional model override applied to every request from this session.
+        #[serde(default)]
+        model: Option<String>,
     },
     /// Codex app-server: submit a user turn.
     CodexInput {

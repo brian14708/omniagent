@@ -53,8 +53,11 @@ use super::{ChannelHandle, ClientConfig, PhoenixSocket, SocketHandle, decode_str
 /// Everything needed to launch one supervised agent session.
 #[derive(Debug, Clone)]
 pub struct SessionSpec {
-    /// Agent command and arguments (e.g. `["claude"]`).
-    pub argv: Vec<String>,
+    /// Selected agent: a canonical name (`claude`/`codex`/`gemini`). Drives the
+    /// launch command, the backend, and proxy config injection.
+    pub agent: String,
+    /// Extra args appended to the agent's resolved launch command.
+    pub custom_command: Vec<String>,
     /// Working directory for the agent.
     pub cwd: PathBuf,
     /// Optional human-readable name.
@@ -115,6 +118,25 @@ pub struct DaemonSupervisor {
     policy: WorkspacePolicy,
 }
 
+/// Final argv for a PTY-spawned agent: claude gets a `--session-id` injected so
+/// its transcript is locatable; codex gets the proxy provider overrides (it
+/// ignores `OPENAI_BASE_URL` for its built-in providers, so env redirection
+/// alone doesn't route the TUI through the proxy). Returns claude's chosen id.
+fn pty_spawn_argv(
+    agent: &str,
+    info: Option<AgentInfo>,
+    resolved: &[String],
+    proxy_url: &str,
+) -> (Vec<String>, Option<String>) {
+    let (argv, id) = agents::prepare_argv(info, resolved);
+    let argv = if agent == "codex" {
+        codex::worker::tui_argv(&argv, proxy_url)
+    } else {
+        argv
+    };
+    (argv, id)
+}
+
 impl DaemonSupervisor {
     /// Start the supervisor; the socket connects in the background.
     #[must_use]
@@ -170,14 +192,22 @@ impl DaemonSupervisor {
         let handle = self.socket.handle();
         let cwd_string = spec.cwd.display().to_string();
 
-        // Identify the agent up front: it picks the backend (codex app-server vs
+        // The user's explicit selection picks the backend (codex app-server vs
         // PTY) and labels the session for the console's renderer choice.
-        let agent_info = agents::detect_agent(&spec.argv);
-        let codex_native = spec.app_server && agent_info.is_some_and(|info| info.name == "codex");
+        let agent_info = agents::agent_info(&spec.agent);
+        let codex_native = spec.app_server && spec.agent == "codex";
+
+        // Resolve the launch command (configured command + the user's extra args)
+        // once, so registration and either backend share one argv.
+        let agent_commands = ConfigStore::default().agent_commands().unwrap_or_default();
+        let resolved_argv = agents::launch_argv(&spec.agent, &spec.custom_command, &agent_commands);
 
         let mut metadata = serde_json::Map::new();
         if codex_native {
             metadata.insert("kind".to_string(), json!("codex-app-server"));
+        }
+        if let Some(model) = &spec.model {
+            metadata.insert("model".to_string(), json!(model));
         }
 
         let opened = handle
@@ -185,7 +215,7 @@ impl DaemonSupervisor {
                 session_id: spec.session_id.clone(),
                 name: spec.name.clone(),
                 cwd: cwd_string.clone(),
-                argv: spec.argv.clone(),
+                argv: resolved_argv.clone(),
                 metadata,
             })
             .await?;
@@ -196,15 +226,16 @@ impl DaemonSupervisor {
         let traces = build_trace_store(spec.trace_path.as_deref(), channel.clone())?;
         let reviews = build_review_store(spec.no_review, spec.review_timeout_secs, &channel);
 
-        let proxy_addr =
-            start_proxy(spec.bind, spec.proxy_port, traces.clone(), reviews.clone()).await?;
+        let proxy_addr = start_proxy(
+            spec.bind,
+            spec.proxy_port,
+            traces.clone(),
+            reviews.clone(),
+            spec.model.clone(),
+        )
+        .await?;
         let proxy_url = crate::proxy_base_url(spec.bind, proxy_addr);
         let env = proxy::agent_env(&proxy_url);
-
-        // Expand a bare agent name (e.g. `codex`) into its configured launch
-        // command (e.g. `pnpm dlx codex`) before either backend uses it.
-        let agent_commands = ConfigStore::default().agent_commands().unwrap_or_default();
-        let resolved_argv = agents::resolve_argv(&spec.argv, &agent_commands);
         let started_at = SystemTime::now();
 
         // Choose the backend. Codex-native drives `codex app-server` over JSON-RPC
@@ -221,7 +252,8 @@ impl DaemonSupervisor {
         } else {
             // For claude-code, inject a known `--session-id` so its transcript is
             // locatable at close; other agents are spawned unchanged.
-            let (spawn_argv, native_session_id) = agents::prepare_argv(agent_info, &resolved_argv);
+            let (spawn_argv, native_session_id) =
+                pty_spawn_argv(&spec.agent, agent_info, &resolved_argv, &proxy_url);
             let agent = AgentHandle::spawn(
                 &spawn_argv,
                 &env,
@@ -242,7 +274,7 @@ impl DaemonSupervisor {
             session_id: session_id.clone(),
             name: spec.name.clone().or_else(|| opened.registered.name.clone()),
             cwd: cwd_string,
-            argv: spec.argv.clone(),
+            argv: resolved_argv,
             proxy_url,
         };
 

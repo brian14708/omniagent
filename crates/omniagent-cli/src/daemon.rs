@@ -105,7 +105,8 @@ async fn spawn_session(
     spawn: SpawnRequest,
 ) -> ControlResponse {
     let spec = SessionSpec {
-        argv: spawn.argv,
+        agent: spawn.agent,
+        custom_command: spawn.custom_command,
         cwd: PathBuf::from(spawn.cwd),
         name: spawn.name,
         session_id: spawn.session_id,
@@ -151,17 +152,20 @@ fn spawn_control_listener(supervisor: Arc<DaemonSupervisor>, bind: IpAddr, persi
         loop {
             match commands.recv().await {
                 Ok(ServerCommand::SpawnAgent {
-                    argv,
+                    agent,
+                    custom_command,
                     cwd,
                     name,
                     app_server,
+                    model,
                 }) => {
                     let cwd = cwd.map_or_else(
                         || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                         PathBuf::from,
                     );
                     let spec = SessionSpec {
-                        argv,
+                        agent,
+                        custom_command,
                         cwd,
                         name,
                         session_id: None,
@@ -171,7 +175,7 @@ fn spawn_control_listener(supervisor: Arc<DaemonSupervisor>, bind: IpAddr, persi
                         review_timeout_secs: DEFAULT_REVIEW_TIMEOUT_SECS,
                         trace_path: persist_traces.then(crate::default_trace_path),
                         app_server,
-                        model: None,
+                        model,
                     };
                     let supervisor = Arc::clone(&supervisor);
                     tokio::spawn(async move {

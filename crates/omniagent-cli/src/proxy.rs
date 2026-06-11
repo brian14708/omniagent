@@ -72,12 +72,18 @@ pub struct ProxyState {
     anthropic_upstream: String,
     openai_upstream: String,
     gemini_upstream: String,
+    /// Model to force on every request from this session (None = pass through).
+    model_override: Option<String>,
 }
 
 impl ProxyState {
     /// Builds proxy state, resolving upstream hosts from the environment.
     #[must_use]
-    pub fn new(traces: Arc<TraceStore>, reviews: Arc<ReviewStore>) -> Self {
+    pub fn new(
+        traces: Arc<TraceStore>,
+        reviews: Arc<ReviewStore>,
+        model_override: Option<String>,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_mins(10))
             .build()
@@ -105,6 +111,7 @@ impl ProxyState {
                 ],
                 DEFAULT_GEMINI,
             ),
+            model_override,
         }
     }
 
@@ -287,11 +294,23 @@ async fn proxy_handler(
         return error_response(StatusCode::NOT_FOUND, "not found");
     }
 
-    let path_and_query = uri
+    let mut path_and_query = uri
         .path_and_query()
         .map_or_else(|| path.clone(), |pq| pq.as_str().to_string());
     let provider = classify(&path);
     let upstream_base_url = state.upstream_for(provider).to_string();
+
+    let mut body = body;
+    let mut request = parse_body(&body);
+
+    // Force the session's configured model on every request (None = pass
+    // through untouched). This makes model selection uniform across PTY agents
+    // and codex regardless of each agent's own CLI flags. It can rewrite the
+    // body and, for Gemini, the URL path, so the upstream URL is resolved after.
+    if let Some(model) = clean_model(state.model_override.as_deref()) {
+        apply_model_override(provider, &mut request, &mut body, &mut path_and_query, model);
+    }
+
     let url = upstream_url(provider, &upstream_base_url, &path_and_query);
 
     let mut draft = SpanDraft::new(provider, path.clone());
@@ -299,8 +318,8 @@ async fn proxy_handler(
     draft.request_base_url = request_base_url(&headers);
     draft.upstream_base_url = upstream_base_url.clone();
     draft.request_headers = capture_headers(&headers);
-    draft.request = parse_body(&body);
-    draft.model = request_model(provider, &draft.request, &path);
+    draft.model = request_model(provider, &request, &path_from_path_and_query(&path_and_query));
+    draft.request = request;
 
     if state.reviews.enabled() {
         return reviewed_proxy_handler(
@@ -1066,5 +1085,36 @@ mod tests {
         );
         let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(sent["model"], "new");
+    }
+
+    #[test]
+    fn model_override_rewrites_gemini_url_path() {
+        // Gemini carries the model in the URL, so the override rewrites the path
+        // (the proxy handler recomputes the upstream URL from this afterwards).
+        let mut request = parse_body(b"{}");
+        let mut body = Bytes::from_static(b"{}");
+        let mut path_and_query =
+            "/v1beta/models/gemini-1.5-flash:generateContent?key=x".to_string();
+        apply_model_override(
+            Provider::Gemini,
+            &mut request,
+            &mut body,
+            &mut path_and_query,
+            "gemini-2.0-pro",
+        );
+        assert_eq!(
+            path_and_query,
+            "/v1beta/models/gemini-2.0-pro:generateContent?key=x"
+        );
+    }
+
+    #[test]
+    fn clean_model_ignores_blank_override() {
+        // A blank/whitespace model must be treated as "no override" so the proxy
+        // forwards the agent's own model untouched.
+        assert_eq!(clean_model(Some("")), None);
+        assert_eq!(clean_model(Some("   ")), None);
+        assert_eq!(clean_model(Some(" opus ")), Some("opus"));
+        assert_eq!(clean_model(None), None);
     }
 }

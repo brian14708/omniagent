@@ -38,7 +38,12 @@ pub enum ControlRequest {
 /// Parameters for spawning a session over the control socket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnRequest {
-    pub argv: Vec<String>,
+    /// Selected agent: a canonical name (`claude`/`codex`/`gemini`). Drives the
+    /// launch command, the backend, and proxy config injection.
+    pub agent: String,
+    /// Extra args appended to the agent's resolved launch command.
+    #[serde(default)]
+    pub custom_command: Vec<String>,
     pub cwd: String,
     #[serde(default)]
     pub name: Option<String>,

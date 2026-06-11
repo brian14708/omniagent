@@ -543,8 +543,21 @@
             </select>
           </label>
           <label class="block">
-            <span class="oa-label mb-1">Agent command</span>
-            <input name="command" class="oa-input w-full" placeholder="claude" value="claude" />
+            <span class="oa-label mb-1">Agent</span>
+            <select name="agent" class="oa-input w-full">
+              <option value="claude">claude</option>
+              <option value="codex">codex (terminal)</option>
+              <option value="codex-app-server">codex (app-server · native)</option>
+              <option value="gemini">gemini</option>
+            </select>
+          </label>
+          <label class="block">
+            <span class="oa-label mb-1">Extra args (optional)</span>
+            <input
+              name="custom_command"
+              class="oa-input w-full"
+              placeholder="appended to the agent command, e.g. --model gpt-5"
+            />
           </label>
           <label class="block">
             <span class="oa-label mb-1">Working dir (optional)</span>
@@ -554,13 +567,13 @@
             <span class="oa-label mb-1">Name (optional)</span>
             <input name="name" class="oa-input w-full" placeholder="my session" />
           </label>
-          <label class="flex items-start gap-2">
-            <input type="checkbox" name="app_server" value="true" class="mt-0.5" />
-            <span class="font-mono text-[11px] text-[var(--dim)]">
-              <span class="text-[var(--text)]">app-server (native)</span>
-              — for <code class="text-[var(--amber)]">codex</code>: render the structured
-              conversation instead of the terminal
-            </span>
+          <label class="block">
+            <span class="oa-label mb-1">Model (optional)</span>
+            <input
+              name="model"
+              class="oa-input w-full"
+              placeholder="defaults to the agent's model"
+            />
           </label>
           <div class="flex justify-end gap-2 pt-2">
             <button type="button" phx-click="close_new_agent" class="oa-btn">Cancel</button>
