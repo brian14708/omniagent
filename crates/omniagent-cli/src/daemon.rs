@@ -117,6 +117,8 @@ async fn spawn_session(
             .unwrap_or(DEFAULT_REVIEW_TIMEOUT_SECS),
         // Each session gets a fresh trace archive when persistence is enabled.
         trace_path: persist_traces.then(crate::default_trace_path),
+        app_server: spawn.app_server,
+        model: spawn.model,
     };
     match supervisor.spawn_session(spec).await {
         Ok(summary) => ControlResponse::Spawned(summary),
@@ -135,7 +137,7 @@ fn spawn_control_listener(supervisor: Arc<DaemonSupervisor>, bind: IpAddr, persi
         let control = loop {
             match supervisor.open_control_channel(metadata.clone()).await {
                 Ok(handle) => {
-                    tracing::info!("registered daemon control channel with control plane");
+                    tracing::debug!("registered daemon control channel with control plane");
                     break handle;
                 }
                 Err(err) => {
@@ -148,7 +150,12 @@ fn spawn_control_listener(supervisor: Arc<DaemonSupervisor>, bind: IpAddr, persi
         let mut commands = control.subscribe_commands();
         loop {
             match commands.recv().await {
-                Ok(ServerCommand::SpawnAgent { argv, cwd, name }) => {
+                Ok(ServerCommand::SpawnAgent {
+                    argv,
+                    cwd,
+                    name,
+                    app_server,
+                }) => {
                     let cwd = cwd.map_or_else(
                         || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                         PathBuf::from,
@@ -163,12 +170,14 @@ fn spawn_control_listener(supervisor: Arc<DaemonSupervisor>, bind: IpAddr, persi
                         no_review: false,
                         review_timeout_secs: DEFAULT_REVIEW_TIMEOUT_SECS,
                         trace_path: persist_traces.then(crate::default_trace_path),
+                        app_server,
+                        model: None,
                     };
                     let supervisor = Arc::clone(&supervisor);
                     tokio::spawn(async move {
                         match supervisor.spawn_session(spec).await {
                             Ok(summary) => {
-                                tracing::info!(session = %summary.session_id, "spawned agent via control channel");
+                                tracing::debug!(session = %summary.session_id, "spawned agent via control channel");
                             }
                             Err(err) => {
                                 tracing::error!(error = %err, "control-channel spawn failed");

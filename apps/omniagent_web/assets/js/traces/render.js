@@ -20,16 +20,40 @@ import {
 } from "./parse.js";
 
 function renderRequest(span, allMessages) {
-  const messages = allMessages.slice(-8);
+  // Always keep the leading context — the system/instructions prompt and the
+  // opening user turn set up the whole conversation — then show the most
+  // recent messages. A naive tail slice drops that context in long agentic
+  // traces (notably OpenAI Responses, where every tool call/output is its own
+  // input item, so the head scrolls past the window after only a few turns).
+  const TAIL = 8;
+  let head = 0;
+  while (
+    head < allMessages.length &&
+    (allMessages[head].role === "system" ||
+      allMessages[head].role === "instructions")
+  )
+    head++;
+  if (head < allMessages.length && allMessages[head].role === "user") head++;
+  const tailStart = Math.max(head, allMessages.length - TAIL);
+  const headMsgs = allMessages.slice(0, head);
+  const tailMsgs = allMessages.slice(tailStart);
+  const omitted = tailStart - head;
   const tools = requestTools(span);
-  if (!messages.length && !tools.length) return "";
+  if (!headMsgs.length && !tailMsgs.length && !tools.length) return "";
   const cards = [];
-  for (const m of messages) {
+  const pushCard = (m) => {
     const title = `${m.role}${m.tool ? " · " + m.tool : ""}`;
     cards.push(
       `<div class="cblock req"><div class="ch">${escapeHtml(title)}</div><pre class="ctext">${escapeHtml(m.text)}</pre></div>`,
     );
+  };
+  headMsgs.forEach(pushCard);
+  if (omitted > 0) {
+    cards.push(
+      `<div class="cblock elide"><div class="ch">${omitted} earlier message${omitted === 1 ? "" : "s"} hidden</div></div>`,
+    );
   }
+  tailMsgs.forEach(pushCard);
   if (tools.length) {
     const toolText = tools
       .map((t) => `${t.name}\n${JSON.stringify(t.raw, null, 2)}`)
@@ -94,16 +118,21 @@ export function buildNode(span) {
     inTok != null || outTok != null || totalTok != null || reasonTok != null;
   const hasCache = cacheR != null || cacheW != null;
 
+  // A non-2xx response is an error even when no transport `error` string was
+  // recorded, so its latency pill turns red (`err`) instead of a latency color
+  // — red is reserved for errors; slow-but-OK spans stay orange via `latClass`.
+  const httpError = span.status != null && span.status >= 400;
+
   const status = span.error
     ? `<span class="err-tag"><span class="lc"></span>${escapeHtml(span.error)}</span>`
-    : `<span class="pill lat ${latClass(span.latency_ms)}"><span class="lc"></span>${span.status} · ${fmtLat(span.latency_ms)}</span>`;
+    : `<span class="pill lat ${httpError ? "err" : latClass(span.latency_ms)}"><span class="lc"></span>${span.status} · ${fmtLat(span.latency_ms)}</span>`;
 
   // Compact stat shown inline in the collapsed (single-line) row. The full
   // pills + flow bar live in row2/.flow below, hidden in the list but cloned
   // into the popup on open.
   const row1Stat = span.error
     ? `<span class="r1stat err">${escapeHtml(span.error)}</span>`
-    : `<span class="r1stat"><span class="lat ${latClass(span.latency_ms)}">${span.status ?? ""} · ${fmtLat(span.latency_ms)}</span>${hasFlow ? `<span class="tok">${fmtTok(inTok)}→${fmtTok(outTok)}</span>` : ""}</span>`;
+    : `<span class="r1stat"><span class="lat ${httpError ? "err" : latClass(span.latency_ms)}">${span.status ?? ""} · ${fmtLat(span.latency_ms)}</span>${hasFlow ? `<span class="tok">${fmtTok(inTok)}→${fmtTok(outTok)}</span>` : ""}</span>`;
 
   // Badges are precomputed server-side (by the proxy) and arrive on the span as
   // `labels`, so the row needs no response parsing.

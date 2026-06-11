@@ -47,7 +47,21 @@ use crate::protocol::{RegisterSessionRequest, RegisteredSession, ServerCommand};
 use super::{ClientConfig, decode_command, next_ref, phoenix_message, websocket_url};
 
 /// Events that ride the sequenced, replayable outbox.
-const REPLAYABLE_EVENTS: [&str; 4] = ["pty_output", "pty_exit", "trace_span", "review_item"];
+///
+/// `codex_*` events are the structured codex app-server conversation; they are
+/// durable and replayed on reconnect just like `pty_output`. The high-volume
+/// `codex_delta` stream is intentionally *not* here — it is ephemeral (like raw
+/// PTY bytes), reconciled by the durable `codex_item` completed item.
+const REPLAYABLE_EVENTS: [&str; 8] = [
+    "pty_output",
+    "pty_exit",
+    "trace_span",
+    "review_item",
+    "codex_item",
+    "codex_turn",
+    "codex_token_usage",
+    "codex_error",
+];
 
 /// Wire event coalescing a contiguous run of `pty_output` items into one frame.
 const PTY_OUTPUT_BATCH: &str = "pty_output_batch";
@@ -458,7 +472,7 @@ async fn run_supervisor(shared: Arc<Shared>) {
                 }
 
                 backoff.reset();
-                tracing::info!("connected to control plane; {} channel(s) live", live.len());
+                tracing::debug!("connected to control plane; {} channel(s) live", live.len());
                 let flusher = spawn_flusher(Arc::clone(&shared));
                 let heartbeat = spawn_heartbeat(Arc::clone(&shared));
                 shared.dirty.notify_one();

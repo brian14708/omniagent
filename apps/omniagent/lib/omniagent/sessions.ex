@@ -18,6 +18,17 @@ defmodule Omniagent.Sessions do
   def get_session!(id), do: Repo.get!(AgentSession, id)
 
   @doc """
+  Whether a session is driven by `codex app-server` (the native, structured
+  backend) rather than a PTY. Set from the registration metadata the daemon
+  sends; the console uses it to pick the conversation renderer over the terminal.
+  """
+  def codex_native?(%AgentSession{metadata: metadata}) when is_map(metadata) do
+    metadata["kind"] == "codex-app-server"
+  end
+
+  def codex_native?(_session), do: false
+
+  @doc """
   IDs of sessions marked `online` whose last activity (`updated_at`, bumped by
   every client heartbeat) predates `cutoff`. Used by the cluster reconciler to
   find sessions whose owning node may have crashed: a live client heartbeats every

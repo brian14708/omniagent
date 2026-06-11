@@ -28,6 +28,7 @@ import { LiveSocket } from "phoenix_live_view";
 import { hooks as colocatedHooks } from "phoenix-colocated/omniagent_web";
 import topbar from "../vendor/topbar";
 import { Terminal } from "./hooks/terminal";
+import { Codex } from "./hooks/codex";
 import { Recording } from "./hooks/recording";
 import { Prefs } from "./hooks/prefs";
 import { Resize } from "./hooks/resize";
@@ -39,7 +40,15 @@ const csrfToken = document
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: { _csrf_token: csrfToken },
-  hooks: { ...colocatedHooks, Terminal, Recording, Prefs, Resize, Traces },
+  hooks: {
+    ...colocatedHooks,
+    Terminal,
+    Codex,
+    Recording,
+    Prefs,
+    Resize,
+    Traces,
+  },
 });
 
 // Show progress bar on live navigation and form submits

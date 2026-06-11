@@ -23,6 +23,19 @@ impl TerminalAttachment {
     const fn new(backlog: Vec<u8>, output: broadcast::Receiver<Bytes>) -> Self {
         Self { backlog, output }
     }
+
+    /// An attachment with no terminal output, for backends without a PTY (the
+    /// codex app-server worker). The sender is dropped immediately, so the
+    /// receiver reports `Closed` on first poll — but the terminal bridges and
+    /// recorder that consume it are never wired for a non-PTY session.
+    #[must_use]
+    fn empty() -> Self {
+        let (_tx, output) = broadcast::channel(1);
+        Self {
+            backlog: Vec::new(),
+            output,
+        }
+    }
 }
 
 /// Backend contract for a supervised coding-agent worker.
@@ -47,45 +60,76 @@ pub trait AgentWorker: Send + Sync + 'static {
 }
 
 /// Cloneable, backend-agnostic handle used by the web server and supervisor.
+///
+/// Two backends: a PTY-backed agent ([`AgentHandle`], the terminal path used by
+/// claude/gemini/codex-TUI) and the structured codex app-server worker
+/// ([`crate::codex::CodexWorkerHandle`]). The shared lifecycle methods
+/// ([`wait_exit`](Self::wait_exit) / [`shutdown`](Self::shutdown)) drive the
+/// supervisor's reaper uniformly; the terminal methods are meaningful only for
+/// the PTY backend and are inert for codex (which the supervisor never wires to
+/// a terminal bridge).
 #[derive(Clone)]
-pub struct WorkerHandle {
-    inner: Arc<dyn AgentWorker>,
+pub enum WorkerHandle {
+    Pty(Arc<dyn AgentWorker>),
+    Codex(crate::codex::CodexWorkerHandle),
 }
 
 impl WorkerHandle {
     #[must_use]
-    pub fn new(worker: impl AgentWorker) -> Self {
-        Self {
-            inner: Arc::new(worker),
+    pub fn new_pty(worker: impl AgentWorker) -> Self {
+        Self::Pty(Arc::new(worker))
+    }
+
+    #[must_use]
+    pub const fn new_codex(handle: crate::codex::CodexWorkerHandle) -> Self {
+        Self::Codex(handle)
+    }
+
+    /// Attach a terminal client to the worker's PTY output (empty for codex).
+    #[must_use]
+    pub fn attach(&self) -> TerminalAttachment {
+        match self {
+            Self::Pty(worker) => worker.terminal_attach(),
+            Self::Codex(_) => TerminalAttachment::empty(),
         }
     }
 
-    /// Attach a terminal client to the worker's PTY output.
-    #[must_use]
-    pub fn attach(&self) -> TerminalAttachment {
-        self.inner.terminal_attach()
-    }
-
-    /// Send raw terminal bytes to the worker's PTY stdin.
+    /// Send raw terminal bytes to the worker's PTY stdin (no-op for codex).
     pub fn send_input(&self, data: Bytes) {
-        self.inner.write_input(data);
+        if let Self::Pty(worker) = self {
+            worker.write_input(data);
+        }
     }
 
-    /// Resize the worker's PTY.
+    /// Resize the worker's PTY (no-op for codex).
     pub fn resize(&self, rows: u16, cols: u16) {
-        self.inner.resize_pty(rows, cols);
+        if let Self::Pty(worker) = self {
+            worker.resize_pty(rows, cols);
+        }
     }
 
-    /// Wait for the worker's command to exit and return its exit code.
+    /// Wait for the worker to exit and return its exit code.
     #[must_use]
     pub fn wait_exit(&self) -> BoxFuture<'_, i32> {
-        self.inner.wait_exit_code()
+        match self {
+            Self::Pty(worker) => worker.wait_exit_code(),
+            Self::Codex(handle) => {
+                let handle = handle.clone();
+                Box::pin(async move { handle.wait_exit().await })
+            }
+        }
     }
 
     /// Terminate the worker and release any backend-owned resources.
     #[must_use]
     pub fn shutdown(&self) -> BoxFuture<'_, ()> {
-        self.inner.shutdown_worker()
+        match self {
+            Self::Pty(worker) => worker.shutdown_worker(),
+            Self::Codex(handle) => {
+                let handle = handle.clone();
+                Box::pin(async move { handle.shutdown().await })
+            }
+        }
     }
 }
 
@@ -170,7 +214,7 @@ mod tests {
     async fn worker_handle_forwards_backend_operations() {
         let fake = FakeWorker::new();
         let events = fake.events.clone();
-        let worker = WorkerHandle::new(fake);
+        let worker = WorkerHandle::new_pty(fake);
 
         let attachment = worker.attach();
         assert_eq!(attachment.backlog, b"backlog");

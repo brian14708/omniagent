@@ -16,18 +16,21 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{Notify, broadcast};
+use time::OffsetDateTime;
+use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::agent::AgentHandle;
 use crate::agent_log;
 use crate::agents::{self, AgentInfo};
 use crate::atif;
 use crate::cast::CastRecorder;
+use crate::codex::client::{Notification, ServerRequest};
+use crate::codex::{self, CodexWorkerHandle};
 use crate::config::{ConfigStore, path_within_roots};
 use crate::files;
 use crate::protocol::{RegisterSessionRequest, ServerCommand};
-use crate::record::TraceStore;
-use crate::review::{ReviewDecision, ReviewEvent, ReviewStore};
+use crate::record::{Provider, TraceStore};
+use crate::review::{ReviewDecision, ReviewEvent, ReviewItem, ReviewPhase, ReviewStore};
 use crate::session::omniagent_data_dir;
 use crate::upload::{self, UploadConfig, UploadedArtifact};
 use crate::worker::WorkerHandle;
@@ -39,6 +42,11 @@ const DEFAULT_PTY_COLS: u16 = 120;
 
 /// Default seconds to wait for a human review decision before timing out.
 pub const DEFAULT_REVIEW_TIMEOUT_SECS: u64 = 30;
+
+/// How long [`DaemonSupervisor::shutdown_all`] waits for in-flight sessions to
+/// finalize and upload their artifacts before giving up, so a single stuck
+/// upload cannot hang daemon shutdown indefinitely.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 use super::{ChannelHandle, ClientConfig, PhoenixSocket, SocketHandle, decode_streaming};
 
@@ -63,6 +71,10 @@ pub struct SessionSpec {
     pub review_timeout_secs: u64,
     /// Optional JSONL trace archive path.
     pub trace_path: Option<PathBuf>,
+    /// Drive codex via `codex app-server` (native, structured) instead of a PTY.
+    pub app_server: bool,
+    /// Optional model override passed to codex's `thread/start`.
+    pub model: Option<String>,
 }
 
 /// A snapshot of a live session for control-plane listing.
@@ -158,13 +170,23 @@ impl DaemonSupervisor {
         let handle = self.socket.handle();
         let cwd_string = spec.cwd.display().to_string();
 
+        // Identify the agent up front: it picks the backend (codex app-server vs
+        // PTY) and labels the session for the console's renderer choice.
+        let agent_info = agents::detect_agent(&spec.argv);
+        let codex_native = spec.app_server && agent_info.is_some_and(|info| info.name == "codex");
+
+        let mut metadata = serde_json::Map::new();
+        if codex_native {
+            metadata.insert("kind".to_string(), json!("codex-app-server"));
+        }
+
         let opened = handle
             .open_session(RegisterSessionRequest {
                 session_id: spec.session_id.clone(),
                 name: spec.name.clone(),
                 cwd: cwd_string.clone(),
                 argv: spec.argv.clone(),
-                metadata: serde_json::Map::new(),
+                metadata,
             })
             .await?;
         let channel = opened.handle;
@@ -179,49 +201,42 @@ impl DaemonSupervisor {
         let proxy_url = crate::proxy_base_url(spec.bind, proxy_addr);
         let env = proxy::agent_env(&proxy_url);
 
-        // Identify the agent (for ATIF support) and, for claude-code, inject a
-        // known `--session-id` so we can locate its transcript deterministically
-        // at close. The server still registers the user's original argv.
-        //
-        // Detection runs on the original argv (it matches the bare program name
-        // `claude`); `resolve_argv` then expands that name into its configured
-        // launch command (e.g. `pnpm dlx @anthropic-ai/claude-code`) before the
-        // session id is appended.
-        let agent_info = agents::detect_agent(&spec.argv);
+        // Expand a bare agent name (e.g. `codex`) into its configured launch
+        // command (e.g. `pnpm dlx codex`) before either backend uses it.
         let agent_commands = ConfigStore::default().agent_commands().unwrap_or_default();
         let resolved_argv = agents::resolve_argv(&spec.argv, &agent_commands);
-        let (spawn_argv, native_session_id) = agents::prepare_argv(agent_info, &resolved_argv);
         let started_at = SystemTime::now();
 
-        let agent = AgentHandle::spawn(
-            &spawn_argv,
-            &env,
-            Some(spec.cwd.as_path()),
-            DEFAULT_PTY_ROWS,
-            DEFAULT_PTY_COLS,
-        )?;
-        let worker = WorkerHandle::new(agent);
-
-        // Record the terminal to a `.cast` file under the data dir — always,
-        // since every session has a PTY. Best-effort; never blocks startup.
-        let recording_path = omniagent_data_dir()
-            .join("recordings")
-            .join(format!("{session_id}.cast"));
-        let recorder = match CastRecorder::spawn(
-            recording_path,
-            &worker,
-            DEFAULT_PTY_ROWS,
-            DEFAULT_PTY_COLS,
-        ) {
-            Ok(recorder) => Some(recorder),
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to start terminal recording");
-                None
-            }
+        // Choose the backend. Codex-native drives `codex app-server` over JSON-RPC
+        // and renders structured events; everything else runs in a PTY. The two
+        // diverge entirely on I/O wiring but share the reaper/finalize path below.
+        let (worker, recorder, native_session_id) = if codex_native {
+            let app_argv = codex::worker::app_server_argv(&resolved_argv, &proxy_url);
+            let (codex_worker, events) =
+                CodexWorkerHandle::spawn(&app_argv, &env, &spec.cwd, spec.model.as_deref()).await?;
+            spawn_codex_event_bridge(&channel, codex_worker.clone(), events.notifications);
+            spawn_codex_approval_bridge(reviews.clone(), codex_worker.clone(), events.approvals);
+            spawn_codex_command_bridge(&channel, codex_worker.clone(), spec.cwd.clone());
+            (WorkerHandle::new_codex(codex_worker), None, None)
+        } else {
+            // For claude-code, inject a known `--session-id` so its transcript is
+            // locatable at close; other agents are spawned unchanged.
+            let (spawn_argv, native_session_id) = agents::prepare_argv(agent_info, &resolved_argv);
+            let agent = AgentHandle::spawn(
+                &spawn_argv,
+                &env,
+                Some(spec.cwd.as_path()),
+                DEFAULT_PTY_ROWS,
+                DEFAULT_PTY_COLS,
+            )?;
+            let worker = WorkerHandle::new_pty(agent);
+            let recorder = start_cast_recorder(&session_id, &worker);
+            spawn_worker_bridge(&channel, worker.clone(), spec.cwd.clone());
+            (worker, recorder, native_session_id)
         };
 
+        // Review decisions flow back the same way for both backends.
         spawn_review_decision_bridge(&channel, reviews.clone());
-        spawn_worker_bridge(&channel, worker.clone(), spec.cwd.clone());
 
         let summary = SessionSummary {
             session_id: session_id.clone(),
@@ -295,7 +310,18 @@ impl DaemonSupervisor {
         }
     }
 
-    /// Shut down every live session.
+    /// Shut down every live session and wait for their reapers to finish
+    /// finalizing and uploading artifacts.
+    ///
+    /// Signaling a worker only makes its agent exit; the per-session reap task
+    /// spawned in [`Self::spawn_session`] is what awaits that exit and then
+    /// uploads the session's artifacts. If we returned as soon as the workers
+    /// were signaled, the daemon's runtime would be dropped mid-upload and
+    /// cancel those tasks (surfacing as "task NNN was cancelled" /
+    /// "background task failed"), losing the trajectory and raw-request
+    /// artifacts. So we wait for the session map to drain — each reaper removes
+    /// its session and notifies `idle` once finalize completes — bounded by
+    /// [`SHUTDOWN_DRAIN_TIMEOUT`] so a single stuck upload can't hang shutdown.
     pub async fn shutdown_all(&self) {
         let workers: Vec<WorkerHandle> = self
             .sessions
@@ -306,6 +332,28 @@ impl DaemonSupervisor {
             .collect();
         for worker in workers {
             worker.shutdown().await;
+        }
+
+        let drained = async {
+            loop {
+                let notified = self.idle.notified();
+                tokio::pin!(notified);
+                // Register the waiter before checking emptiness: `notify_waiters`
+                // wakes only already-registered waiters and stores no permit, so
+                // a reaper that drains the map between the check and the await
+                // would otherwise be missed and leave us waiting forever.
+                notified.as_mut().enable();
+                if self.sessions.lock().expect("sessions lock").is_empty() {
+                    break;
+                }
+                notified.await;
+            }
+        };
+        if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, drained)
+            .await
+            .is_err()
+        {
+            tracing::warn!("timed out waiting for sessions to finalize during shutdown");
         }
     }
 }
@@ -536,6 +584,21 @@ fn spawn_worker_bridge(channel: &ChannelHandle, worker: WorkerHandle, workspace:
     spawn_command_bridge(channel, worker, workspace);
 }
 
+/// Records a PTY session's terminal to a `.cast` file under the data dir.
+/// Best-effort: a failure is logged and yields `None` rather than blocking startup.
+fn start_cast_recorder(session_id: &str, worker: &WorkerHandle) -> Option<CastRecorder> {
+    let recording_path = omniagent_data_dir()
+        .join("recordings")
+        .join(format!("{session_id}.cast"));
+    match CastRecorder::spawn(recording_path, worker, DEFAULT_PTY_ROWS, DEFAULT_PTY_COLS) {
+        Ok(recorder) => Some(recorder),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to start terminal recording");
+            None
+        }
+    }
+}
+
 /// Forwards PTY output (and the final exit) from the worker into the channel.
 ///
 /// A single task owns the output stream so `pty_exit` is always sequenced
@@ -609,55 +672,73 @@ fn spawn_command_bridge(channel: &ChannelHandle, worker: WorkerHandle, workspace
             match command {
                 ServerCommand::PtyInput { data } => worker.send_input(Bytes::from(data)),
                 ServerCommand::PtyResize { rows, cols } => worker.resize(rows, cols),
-                ServerCommand::ReviewDecision { .. } | ServerCommand::SpawnAgent { .. } => {
-                    // Handled elsewhere: review-decision bridge / daemon control channel.
-                }
-                ServerCommand::FileRequest { path } => {
-                    let workspace = workspace.clone();
-                    let payload = tokio::task::spawn_blocking(move || {
-                        match files::read_file(&workspace, &path) {
-                            Ok(text) => json!({"path": path, "ok": true, "text": text}),
-                            Err(err) => {
-                                json!({"path": path, "ok": false, "error": err.to_string()})
-                            }
-                        }
-                    })
-                    .await
-                    .unwrap_or_else(|_| json!({"ok": false, "error": "file task panicked"}));
-                    channel.push("file_response", payload);
-                }
-                ServerCommand::DiffRequest { path } => {
-                    let workspace = workspace.clone();
-                    let payload = tokio::task::spawn_blocking(move || {
-                        let filter = (!path.trim().is_empty()).then_some(path.as_str());
-                        let diff = files::git_diff(&workspace, filter);
-                        json!({"path": path, "ok": true, "diff": diff})
-                    })
-                    .await
-                    .unwrap_or_else(|_| json!({"ok": false, "error": "diff task panicked"}));
-                    channel.push("diff_response", payload);
-                }
-                ServerCommand::ListDir { path } => {
-                    let workspace = workspace.clone();
-                    let payload = tokio::task::spawn_blocking(move || {
-                        match files::list_dir(&workspace, &path) {
-                            Ok(entries) => json!({"path": path, "ok": true, "entries": entries}),
-                            Err(err) => {
-                                json!({"path": path, "ok": false, "error": err.to_string()})
-                            }
-                        }
-                    })
-                    .await
-                    .unwrap_or_else(|_| json!({"ok": false, "error": "dir task panicked"}));
-                    channel.push("dir_response", payload);
-                }
                 ServerCommand::Shutdown => {
                     worker.shutdown().await;
                     break;
                 }
+                // Handled elsewhere (review-decision bridge / daemon control /
+                // codex command bridge) or not applicable to a PTY session.
+                ServerCommand::ReviewDecision { .. }
+                | ServerCommand::SpawnAgent { .. }
+                | ServerCommand::CodexInput { .. }
+                | ServerCommand::CodexInterrupt => {}
+                file_or_diff_or_dir => {
+                    handle_workspace_request(&channel, &workspace, &file_or_diff_or_dir).await;
+                }
             }
         }
     });
+}
+
+/// Serves the workspace file/diff/dir read commands shared by the PTY and codex
+/// command bridges. Returns `true` if `command` was a workspace request.
+async fn handle_workspace_request(
+    channel: &ChannelHandle,
+    workspace: &Path,
+    command: &ServerCommand,
+) -> bool {
+    match command {
+        ServerCommand::FileRequest { path } => {
+            let workspace = workspace.to_path_buf();
+            let path = path.clone();
+            let payload =
+                tokio::task::spawn_blocking(move || match files::read_file(&workspace, &path) {
+                    Ok(text) => json!({"path": path, "ok": true, "text": text}),
+                    Err(err) => json!({"path": path, "ok": false, "error": err.to_string()}),
+                })
+                .await
+                .unwrap_or_else(|_| json!({"ok": false, "error": "file task panicked"}));
+            channel.push("file_response", payload);
+            true
+        }
+        ServerCommand::DiffRequest { path } => {
+            let workspace = workspace.to_path_buf();
+            let path = path.clone();
+            let payload = tokio::task::spawn_blocking(move || {
+                let filter = (!path.trim().is_empty()).then_some(path.as_str());
+                let diff = files::git_diff(&workspace, filter);
+                json!({"path": path, "ok": true, "diff": diff})
+            })
+            .await
+            .unwrap_or_else(|_| json!({"ok": false, "error": "diff task panicked"}));
+            channel.push("diff_response", payload);
+            true
+        }
+        ServerCommand::ListDir { path } => {
+            let workspace = workspace.to_path_buf();
+            let path = path.clone();
+            let payload =
+                tokio::task::spawn_blocking(move || match files::list_dir(&workspace, &path) {
+                    Ok(entries) => json!({"path": path, "ok": true, "entries": entries}),
+                    Err(err) => json!({"path": path, "ok": false, "error": err.to_string()}),
+                })
+                .await
+                .unwrap_or_else(|_| json!({"ok": false, "error": "dir task panicked"}));
+            channel.push("dir_response", payload);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Routes review decisions from the server into the review store.
@@ -675,6 +756,166 @@ fn spawn_review_decision_bridge(channel: &ChannelHandle, reviews: Arc<ReviewStor
             };
             if let ServerCommand::ReviewDecision { id, decision } = command {
                 let _ = reviews.decide(&id, ReviewDecision::from_server_value(&decision));
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Codex app-server bridges (structured conversation instead of a PTY)
+// ---------------------------------------------------------------------------
+
+/// Forwards codex notifications to the channel as structured conversation
+/// events, tracking the active turn id so an interrupt can target it.
+fn spawn_codex_event_bridge(
+    channel: &ChannelHandle,
+    worker: CodexWorkerHandle,
+    mut notifications: mpsc::UnboundedReceiver<Notification>,
+) {
+    let channel = channel.clone();
+    tokio::spawn(async move {
+        // Codex sends reasoning text only via ephemeral deltas; accumulate it per
+        // item so the durable reasoning item can be backfilled on completion and
+        // survive replay.
+        let mut reasoning: HashMap<String, String> = HashMap::new();
+        while let Some(note) = notifications.recv().await {
+            match note.method.as_str() {
+                "turn/started" => worker.set_active_turn(codex::turn_started_id(&note.params)),
+                "turn/completed" => worker.set_active_turn(None),
+                _ => {}
+            }
+            if let Some((item_id, delta)) = codex::reasoning_delta(&note) {
+                reasoning.entry(item_id).or_default().push_str(&delta);
+            }
+            if let Some((event, mut payload)) = codex::map_notification(&note) {
+                codex::backfill_reasoning(&mut payload, &mut reasoning);
+                channel.push(event, payload);
+            }
+        }
+    });
+}
+
+/// Turns codex approval requests into review-gate items and routes the human
+/// decision back as the codex approval response. Reuses the existing
+/// [`ReviewStore`] so codex approvals surface in the console's Reviews pane.
+fn spawn_codex_approval_bridge(
+    reviews: Arc<ReviewStore>,
+    worker: CodexWorkerHandle,
+    mut approvals: mpsc::UnboundedReceiver<ServerRequest>,
+) {
+    tokio::spawn(async move {
+        while let Some(req) = approvals.recv().await {
+            // One task per request so a slow human decision on one approval
+            // doesn't block surfacing the next.
+            let reviews = Arc::clone(&reviews);
+            let worker = worker.clone();
+            tokio::spawn(async move {
+                let item = approval_review_item(&req);
+                let decision = reviews.prompt(item).await;
+                worker
+                    .respond_approval(&req.id, codex::map_decision(&decision))
+                    .await;
+            });
+        }
+    });
+}
+
+/// First present key from `keys` read as a string, else empty (codex mixes
+/// `snake_case` and `camelCase` across payloads).
+fn json_str(value: &serde_json::Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Builds a review item from a codex approval request. The id encodes the rpc id
+/// so the returned decision round-trips to the right request; codex isn't an
+/// LLM-proxy call, so the proxy-specific fields stay empty.
+fn approval_review_item(req: &ServerRequest) -> ReviewItem {
+    let p = &req.params;
+    let (method, path) = if req.method.contains("fileChange") {
+        // The fileChange approval references the item by id (codex mixes
+        // snake/camel spellings across payloads, so accept both).
+        let id = json_str(p, &["itemId", "item_id"]);
+        ("file_change", id)
+    } else {
+        // For a command approval, show the command itself (falling back to the
+        // cwd) rather than the cwd alone — that's what the human is approving.
+        let command = p
+            .get("command")
+            .and_then(serde_json::Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| json_str(p, &["cwd"]));
+        ("command_execution", command)
+    };
+    ReviewItem {
+        id: codex::approval_review_id(req),
+        sequence: 0,
+        phase: ReviewPhase::Request,
+        attempt: 1,
+        // Codex runs on OpenAI; the review UI is provider-labelled but otherwise
+        // provider-agnostic.
+        provider: Provider::OpenAI,
+        model: None,
+        method: method.to_string(),
+        path,
+        streaming: false,
+        request_base_url: String::new(),
+        upstream_base_url: String::new(),
+        request_headers: std::collections::BTreeMap::new(),
+        request: req.params.clone(),
+        response_headers: std::collections::BTreeMap::new(),
+        response: serde_json::Value::Null,
+        usage: crate::record::Usage::default(),
+        status: None,
+        latency_ms: None,
+        started_at: OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        error: None,
+    }
+}
+
+/// Applies server->client commands for a codex session: user turns, interrupt,
+/// shutdown, and the shared workspace file/diff/dir reads.
+fn spawn_codex_command_bridge(
+    channel: &ChannelHandle,
+    worker: CodexWorkerHandle,
+    workspace: PathBuf,
+) {
+    let mut commands = channel.subscribe_commands();
+    let channel = channel.clone();
+    tokio::spawn(async move {
+        loop {
+            let command = match commands.recv().await {
+                Ok(command) => command,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            match command {
+                ServerCommand::CodexInput { text } => worker.start_turn(&text).await,
+                ServerCommand::CodexInterrupt => worker.interrupt().await,
+                ServerCommand::Shutdown => {
+                    worker.shutdown().await;
+                    break;
+                }
+                // Handled by the review-decision bridge / daemon control channel,
+                // or not applicable to a codex session.
+                ServerCommand::ReviewDecision { .. }
+                | ServerCommand::SpawnAgent { .. }
+                | ServerCommand::PtyInput { .. }
+                | ServerCommand::PtyResize { .. } => {}
+                file_or_diff_or_dir => {
+                    handle_workspace_request(&channel, &workspace, &file_or_diff_or_dir).await;
+                }
             }
         }
     });

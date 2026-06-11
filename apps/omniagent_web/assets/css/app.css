@@ -108,6 +108,9 @@ h3,
   --amber-soft: rgba(255, 180, 84, 0.12);
   --prov-green: #5fe0aa;
   --prov-red: #ff6b6b;
+  /* Slow-but-successful latency: a warning orange distinct from the error red,
+     which is reserved for genuine errors in the trace panel. */
+  --prov-orange: #ff9145;
   --prov-anthropic: #e0936f;
   --prov-openai: #4fd0a8;
   --prov-gemini: #86a8ff;
@@ -547,6 +550,9 @@ h3,
   color: var(--amber);
 }
 .oa-traces .r1stat .lat.slow {
+  color: var(--prov-orange);
+}
+.oa-traces .r1stat .lat.err {
   color: var(--prov-red);
 }
 .oa-traces .r1stat .tok {
@@ -604,6 +610,9 @@ h3,
   color: var(--amber);
 }
 .oa-traces .lat.slow {
+  color: var(--prov-orange);
+}
+.oa-traces .lat.err {
   color: var(--prov-red);
 }
 .oa-traces .stream {
@@ -707,6 +716,15 @@ h3,
 }
 .oa-traces .cblock.result .ch {
   color: var(--prov-openai);
+}
+.oa-traces .cblock.elide {
+  border-style: dashed;
+  background: transparent;
+}
+.oa-traces .cblock.elide .ch {
+  border-bottom: none;
+  justify-content: center;
+  color: var(--faint);
 }
 .oa-traces .cblock .ctext {
   margin: 0;
@@ -1004,4 +1022,232 @@ h3,
 }
 .rtype.result {
   color: var(--dim);
+}
+
+/* ── Native codex conversation pane (built by the Codex hook) ── */
+.oa-codex {
+  font: 400 12px/1.55 var(--font-mono);
+}
+.oa-codex-strip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: none;
+  padding: 6px 11px;
+  border-bottom: 1px solid var(--line);
+  color: var(--faint);
+  font-size: 11px;
+}
+.oa-codex-turn[data-state="running"] {
+  color: var(--amber);
+}
+.oa-codex-turn[data-state="failed"] {
+  color: var(--prov-red);
+}
+.oa-codex-tokens {
+  margin-left: auto;
+}
+.oa-codex-error {
+  flex: none;
+  margin: 8px;
+  padding: 8px 11px;
+  border: 1px solid var(--prov-red);
+  border-radius: 8px;
+  color: var(--prov-red);
+  font-size: 11px;
+}
+.oa-codex-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.oa-codex-item {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+.oa-codex-item.is-empty {
+  display: none;
+}
+.oa-codex-item.kind-userMessage {
+  /* Indent to the right so the user's turn reads as distinct against the
+     left-aligned agent/tool output (no special background or border). */
+  margin-left: 12%;
+}
+.oa-codex-item.kind-userMessage > .oa-codex-item-label {
+  color: var(--amber);
+  background: transparent;
+}
+.oa-codex-item.kind-userMessage .oa-md-p {
+  color: var(--amber-2);
+}
+.oa-codex-item-label {
+  padding: 4px 10px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.oa-codex-item-body {
+  padding: 9px 11px;
+}
+.oa-codex-text {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+  font: inherit;
+}
+.oa-codex-item.kind-reasoning .oa-codex-text {
+  color: var(--dim);
+  font-style: italic;
+}
+.oa-codex-collapse {
+  margin-top: 6px;
+}
+.oa-codex-collapse > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 11px;
+  color: var(--faint);
+  user-select: none;
+}
+.oa-codex-collapse > summary::-webkit-details-marker {
+  display: none;
+}
+.oa-codex-collapse > summary::before {
+  content: "▸ ";
+}
+.oa-codex-collapse[open] > summary::before {
+  content: "▾ ";
+}
+.oa-codex-collapse > summary:hover {
+  color: var(--dim);
+}
+/* The wrapped pre already has its own top margin; tighten it under the summary. */
+.oa-codex-collapse > pre {
+  margin-top: 4px;
+}
+.oa-codex-cmd,
+.oa-codex-output,
+.oa-codex-diff,
+.oa-codex-raw {
+  margin: 6px 0 0;
+  background: #050608;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+  scrollbar-width: thin;
+  font: 400 11px/1.5 var(--font-mono);
+  color: var(--dim);
+}
+.oa-codex-cmd {
+  color: var(--amber);
+}
+.oa-codex-meta {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--faint);
+}
+.oa-codex-plan {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--dim);
+}
+/* ── Rendered Markdown (agent messages, reasoning, user messages) ── */
+.oa-md-p {
+  margin: 0 0 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+}
+.oa-md-p:last-child {
+  margin-bottom: 0;
+}
+.oa-codex-item.kind-reasoning .oa-md-p {
+  color: var(--dim);
+  font-style: italic;
+}
+.oa-md-h {
+  margin: 10px 0 6px;
+  font-weight: 700;
+  color: var(--text);
+}
+.oa-md-h1 {
+  font-size: 15px;
+}
+.oa-md-h2 {
+  font-size: 14px;
+}
+.oa-md-h3,
+.oa-md-h4,
+.oa-md-h5,
+.oa-md-h6 {
+  font-size: 13px;
+}
+.oa-md-list {
+  margin: 0 0 8px;
+  padding-left: 20px;
+  color: var(--text);
+}
+.oa-md-list li {
+  margin: 2px 0;
+}
+.oa-md-quote {
+  margin: 0 0 8px;
+  padding-left: 10px;
+  border-left: 2px solid var(--line);
+  color: var(--dim);
+}
+.oa-md-hr {
+  border: none;
+  border-top: 1px solid var(--line);
+  margin: 10px 0;
+}
+.oa-md-code {
+  margin: 0 0 8px;
+  background: #050608;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  overflow: auto;
+  scrollbar-width: thin;
+  font: 400 11px/1.5 var(--font-mono);
+  color: var(--dim);
+}
+.oa-md-inlinecode {
+  background: #050608;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 4px;
+  font: 400 0.92em var(--font-mono);
+  color: var(--amber);
+}
+.oa-codex-item-body a {
+  color: var(--amber);
+  text-decoration: underline;
+}
+.oa-codex-composer {
+  flex: none;
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  border-top: 1px solid var(--line);
+}
+.oa-codex-input {
+  flex: 1 1 auto;
+  resize: none;
+  font: 400 12px/1.5 var(--font-mono);
 }

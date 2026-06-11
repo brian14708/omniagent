@@ -13,6 +13,7 @@ mod agents;
 mod atif;
 mod cast;
 mod client;
+mod codex;
 mod config;
 mod control;
 mod daemon;

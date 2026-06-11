@@ -161,22 +161,34 @@
         class="flex min-h-0 flex-col border-b border-[var(--line)] p-2"
         style="flex: 0 0 var(--term-basis)"
       >
-        <%= if @session.status == "online" do %>
-          <div
-            id={"terminal-#{@session.id}"}
-            phx-hook="Terminal"
-            phx-update="ignore"
-            class="oa-terminal min-h-0 flex-1 overflow-hidden rounded-md border border-[var(--line)] bg-black p-2"
-          >
-          </div>
-        <% else %>
-          <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-md border border-[var(--line)] bg-black text-center">
-            <p class="oa-display text-sm font-bold text-[var(--dim)]">Session ended</p>
-            <p class="font-mono text-[11px] text-[var(--faint)]">
-              open the <span class="text-[var(--amber)]">Artifacts</span>
-              tab to replay or download the recording
-            </p>
-          </div>
+        <%= cond do %>
+          <% Sessions.codex_native?(@session) -> %>
+            <%!-- Native codex conversation: the Codex hook owns the whole pane
+                  (transcript + composer + interrupt), driven by push_event. --%>
+            <div
+              id={"codex-#{@session.id}"}
+              phx-hook="Codex"
+              phx-update="ignore"
+              data-status={@session.status}
+              class="oa-codex flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border border-[var(--line)] bg-[var(--panel)]"
+            >
+            </div>
+          <% @session.status == "online" -> %>
+            <div
+              id={"terminal-#{@session.id}"}
+              phx-hook="Terminal"
+              phx-update="ignore"
+              class="oa-terminal min-h-0 flex-1 overflow-hidden rounded-md border border-[var(--line)] bg-black p-2"
+            >
+            </div>
+          <% true -> %>
+            <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-md border border-[var(--line)] bg-black text-center">
+              <p class="oa-display text-sm font-bold text-[var(--dim)]">Session ended</p>
+              <p class="font-mono text-[11px] text-[var(--faint)]">
+                open the <span class="text-[var(--amber)]">Artifacts</span>
+                tab to replay or download the recording
+              </p>
+            </div>
         <% end %>
       </div>
 
@@ -280,207 +292,224 @@
         </button>
       </div>
 
-    <div class="min-h-0 flex-1 overflow-y-auto p-3">
-      <%= cond do %>
-        <% is_nil(@session) -> %>
-          <p class="font-mono text-xs text-[var(--faint)]">select a session</p>
-        <% @right_tab == "changes" -> %>
-          <div class="mb-2 flex items-center justify-between">
-            <span class="oa-label">Working tree</span>
-            <button type="button" phx-click="refresh_changes" class="oa-btn text-xs">
-              refresh
-            </button>
-          </div>
-          <%= cond do %>
-            <% @changes_loading -> %>
-              <p class="font-mono text-xs text-[var(--faint)]">loading diff…</p>
-            <% @changes_error -> %>
-              <p class="font-mono text-xs text-[var(--prov-red)]">{@changes_error}</p>
-            <% @changed_files == [] -> %>
-              <p class="font-mono text-xs text-[var(--faint)]">no changes</p>
-            <% true -> %>
-              <div class="space-y-3">
-                <%= for file <- @changed_files do %>
-                  <div class="overflow-hidden rounded-md border border-[var(--line)]">
-                    <div class="flex items-center justify-between bg-[var(--panel-2)] px-3 py-1.5 font-mono text-[11px]">
-                      <span class="truncate text-[var(--dim)]">{file.path}</span>
-                      <span class="flex-none">
-                        <span class="text-[var(--prov-green)]">+{file.added}</span>
-                        <span class="text-[var(--prov-red)]">-{file.removed}</span>
-                      </span>
-                    </div>
-                    <pre class="oa-diff overflow-x-auto px-2 py-1 font-mono text-[11px] leading-relaxed"><%= for line <- file.lines do %><span class={diff_line_class(line.type)}>{line.text}
-</span><% end %></pre>
-                  </div>
-                <% end %>
-              </div>
-          <% end %>
-        <% @right_tab == "files" -> %>
-          <%= cond do %>
-            <% not is_nil(@file_result) -> %>
-              <%!-- Single-file viewer (reached by clicking a file or manual path) --%>
-              <div class="mb-2 flex items-center justify-between gap-2">
-                <span class="truncate font-mono text-[11px] text-[var(--dim)]">
-                  {@file_result["path"]}
-                </span>
-                <button type="button" phx-click="close_file" class="oa-btn flex-none text-xs">
-                  ← back
-                </button>
-              </div>
-              <%= cond do %>
-                <% @file_result["loading"] -> %>
-                  <p class="font-mono text-xs text-[var(--faint)]">
-                    loading {@file_result["path"]}…
-                  </p>
-                <% @file_result["ok"] -> %>
-                  <pre class="oa-pre overflow-x-auto text-[11px]">{@file_result["text"]}</pre>
-                <% true -> %>
-                  <p class="font-mono text-xs text-[var(--prov-red)]">{@file_result["error"]}</p>
-              <% end %>
-            <% true -> %>
-              <%!-- File explorer: a lazy-expanding directory tree --%>
-              <form phx-submit="request_file" class="mb-3 flex gap-2">
-                <input name="path" class="oa-input flex-1" placeholder="relative/path" />
-                <button class="oa-btn primary">Read</button>
-              </form>
-              <% rows = file_rows(@dir_tree, @dir_expanded) %>
-              <%= cond do %>
-                <% @dir_tree == %{} and @dir_error -> %>
-                  <p class="font-mono text-xs text-[var(--prov-red)]">{@dir_error}</p>
-                <% @dir_tree == %{} -> %>
-                  <p class="font-mono text-xs text-[var(--faint)]">loading…</p>
-                <% true -> %>
-                  <%= if @dir_error do %>
-                    <p class="mb-2 font-mono text-xs text-[var(--prov-red)]">{@dir_error}</p>
-                  <% end %>
-                  <%= if rows == [] do %>
-                    <p class="font-mono text-xs text-[var(--faint)]">empty</p>
-                  <% else %>
+      <div class="min-h-0 flex-1 overflow-y-auto p-3">
+        <%= cond do %>
+          <% is_nil(@session) -> %>
+            <p class="font-mono text-xs text-[var(--faint)]">select a session</p>
+          <% @right_tab == "changes" -> %>
+            <div class="mb-2 flex items-center justify-between">
+              <span class="oa-label">Working tree</span>
+              <button type="button" phx-click="refresh_changes" class="oa-btn text-xs">
+                refresh
+              </button>
+            </div>
+            <%= cond do %>
+              <% @changes_loading -> %>
+                <p class="font-mono text-xs text-[var(--faint)]">loading diff…</p>
+              <% @changes_error -> %>
+                <p class="font-mono text-xs text-[var(--prov-red)]">{@changes_error}</p>
+              <% @changed_files == [] -> %>
+                <p class="font-mono text-xs text-[var(--faint)]">no changes</p>
+              <% true -> %>
+                <div class="space-y-3">
+                  <%= for file <- @changed_files do %>
                     <div class="overflow-hidden rounded-md border border-[var(--line)]">
-                      <%= for row <- rows do %>
-                        <button
-                          type="button"
-                          phx-click={if row.dir, do: "toggle_dir", else: "open_file"}
-                          phx-value-path={row.path}
-                          style={"padding-left: #{row.depth * 14 + 8}px"}
-                          class="flex w-full items-center gap-1.5 py-1 pr-2 text-left font-mono text-[11px] hover:bg-[var(--panel-2)]"
-                        >
-                          <span class="w-3 flex-none text-center text-[var(--faint)]">
-                            {cond do
-                              not row.dir -> ""
-                              row.expanded -> "▾"
-                              true -> "▸"
-                            end}
-                          </span>
-                          <span class={[
-                            "truncate",
-                            row.dir && "text-[var(--amber)]",
-                            !row.dir && "text-[var(--dim)]"
-                          ]}>{row.name}</span>
-                        </button>
+                      <div class="flex items-center justify-between bg-[var(--panel-2)] px-3 py-1.5 font-mono text-[11px]">
+                        <span class="truncate text-[var(--dim)]">{file.path}</span>
+                        <span class="flex-none">
+                          <span class="text-[var(--prov-green)]">+{file.added}</span>
+                          <span class="text-[var(--prov-red)]">-{file.removed}</span>
+                        </span>
+                      </div>
+                      <pre class="oa-diff overflow-x-auto px-2 py-1 font-mono text-[11px] leading-relaxed"><%= for line <- file.lines do %><span class={diff_line_class(line.type)}>{line.text}
+</span><% end %></pre>
+                    </div>
+                  <% end %>
+                </div>
+            <% end %>
+          <% @right_tab == "files" -> %>
+            <%= cond do %>
+              <% not is_nil(@file_result) -> %>
+                <%!-- Single-file viewer (reached by clicking a file or manual path) --%>
+                <div class="mb-2 flex items-center justify-between gap-2">
+                  <span class="truncate font-mono text-[11px] text-[var(--dim)]">
+                    {@file_result["path"]}
+                  </span>
+                  <button type="button" phx-click="close_file" class="oa-btn flex-none text-xs">
+                    ← back
+                  </button>
+                </div>
+                <%= cond do %>
+                  <% @file_result["loading"] -> %>
+                    <p class="font-mono text-xs text-[var(--faint)]">
+                      loading {@file_result["path"]}…
+                    </p>
+                  <% @file_result["ok"] -> %>
+                    <pre class="oa-pre overflow-x-auto text-[11px]">{@file_result["text"]}</pre>
+                  <% true -> %>
+                    <p class="font-mono text-xs text-[var(--prov-red)]">
+                      {@file_result["error"]}
+                    </p>
+                <% end %>
+              <% true -> %>
+                <%!-- File explorer: a lazy-expanding directory tree --%>
+                <form phx-submit="request_file" class="mb-3 flex gap-2">
+                  <input name="path" class="oa-input flex-1" placeholder="relative/path" />
+                  <button class="oa-btn primary">Read</button>
+                </form>
+                <% rows = file_rows(@dir_tree, @dir_expanded) %>
+                <%= cond do %>
+                  <% @dir_tree == %{} and @dir_error -> %>
+                    <p class="font-mono text-xs text-[var(--prov-red)]">{@dir_error}</p>
+                  <% @dir_tree == %{} -> %>
+                    <p class="font-mono text-xs text-[var(--faint)]">loading…</p>
+                  <% true -> %>
+                    <%= if @dir_error do %>
+                      <p class="mb-2 font-mono text-xs text-[var(--prov-red)]">{@dir_error}</p>
+                    <% end %>
+                    <%= if rows == [] do %>
+                      <p class="font-mono text-xs text-[var(--faint)]">empty</p>
+                    <% else %>
+                      <div class="overflow-hidden rounded-md border border-[var(--line)]">
+                        <%= for row <- rows do %>
+                          <button
+                            type="button"
+                            phx-click={if row.dir, do: "toggle_dir", else: "open_file"}
+                            phx-value-path={row.path}
+                            style={"padding-left: #{row.depth * 14 + 8}px"}
+                            class="flex w-full items-center gap-1.5 py-1 pr-2 text-left font-mono text-[11px] hover:bg-[var(--panel-2)]"
+                          >
+                            <span class="w-3 flex-none text-center text-[var(--faint)]">
+                              {cond do
+                                not row.dir -> ""
+                                row.expanded -> "▾"
+                                true -> "▸"
+                              end}
+                            </span>
+                            <span class={[
+                              "truncate",
+                              row.dir && "text-[var(--amber)]",
+                              !row.dir && "text-[var(--dim)]"
+                            ]}>
+                              {row.name}
+                            </span>
+                          </button>
+                        <% end %>
+                      </div>
+                    <% end %>
+                <% end %>
+            <% end %>
+          <% @right_tab == "reviews" -> %>
+            <div class="mb-3 flex items-center justify-between">
+              <span class="oa-label">Review gate</span>
+              <button
+                type="button"
+                phx-click="toggle_auto_approve"
+                aria-pressed={@auto_approve}
+                class={"oa-btn text-xs #{if @auto_approve, do: "ok", else: ""}"}
+              >
+                <span class={"oa-dot #{if @auto_approve, do: "on", else: ""}"}></span>
+                Auto {if @auto_approve, do: "on", else: "off"}
+              </button>
+            </div>
+            <div class="space-y-2">
+              <%= for item <- @reviews do %>
+                <div class="oa-panel p-3">
+                  <div class="font-mono text-[11px] text-[var(--dim)]">
+                    {item.external_id} · {item.phase} · {item.path}
+                  </div>
+                  <%= if item.decision do %>
+                    <div class="mt-2 flex items-center gap-2 font-mono text-[11px]">
+                      <span class={"oa-status #{review_decision_class(item.decision)}"}>
+                        {review_decision_label(item.decision)}
+                      </span>
+                      <%= if item.decided_at do %>
+                        <span class="text-[var(--faint)]">
+                          {Calendar.strftime(item.decided_at, "%Y-%m-%d %H:%M")}
+                        </span>
                       <% end %>
                     </div>
-                  <% end %>
-              <% end %>
-          <% end %>
-        <% @right_tab == "reviews" -> %>
-          <div class="mb-3 flex items-center justify-between">
-            <span class="oa-label">Review gate</span>
-            <button
-              type="button"
-              phx-click="toggle_auto_approve"
-              aria-pressed={@auto_approve}
-              class={"oa-btn text-xs #{if @auto_approve, do: "ok", else: ""}"}
-            >
-              <span class={"oa-dot #{if @auto_approve, do: "on", else: ""}"}></span>
-              Auto {if @auto_approve, do: "on", else: "off"}
-            </button>
-          </div>
-          <div class="space-y-2">
-            <%= for item <- @reviews do %>
-              <div class="oa-panel p-3">
-                <div class="font-mono text-[11px] text-[var(--dim)]">
-                  {item.external_id} · {item.phase} · {item.path}
-                </div>
-                <div class="mt-2 flex flex-wrap gap-2">
-                  <button
-                    phx-click="review_decision"
-                    phx-value-id={item.external_id}
-                    phx-value-action="approve"
-                    class="oa-btn ok text-xs"
-                  >
-                    Approve
-                  </button>
-                  <button
-                    phx-click="review_decision"
-                    phx-value-id={item.external_id}
-                    phx-value-action="retry"
-                    class="oa-btn primary text-xs"
-                  >
-                    Retry
-                  </button>
-                  <button
-                    phx-click="review_decision"
-                    phx-value-id={item.external_id}
-                    phx-value-action="reject"
-                    class="oa-btn danger text-xs"
-                  >
-                    Reject
-                  </button>
-                </div>
-              </div>
-            <% end %>
-            <%= if @reviews == [] do %>
-              <p class="font-mono text-xs text-[var(--faint)]">no pending reviews</p>
-            <% end %>
-          </div>
-        <% @right_tab == "artifacts" -> %>
-          <div class="mb-2 oa-label">Captured artifacts</div>
-          <%= if @artifacts == [] do %>
-            <p class="font-mono text-xs text-[var(--faint)]">
-              no artifacts yet — recording, traces, and logs upload when the session ends
-            </p>
-          <% else %>
-            <ul class="space-y-2">
-              <%= for artifact <- @artifacts do %>
-                <li class="oa-panel flex items-center justify-between gap-3 p-3">
-                  <div class="min-w-0">
-                    <div class="truncate text-sm text-[var(--text)]">
-                      {artifact_label(artifact.kind)}
-                    </div>
-                    <div class="mt-0.5 font-mono text-[11px] text-[var(--faint)]">
-                      {format_bytes(artifact.size)} · {Calendar.strftime(
-                        artifact.inserted_at,
-                        "%Y-%m-%d %H:%M"
-                      )}
-                    </div>
-                  </div>
-                  <div class="flex flex-none items-center gap-2">
-                    <%= if artifact.kind == "recording" do %>
+                  <% else %>
+                    <div class="mt-2 flex flex-wrap gap-2">
                       <button
-                        type="button"
-                        phx-click="play_recording"
-                        phx-value-id={artifact.id}
+                        phx-click="review_decision"
+                        phx-value-id={item.external_id}
+                        phx-value-action="approve"
+                        class="oa-btn ok text-xs"
+                      >
+                        Approve
+                      </button>
+                      <button
+                        phx-click="review_decision"
+                        phx-value-id={item.external_id}
+                        phx-value-action="retry"
                         class="oa-btn primary text-xs"
                       >
-                        Play
+                        Retry
                       </button>
-                    <% end %>
-                    <a
-                      href={~p"/sessions/#{@session.id}/artifacts/#{artifact.id}/download"}
-                      class="oa-btn text-xs"
-                      download
-                    >
-                      Download
-                    </a>
-                  </div>
-                </li>
+                      <button
+                        phx-click="review_decision"
+                        phx-value-id={item.external_id}
+                        phx-value-action="reject"
+                        class="oa-btn danger text-xs"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  <% end %>
+                </div>
               <% end %>
-            </ul>
-          <% end %>
-        <% true -> %>
-      <% end %>
-    </div>
+              <%= if @reviews == [] do %>
+                <p class="font-mono text-xs text-[var(--faint)]">no pending reviews</p>
+              <% end %>
+            </div>
+          <% @right_tab == "artifacts" -> %>
+            <div class="mb-2 oa-label">Captured artifacts</div>
+            <%= if @artifacts == [] do %>
+              <p class="font-mono text-xs text-[var(--faint)]">
+                no artifacts yet — recording, traces, and logs upload when the session ends
+              </p>
+            <% else %>
+              <ul class="space-y-2">
+                <%= for artifact <- @artifacts do %>
+                  <li class="oa-panel flex items-center justify-between gap-3 p-3">
+                    <div class="min-w-0">
+                      <div class="truncate text-sm text-[var(--text)]">
+                        {artifact_label(artifact.kind)}
+                      </div>
+                      <div class="mt-0.5 font-mono text-[11px] text-[var(--faint)]">
+                        {format_bytes(artifact.size)} · {Calendar.strftime(
+                          artifact.inserted_at,
+                          "%Y-%m-%d %H:%M"
+                        )}
+                      </div>
+                    </div>
+                    <div class="flex flex-none items-center gap-2">
+                      <%= if artifact.kind == "recording" do %>
+                        <button
+                          type="button"
+                          phx-click="play_recording"
+                          phx-value-id={artifact.id}
+                          class="oa-btn primary text-xs"
+                        >
+                          Play
+                        </button>
+                      <% end %>
+                      <a
+                        href={~p"/sessions/#{@session.id}/artifacts/#{artifact.id}/download"}
+                        class="oa-btn text-xs"
+                        download
+                      >
+                        Download
+                      </a>
+                    </div>
+                  </li>
+                <% end %>
+              </ul>
+            <% end %>
+          <% true -> %>
+        <% end %>
+      </div>
     <% end %>
   </aside>
 </div>
@@ -524,6 +553,14 @@
           <label class="block">
             <span class="oa-label mb-1">Name (optional)</span>
             <input name="name" class="oa-input w-full" placeholder="my session" />
+          </label>
+          <label class="flex items-start gap-2">
+            <input type="checkbox" name="app_server" value="true" class="mt-0.5" />
+            <span class="font-mono text-[11px] text-[var(--dim)]">
+              <span class="text-[var(--text)]">app-server (native)</span>
+              — for <code class="text-[var(--amber)]">codex</code>: render the structured
+              conversation instead of the terminal
+            </span>
           </label>
           <div class="flex justify-end gap-2 pt-2">
             <button type="button" phx-click="close_new_agent" class="oa-btn">Cancel</button>

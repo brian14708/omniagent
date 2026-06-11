@@ -83,5 +83,14 @@ pub enum ServerCommand {
         cwd: Option<String>,
         #[serde(default)]
         name: Option<String>,
+        /// Drive codex via `codex app-server` (native, structured) instead of a PTY.
+        #[serde(default)]
+        app_server: bool,
     },
+    /// Codex app-server: submit a user turn.
+    CodexInput {
+        text: String,
+    },
+    /// Codex app-server: interrupt the in-progress turn.
+    CodexInterrupt,
 }

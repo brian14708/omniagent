@@ -88,6 +88,19 @@ defmodule OmniagentWeb.ConsoleLive do
     {:noreply, socket}
   end
 
+  # ── Codex app-server conversation (relayed to the connected client) ─────────
+
+  def handle_event("codex_send", %{"text" => text}, socket) do
+    case String.trim(text || "") do
+      "" -> {:noreply, socket}
+      trimmed -> {:noreply, codex_command(socket, "codex_input", %{"text" => trimmed})}
+    end
+  end
+
+  def handle_event("codex_interrupt", _params, socket) do
+    {:noreply, codex_command(socket, "codex_interrupt", %{})}
+  end
+
   # ── Right pane ──────────────────────────────────────────────────────────────
 
   def handle_event("toggle_sidebar", _params, socket) do
@@ -240,6 +253,7 @@ defmodule OmniagentWeb.ConsoleLive do
           %{"argv" => argv}
           |> put_present("cwd", params["cwd"])
           |> put_present("name", params["name"])
+          |> put_app_server(params["app_server"])
 
         case Daemons.spawn_agent(daemon_id, payload) do
           :ok ->
@@ -268,6 +282,28 @@ defmodule OmniagentWeb.ConsoleLive do
 
   def handle_info({:trace_span, span}, socket) do
     {:noreply, push_event(socket, "trace_span", span_json(span))}
+  end
+
+  # Codex app-server conversation events → the Codex hook, which owns the
+  # conversation DOM (mirrors how the Terminal/Traces hooks consume push_event).
+  def handle_info({:codex_item, payload}, socket) do
+    {:noreply, push_event(socket, "codex_item", payload)}
+  end
+
+  def handle_info({:codex_delta, payload}, socket) do
+    {:noreply, push_event(socket, "codex_delta", payload)}
+  end
+
+  def handle_info({:codex_turn, payload}, socket) do
+    {:noreply, push_event(socket, "codex_turn", payload)}
+  end
+
+  def handle_info({:codex_token_usage, payload}, socket) do
+    {:noreply, push_event(socket, "codex_token_usage", payload)}
+  end
+
+  def handle_info({:codex_error, payload}, socket) do
+    {:noreply, push_event(socket, "codex_error", payload)}
   end
 
   def handle_info({:review_item, item}, socket) do
@@ -322,7 +358,14 @@ defmodule OmniagentWeb.ConsoleLive do
          socket |> assign(:pending_focus, false) |> push_patch(to: ~p"/sessions/#{session.id}")}
 
       socket.assigns.session && socket.assigns.session.id == session.id ->
-        {:noreply, assign(socket, :session, session)}
+        socket = assign(socket, :session, session)
+
+        socket =
+          if Sessions.codex_native?(session),
+            do: push_event(socket, "codex_status", %{status: session.status}),
+            else: socket
+
+        {:noreply, socket}
 
       true ->
         {:noreply, socket}
@@ -368,9 +411,29 @@ defmodule OmniagentWeb.ConsoleLive do
     |> assign(:dir_loading, false)
     |> assign(:dir_error, nil)
     |> assign(:page_title, session.name || "Session")
-    |> push_event("pty_backlog", %{data: terminal_backlog(session.id)})
+    |> push_session_backlog(session)
     |> push_event("trace_init", %{spans: Enum.map(Traces.list_spans(session.id), &span_json/1)})
     |> request_changes()
+  end
+
+  # Primes the middle-pane renderer for a freshly selected session: the codex
+  # conversation hook gets its persisted item/turn backlog; a PTY session gets
+  # its terminal scrollback. (Ephemeral codex deltas aren't replayed — the
+  # durable completed items carry the final text.)
+  defp push_session_backlog(socket, session) do
+    if Sessions.codex_native?(session) do
+      socket
+      |> push_event("codex_init", %{events: codex_backlog(session.id)})
+      |> push_event("codex_status", %{status: session.status})
+    else
+      push_event(socket, "pty_backlog", %{data: terminal_backlog(session.id)})
+    end
+  end
+
+  defp codex_backlog(session_id) do
+    session_id
+    |> Events.list_codex_events()
+    |> Enum.map(fn %{event_type: type, payload: payload} -> %{type: type, payload: payload} end)
   end
 
   defp deselect_session(socket) do
@@ -430,6 +493,14 @@ defmodule OmniagentWeb.ConsoleLive do
     case socket.assigns.session do
       nil -> {:error, :no_session}
       session -> ClientCommands.send_command(session.id, event, payload)
+    end
+  end
+
+  # Relays a codex conversation command, flashing if the agent is offline.
+  defp codex_command(socket, event, payload) do
+    case send_command(socket, event, payload) do
+      :ok -> socket
+      _ -> put_flash(socket, :error, "agent offline — reconnect to send to codex")
     end
   end
 
@@ -543,6 +614,14 @@ defmodule OmniagentWeb.ConsoleLive do
   defp put_present(map, _key, value) when value in [nil, ""], do: map
   defp put_present(map, key, value), do: Map.put(map, key, value)
 
+  # The "app-server (native)" checkbox posts "true"/"on" when ticked; otherwise
+  # the field is absent. Only set the flag when it is on (the daemon ignores it
+  # for non-codex agents).
+  defp put_app_server(map, value) when value in ["true", "on", true],
+    do: Map.put(map, "app_server", true)
+
+  defp put_app_server(map, _value), do: map
+
   # Shell-aware argv split (honours quotes); falls back to whitespace on any
   # malformed input (e.g. an unbalanced quote) rather than raising.
   defp split_command(nil), do: []
@@ -623,6 +702,31 @@ defmodule OmniagentWeb.ConsoleLive do
   def diff_line_class(:del), do: "text-[var(--prov-red)]"
   def diff_line_class(:hunk), do: "text-[var(--amber)]"
   def diff_line_class(_), do: "text-[var(--dim)]"
+
+  # ── Reviews pane ────────────────────────────────────────────────────────────
+
+  @doc false
+  def review_action(%{"action" => action}), do: action
+  def review_action(_), do: nil
+
+  def review_decision_label(decision) do
+    case review_action(decision) do
+      "approve" -> "Approved"
+      "retry" -> "Retried"
+      "reject" -> "Rejected"
+      nil -> "Decided"
+      other -> String.capitalize(other)
+    end
+  end
+
+  def review_decision_class(decision) do
+    case review_action(decision) do
+      "approve" -> "ok"
+      "retry" -> "primary"
+      "reject" -> "danger"
+      _ -> ""
+    end
+  end
 
   # ── Artifacts pane ──────────────────────────────────────────────────────────
 

@@ -50,6 +50,12 @@ pub struct SpawnRequest {
     pub review_timeout_secs: Option<u64>,
     #[serde(default)]
     pub proxy_port: u16,
+    /// Drive codex via `codex app-server` (native, structured) instead of a PTY.
+    #[serde(default)]
+    pub app_server: bool,
+    /// Optional model override passed to `codex app-server` `thread/start`.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// A response from the daemon to the CLI.

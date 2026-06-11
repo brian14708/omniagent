@@ -121,6 +121,31 @@ defmodule Omniagent.Events do
     Enum.reverse(recent)
   end
 
+  @codex_backlog_limit 2000
+
+  @doc """
+  Persisted structured codex events for a session, ordered for replay when the
+  console selects the session. Returns the durable `codex_item`/`codex_turn`/
+  `codex_token_usage`/`codex_error` rows (the ephemeral `codex_delta` stream is
+  not persisted — completed items carry the final text). Bounded to the most
+  recent `#{@codex_backlog_limit}` events.
+  """
+  def list_codex_events(session_id) do
+    types = ["codex_item", "codex_turn", "codex_token_usage", "codex_error"]
+
+    recent =
+      SessionEvent
+      |> where(
+        [event],
+        event.agent_session_id == ^session_id and event.event_type in ^types
+      )
+      |> order_by([event], desc: event.sequence, desc: event.inserted_at)
+      |> limit(^@codex_backlog_limit)
+      |> Repo.all()
+
+    Enum.reverse(recent)
+  end
+
   def list_session_events(session_id, opts \\ []) do
     limit = Keyword.get(opts, :limit, 200)
 

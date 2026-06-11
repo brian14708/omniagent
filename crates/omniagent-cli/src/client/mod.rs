@@ -116,7 +116,15 @@ pub fn decode_command(event: &str, payload: &Value) -> Option<ServerCommand> {
                 .get("name")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            app_server: payload
+                .get("app_server")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         }),
+        "codex_input" => Some(ServerCommand::CodexInput {
+            text: payload.get("text")?.as_str()?.to_string(),
+        }),
+        "codex_interrupt" => Some(ServerCommand::CodexInterrupt),
         _ => None,
     }
 }

@@ -69,6 +69,39 @@ defmodule OmniagentWeb.ClientChannel do
     end
   end
 
+  # Structured codex app-server conversation events. Durable (sequenced, replayed
+  # on reconnect like pty_output): persisted for backlog reconstruction and
+  # broadcast live to the console. Acked lazily via the heartbeat high-water mark,
+  # same as trace_span/review_item. Only broadcast once the row is persisted, so
+  # the live view and the replayed backlog can't disagree on a persistence error.
+  def handle_in(event, payload, socket)
+      when event in ["codex_item", "codex_turn", "codex_token_usage", "codex_error"] do
+    seq = payload["sequence"] || 0
+
+    with {:ok, session_id} <- session_id(socket),
+         {:ok, _event} <- Events.record_session_event(session_id, "client", event, seq, payload) do
+      Events.broadcast(session_id, {codex_tag(event), payload})
+      {:noreply, socket}
+    else
+      {:error, :missing_session} ->
+        {:reply, {:error, %{reason: "session not registered"}}, socket}
+
+      error ->
+        {:reply, {:error, %{reason: inspect(error)}}, socket}
+    end
+  end
+
+  # The high-volume codex streaming deltas are ephemeral: broadcast live only, not
+  # persisted (the durable codex_item completed event carries the final text).
+  def handle_in("codex_delta", payload, socket) do
+    with {:ok, session_id} <- session_id(socket) do
+      Events.broadcast(session_id, {:codex_delta, payload})
+      {:noreply, socket}
+    else
+      _ -> {:reply, {:error, %{reason: "session not registered"}}, socket}
+    end
+  end
+
   def handle_in(event, payload, socket)
       when event in ["file_response", "diff_response", "dir_response"] do
     with {:ok, session_id} <- session_id(socket) do
@@ -123,6 +156,13 @@ defmodule OmniagentWeb.ClientChannel do
       session_id -> {:ok, session_id}
     end
   end
+
+  # Maps a codex channel event name to its PubSub broadcast tag (literal atoms so
+  # they always exist for the LiveView's handle_info clauses).
+  defp codex_tag("codex_item"), do: :codex_item
+  defp codex_tag("codex_turn"), do: :codex_turn
+  defp codex_tag("codex_token_usage"), do: :codex_token_usage
+  defp codex_tag("codex_error"), do: :codex_error
 
   # Records a terminal lifecycle event, marks the session offline, and
   # broadcasts it. Shared by the `pty_exit` and `session_close` handlers.
