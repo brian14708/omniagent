@@ -111,19 +111,3 @@ jobs:
 
       - name: Run tests
         run: cargo +stable test --workspace --all-targets
-
-  nix:
-    name: Nix flake
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Install Nix
-        uses: cachix/install-nix-action@v31
-        with:
-          extra_nix_config: |
-            accept-flake-config = true
-
-      - name: Check flake
-        run: nix flake check

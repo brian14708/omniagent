@@ -1,0 +1,108 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/brian14708/omniagent/control-plane
+  pullPolicy: IfNotPresent
+  tag: nightly
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 4000
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: omniagent.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+phoenix:
+  host: ""
+  scheme: https
+  port: 443
+
+database:
+  poolSize: 10
+  ipv6: false
+
+rustfs:
+  endpointUrl: ""
+  region: us-east-1
+  bucket: omniagent-artifacts
+
+# Erlang/BEAM clustering is always on: the control-plane registries are
+# cluster-wide (:pg) and node discovery uses libcluster_postgres (no headless
+# Service needed). A single replica simply discovers only itself.
+cluster:
+  nodeName: omniagent
+  epmdPort: 4369
+  distPort: 9100
+
+secrets:
+  create: true
+  existingSecret: ""
+  databaseUrl: ""
+  secretKeyBase: ""
+  releaseCookie: ""
+  rustfsAccessKeyId: ""
+  rustfsSecretAccessKey: ""
+
+extraEnv: []
+
+resources: {}
+
+probes:
+  liveness:
+    enabled: true
+    path: /
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 6
+  readiness:
+    enabled: true
+    path: /
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 6
+
+migrations:
+  enabled: true
+  annotations: {}
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  podAnnotations: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+volumes: []
+volumeMounts: []

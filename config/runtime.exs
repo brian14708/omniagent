@@ -7,8 +7,9 @@ import Config
 # any compile-time configuration in here, as it won't be applied.
 # The block below contains prod specific runtime configuration.
 
-config :omniagent_web, OmniagentWeb.Endpoint,
-  http: [port: String.to_integer(System.get_env("PORT", "4000"))]
+http_port = String.to_integer(System.get_env("PORT", "4000"))
+
+config :omniagent_web, OmniagentWeb.Endpoint, http: [port: http_port]
 
 # Cluster the control-plane nodes using Postgres LISTEN/NOTIFY for discovery
 # (libcluster_postgres). Erlang distribution is still the transport; Postgres is
@@ -95,6 +96,14 @@ if bucket = System.get_env("RUSTFS_BUCKET") do
 end
 
 if config_env() == :prod do
+  phoenix_host = System.get_env("PHX_HOST") || "example.com"
+  phoenix_scheme = System.get_env("PHX_SCHEME") || "https"
+
+  phoenix_port =
+    String.to_integer(
+      System.get_env("PHX_PORT") || if(phoenix_scheme == "https", do: "443", else: "80")
+    )
+
   database_url =
     System.get_env("DATABASE_URL") ||
       raise """
@@ -125,10 +134,12 @@ if config_env() == :prod do
       """
 
   config :omniagent_web, OmniagentWeb.Endpoint,
+    url: [host: phoenix_host, port: phoenix_port, scheme: phoenix_scheme],
     http: [
       # Enable IPv6 and bind on all interfaces.
       # Set it to  {0, 0, 0, 0, 0, 0, 0, 1} for local network only access.
-      ip: {0, 0, 0, 0, 0, 0, 0, 0}
+      ip: {0, 0, 0, 0, 0, 0, 0, 0},
+      port: http_port
     ],
     secret_key_base: secret_key_base
 

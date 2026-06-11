@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "omniagent.configMapName" . }}
+  labels:
+    {{- include "omniagent.labels" . | nindent 4 }}
+data:
+  CLI_BUNDLE_DIR: /cli
+  PHX_SERVER: "true"
+  PORT: {{ .Values.service.port | quote }}
+  POOL_SIZE: {{ .Values.database.poolSize | quote }}
+  CLUSTER_ENABLED: "true"
+  ECTO_IPV6: {{ ternary "true" "false" .Values.database.ipv6 | quote }}
+  RUSTFS_REGION: {{ .Values.rustfs.region | quote }}
+  {{- if .Values.phoenix.host }}
+  PHX_HOST: {{ .Values.phoenix.host | quote }}
+  {{- else if and .Values.ingress.enabled .Values.ingress.hosts }}
+  PHX_HOST: {{ (index .Values.ingress.hosts 0).host | quote }}
+  {{- end }}
+  PHX_SCHEME: {{ .Values.phoenix.scheme | quote }}
+  PHX_PORT: {{ .Values.phoenix.port | quote }}
+  {{- if .Values.rustfs.endpointUrl }}
+  RUSTFS_ENDPOINT_URL: {{ .Values.rustfs.endpointUrl | quote }}
+  {{- end }}
+  {{- if .Values.rustfs.bucket }}
+  RUSTFS_BUCKET: {{ .Values.rustfs.bucket | quote }}
+  {{- end }}
+  RELEASE_DISTRIBUTION: name
+  ERL_AFLAGS: {{ printf "-kernel inet_dist_listen_min %d inet_dist_listen_max %d" (.Values.cluster.distPort | int) (.Values.cluster.distPort | int) | quote }}

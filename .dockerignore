@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.git
+.github
+.jj
+_build
+cover
+data
+deps
+doc
+erl_crash.dump
+result
+target
+tmp

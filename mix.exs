@@ -8,6 +8,7 @@ defmodule Omniagent.Umbrella.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
+      releases: releases(),
       listeners: [Phoenix.CodeReloader]
     ]
   end
@@ -51,6 +52,18 @@ defmodule Omniagent.Umbrella.MixProject do
       # run `mix setup` in all child apps
       setup: ["cmd mix setup"],
       precommit: ["compile --warnings-as-errors", "deps.unlock --unused", "format", "test"]
+    ]
+  end
+
+  defp releases do
+    [
+      omniagent: [
+        include_executables_for: [:unix],
+        applications: [
+          omniagent: :permanent,
+          omniagent_web: :permanent
+        ]
+      ]
     ]
   end
 end

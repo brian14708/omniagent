@@ -1,0 +1,7 @@
+apiVersion: v2
+name: omniagent
+description: OmniAgent control plane
+type: application
+version: 0.1.0
+appVersion: nightly
+kubeVersion: ">=1.25.0-0"

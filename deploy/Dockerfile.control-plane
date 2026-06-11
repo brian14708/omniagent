@@ -1,0 +1,59 @@
+# syntax=docker/dockerfile:1.7
+
+ARG ELIXIR_IMAGE=elixir:1.20.0-otp-29-slim
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+
+FROM --platform=$TARGETPLATFORM ${ELIXIR_IMAGE} AS builder
+
+RUN apt-get update -y \
+  && apt-get install -y --no-install-recommends build-essential ca-certificates git npm \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+ENV MIX_ENV=prod
+
+RUN mix local.hex --force \
+  && mix local.rebar --force
+
+COPY mix.exs mix.lock ./
+COPY config config
+COPY apps/omniagent/mix.exs apps/omniagent/mix.exs
+COPY apps/omniagent_web/mix.exs apps/omniagent_web/mix.exs
+
+RUN mix deps.get --only prod
+RUN mix deps.compile
+
+COPY apps/omniagent_web/assets/package.json apps/omniagent_web/assets/package-lock.json apps/omniagent_web/assets/
+RUN npm ci --prefix apps/omniagent_web/assets
+
+COPY apps apps
+
+RUN cd apps/omniagent_web && mix assets.deploy
+RUN mix compile
+RUN mix release omniagent
+
+FROM --platform=$TARGETPLATFORM ${DEBIAN_IMAGE} AS runtime
+
+RUN apt-get update -y \
+  && apt-get install -y --no-install-recommends ca-certificates curl libncurses6 libstdc++6 openssl \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --system omniagent \
+  && useradd --system --gid omniagent --home-dir /app --shell /usr/sbin/nologin omniagent
+
+WORKDIR /app
+
+ENV CLI_BUNDLE_DIR=/cli \
+  HOME=/app \
+  LANG=C.UTF-8 \
+  PHX_SERVER=true
+
+COPY --from=builder --chown=omniagent:omniagent /app/_build/prod/rel/omniagent ./
+
+USER omniagent
+
+EXPOSE 4000
+
+ENTRYPOINT ["/app/bin/omniagent"]
+CMD ["start"]

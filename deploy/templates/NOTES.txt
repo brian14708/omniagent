@@ -1,0 +1,13 @@
+OmniAgent control plane has been installed.
+
+Required production settings:
+  - DATABASE_URL via secrets.databaseUrl or an existing Secret
+  - SECRET_KEY_BASE via secrets.secretKeyBase or the generated chart Secret
+  - RELEASE_COOKIE via secrets.releaseCookie or the generated chart Secret
+
+Example:
+  helm upgrade --install {{ .Release.Name }} {{ .Chart.Name }} \
+    --set secrets.databaseUrl='ecto://USER:PASS@HOST/DB' \
+    --set phoenix.host='omniagent.example.com'
+
+The chart runs `bin/omniagent eval "Omniagent.Release.migrate()"` as a Helm pre-install/pre-upgrade hook when migrations.enabled=true.
