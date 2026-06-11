@@ -4,7 +4,7 @@
 // incremental `trace_span` events. Adapted from the 282d628 SSE controller.
 
 import { spanSearchHaystack } from "./parse.js";
-import { buildNode } from "./render.js";
+import { buildNode, buildBody } from "./render.js";
 
 export const Traces = {
   mounted() {
@@ -14,9 +14,9 @@ export const Traces = {
     this.search = "";
     this.emptyEl = this.el.querySelector("[data-trace-empty]");
 
-    this.handleEvent("trace_init", ({ spans }) => {
-      for (const span of spans ?? []) this.ingest(span);
-    });
+    this.handleEvent("trace_init", ({ spans }) =>
+      this.ingestBatch(spans ?? []),
+    );
     this.handleEvent("trace_span", (span) => this.ingest(span));
 
     // Search box lives outside the hook element (in the section header).
@@ -74,14 +74,32 @@ export const Traces = {
   },
 
   openModal(span) {
-    // The detail body is built lazily (see render.js) the first time a span is
-    // opened, then kept on the span (hidden in the list) for re-opens.
-    let body = span.querySelector(":scope > .body");
-    if (!body) {
-      body = span._buildBody?.();
-      if (!body) return;
+    // The detail body is built the first time a span is opened, then kept on
+    // the span (hidden in the list) for re-opens.
+    const existing = span.querySelector(":scope > .body");
+    if (existing) return this.presentModal(span, existing);
+
+    const data = span._span;
+    if (!data) return;
+
+    const build = () => {
+      const body = buildBody(data);
       span.appendChild(body);
-    }
+      this.presentModal(span, body);
+    };
+
+    // Heavy detail (stream events + headers) is omitted from the trace list and
+    // fetched on first open; request/response ship with the summary. Once loaded
+    // it's merged onto the span object and cached via `_detail` for re-opens.
+    if (data._detail) return build();
+    this.pushEvent("load_span", { id: data.id }, (reply) => {
+      if (reply && !reply.error) Object.assign(data, reply);
+      data._detail = true;
+      build();
+    });
+  },
+
+  presentModal(span, body) {
     this.restoreBody();
     this.activeSpan = span;
     this.activeBody = body;
@@ -136,6 +154,37 @@ export const Traces = {
     // Insert above the first existing span node (newest on top).
     const firstSpan = this.el.querySelector(".span");
     this.el.insertBefore(node, firstSpan);
+    this.updateEmpty();
+  },
+
+  // Batched ingest for the `trace_init` backlog (spans arrive oldest-first).
+  // Builds every node into one DocumentFragment and does a single DOM insert,
+  // prepends the array once, and runs `updateEmpty` once — so a long trace is
+  // O(n) instead of the O(n²) the per-span path would cost on init.
+  ingestBatch(spans) {
+    const fresh = [];
+    for (const span of spans) {
+      const key = this.spanKey(span);
+      if (this.seen.has(key)) continue;
+      this.seen.add(key);
+      const node = buildNode(span);
+      this.nodeById.set(key, node);
+      node.classList.toggle("hidden", !this.passes(span));
+      fresh.push({ span, node });
+    }
+    if (!fresh.length) return;
+
+    // Newest on top: append nodes to the fragment in reverse before inserting.
+    const fragment = document.createDocumentFragment();
+    for (let i = fresh.length - 1; i >= 0; i--)
+      fragment.appendChild(fresh[i].node);
+    this.el.insertBefore(fragment, this.el.querySelector(".span"));
+
+    // `this.spans` stays newest-first; the batch reversed is newest-first too.
+    this.spans = fresh
+      .map((f) => f.span)
+      .reverse()
+      .concat(this.spans);
     this.updateEmpty();
   },
 

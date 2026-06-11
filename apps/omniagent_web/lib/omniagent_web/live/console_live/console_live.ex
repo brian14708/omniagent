@@ -2,7 +2,7 @@ defmodule OmniagentWeb.ConsoleLive do
   @moduledoc """
   The agent-native console: a three-pane layout — sessions sidebar (left), the
   agent terminal with its LLM trace stream (middle), and a tabbed
-  Changes / Files / Reviews inspector (right). Handles both `/` (no selection)
+  Files / Reviews / Artifacts inspector (right). Handles both `/` (no selection)
   and `/sessions/:id` (a session selected) as one LiveView.
   """
   use OmniagentWeb, :live_view
@@ -39,10 +39,7 @@ defmodule OmniagentWeb.ConsoleLive do
      |> assign(:artifacts, [])
      |> assign(:playing_artifact, nil)
      |> assign(:auto_approve, true)
-     |> assign(:right_tab, "changes")
-     |> assign(:changed_files, [])
-     |> assign(:changes_loading, false)
-     |> assign(:changes_error, nil)
+     |> assign(:right_tab, "files")
      |> assign(:file_result, nil)
      |> assign(:dir_tree, %{})
      |> assign(:dir_expanded, MapSet.new())
@@ -147,10 +144,6 @@ defmodule OmniagentWeb.ConsoleLive do
     {:noreply, socket}
   end
 
-  def handle_event("refresh_changes", _params, socket) do
-    {:noreply, request_changes(socket)}
-  end
-
   def handle_event("play_recording", %{"id" => id}, socket) do
     artifact = Enum.find(socket.assigns.artifacts, &(&1.id == id))
     {:noreply, assign(socket, :playing_artifact, artifact)}
@@ -158,6 +151,19 @@ defmodule OmniagentWeb.ConsoleLive do
 
   def handle_event("close_recording", _params, socket) do
     {:noreply, assign(socket, :playing_artifact, nil)}
+  end
+
+  # Lazily fetch a span's heavy detail (stream events + headers) the first time
+  # it's opened — these are omitted from the trace list to keep session switches
+  # cheap. Replies to the Traces hook's `pushEvent` callback.
+  def handle_event("load_span", %{"id" => id}, socket) do
+    detail =
+      case socket.assigns.session && Traces.get_span(socket.assigns.session.id, id) do
+        nil -> %{error: "not_found"}
+        span -> Traces.span_detail(span)
+      end
+
+    {:reply, detail, socket}
   end
 
   # Expand/collapse a directory in the file-explorer tree. Children are fetched
@@ -284,7 +290,7 @@ defmodule OmniagentWeb.ConsoleLive do
   end
 
   def handle_info({:trace_span, span}, socket) do
-    {:noreply, push_event(socket, "trace_span", span_json(span))}
+    {:noreply, push_event(socket, "trace_span", Traces.span_summary(span))}
   end
 
   # Codex app-server conversation events → the Codex hook, which owns the
@@ -345,18 +351,18 @@ defmodule OmniagentWeb.ConsoleLive do
     {:noreply, socket}
   end
 
-  def handle_info({:diff_response, payload}, socket) do
-    files = payload |> Map.get("diff") |> parse_diff()
-    {:noreply, assign(socket, changed_files: files, changes_loading: false, changes_error: nil)}
-  end
-
   def handle_info({:session_updated, session}, socket) do
-    known_ids = MapSet.new(socket.assigns.sessions, & &1.id)
-    socket = assign(socket, :sessions, list_sessions(socket.assigns.current_user))
+    existing = socket.assigns.sessions
+    new? = not Enum.any?(existing, &(&1.id == session.id))
+    # Any update bumps `updated_at` to now, so the touched session sorts to the
+    # front of the `updated_at desc` list — splice it in place of its old copy
+    # rather than re-querying every session for the user on each broadcast.
+    socket =
+      assign(socket, :sessions, [session | Enum.reject(existing, &(&1.id == session.id))])
 
     cond do
       # A new session appeared after the user spawned an agent — jump to it.
-      socket.assigns.pending_focus and not MapSet.member?(known_ids, session.id) ->
+      socket.assigns.pending_focus and new? ->
         {:noreply,
          socket |> assign(:pending_focus, false) |> push_patch(to: ~p"/sessions/#{session.id}")}
 
@@ -375,8 +381,8 @@ defmodule OmniagentWeb.ConsoleLive do
     end
   end
 
-  def handle_info({:session_deleted, _id}, socket) do
-    {:noreply, assign(socket, :sessions, list_sessions(socket.assigns.current_user))}
+  def handle_info({:session_deleted, id}, socket) do
+    {:noreply, assign(socket, :sessions, Enum.reject(socket.assigns.sessions, &(&1.id == id)))}
   end
 
   def handle_info({:daemons_updated}, socket) do
@@ -405,9 +411,7 @@ defmodule OmniagentWeb.ConsoleLive do
     |> assign(:reviews, reviews)
     |> assign(:artifacts, Artifacts.list_artifacts(session.id))
     |> assign(:playing_artifact, nil)
-    |> assign(:right_tab, "changes")
-    |> assign(:changed_files, [])
-    |> assign(:changes_error, nil)
+    |> assign(:right_tab, "files")
     |> assign(:file_result, nil)
     |> assign(:dir_tree, %{})
     |> assign(:dir_expanded, MapSet.new())
@@ -415,8 +419,8 @@ defmodule OmniagentWeb.ConsoleLive do
     |> assign(:dir_error, nil)
     |> assign(:page_title, session.name || "Session")
     |> push_session_backlog(session)
-    |> push_event("trace_init", %{spans: Enum.map(Traces.list_spans(session.id), &span_json/1)})
-    |> request_changes()
+    |> push_event("trace_init", %{spans: Traces.list_spans(session.id)})
+    |> list_dir("")
   end
 
   # Primes the middle-pane renderer for a freshly selected session: the codex
@@ -447,8 +451,6 @@ defmodule OmniagentWeb.ConsoleLive do
     |> assign(:reviews, [])
     |> assign(:artifacts, [])
     |> assign(:playing_artifact, nil)
-    |> assign(:changed_files, [])
-    |> assign(:changes_error, nil)
     |> assign(:file_result, nil)
     |> assign(:dir_tree, %{})
     |> assign(:dir_expanded, MapSet.new())
@@ -460,15 +462,6 @@ defmodule OmniagentWeb.ConsoleLive do
   defp unsubscribe_current(socket) do
     if socket.assigns[:subscribed_id], do: Events.unsubscribe(socket.assigns.subscribed_id)
     assign(socket, :subscribed_id, nil)
-  end
-
-  defp request_changes(%{assigns: %{session: nil}} = socket), do: socket
-
-  defp request_changes(socket) do
-    case send_command(socket, "diff_request", %{"path" => ""}) do
-      :ok -> assign(socket, changes_loading: true, changes_error: nil)
-      _ -> assign(socket, changes_loading: false, changes_error: offline_msg())
-    end
   end
 
   # Browse into a directory (empty path = workspace root).
@@ -510,10 +503,6 @@ defmodule OmniagentWeb.ConsoleLive do
   defp offline_msg, do: "agent offline — reconnect to browse files"
 
   # Lazily fetch the data a right-pane tab needs the first time it's shown.
-  defp ensure_tab_loaded(socket, "changes") do
-    if socket.assigns.changed_files == [], do: request_changes(socket), else: socket
-  end
-
   defp ensure_tab_loaded(socket, "files") do
     if socket.assigns.dir_tree == %{} and is_nil(socket.assigns.file_result),
       do: list_dir(socket, ""),
@@ -545,7 +534,7 @@ defmodule OmniagentWeb.ConsoleLive do
 
   defp clamp(value, min, max), do: value |> max(min) |> min(max)
 
-  defp restore_tab(socket, tab) when tab in ["changes", "files", "reviews", "artifacts"] do
+  defp restore_tab(socket, tab) when tab in ["files", "reviews", "artifacts"] do
     socket |> assign(:right_tab, tab) |> ensure_tab_loaded(tab)
   end
 
@@ -640,77 +629,6 @@ defmodule OmniagentWeb.ConsoleLive do
   rescue
     _ -> String.split(command, ~r/\s+/, trim: true)
   end
-
-  defp span_json(span) do
-    Map.take(span, [
-      :id,
-      :external_id,
-      :sequence,
-      :provider,
-      :model,
-      :method,
-      :path,
-      :status,
-      :latency_ms,
-      :streaming,
-      :request,
-      :request_headers,
-      :response,
-      :response_headers,
-      :usage,
-      :stream_events,
-      :labels,
-      :error
-    ])
-  end
-
-  # ── Unified-diff parser (for the Changes pane) ──────────────────────────────
-
-  @doc false
-  def parse_diff(diff) when is_binary(diff) and diff != "" do
-    {files, current} =
-      diff
-      |> String.split("\n")
-      |> Enum.reduce({[], nil}, &parse_diff_line/2)
-
-    files |> push_file(current) |> Enum.reverse()
-  end
-
-  def parse_diff(_), do: []
-
-  defp parse_diff_line("diff --git " <> rest, {files, current}) do
-    path = rest |> String.split(" ") |> List.last() |> String.replace_prefix("b/", "")
-    {push_file(files, current), %{path: path, added: 0, removed: 0, lines: []}}
-  end
-
-  defp parse_diff_line("--- " <> _, acc), do: acc
-  defp parse_diff_line("+++ " <> _, acc), do: acc
-  defp parse_diff_line("index " <> _, acc), do: acc
-
-  defp parse_diff_line("@@" <> _ = line, {files, current}) when not is_nil(current),
-    do: {files, add_line(current, :hunk, line)}
-
-  defp parse_diff_line("+" <> _ = line, {files, current}) when not is_nil(current),
-    do: {files, current |> add_line(:add, line) |> Map.update!(:added, &(&1 + 1))}
-
-  defp parse_diff_line("-" <> _ = line, {files, current}) when not is_nil(current),
-    do: {files, current |> add_line(:del, line) |> Map.update!(:removed, &(&1 + 1))}
-
-  defp parse_diff_line(" " <> _ = line, {files, current}) when not is_nil(current),
-    do: {files, add_line(current, :ctx, line)}
-
-  defp parse_diff_line(_other, acc), do: acc
-
-  defp add_line(file, type, text), do: %{file | lines: [%{type: type, text: text} | file.lines]}
-
-  defp push_file(files, nil), do: files
-  defp push_file(files, file), do: [%{file | lines: Enum.reverse(file.lines)} | files]
-
-  @doc false
-  def diff_line_class(:add), do: "text-[var(--prov-green)]"
-  def diff_line_class(:del), do: "text-[var(--prov-red)]"
-  def diff_line_class(:hunk), do: "text-[var(--amber)]"
-  def diff_line_class(_), do: "text-[var(--dim)]"
 
   # ── Reviews pane ────────────────────────────────────────────────────────────
 

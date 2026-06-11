@@ -308,7 +308,13 @@ async fn proxy_handler(
     // and codex regardless of each agent's own CLI flags. It can rewrite the
     // body and, for Gemini, the URL path, so the upstream URL is resolved after.
     if let Some(model) = clean_model(state.model_override.as_deref()) {
-        apply_model_override(provider, &mut request, &mut body, &mut path_and_query, model);
+        apply_model_override(
+            provider,
+            &mut request,
+            &mut body,
+            &mut path_and_query,
+            model,
+        );
     }
 
     let url = upstream_url(provider, &upstream_base_url, &path_and_query);
@@ -318,7 +324,11 @@ async fn proxy_handler(
     draft.request_base_url = request_base_url(&headers);
     draft.upstream_base_url = upstream_base_url.clone();
     draft.request_headers = capture_headers(&headers);
-    draft.model = request_model(provider, &request, &path_from_path_and_query(&path_and_query));
+    draft.model = request_model(
+        provider,
+        &request,
+        &path_from_path_and_query(&path_and_query),
+    );
     draft.request = request;
 
     if state.reviews.enabled() {

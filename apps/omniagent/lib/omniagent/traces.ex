@@ -8,12 +8,56 @@ defmodule Omniagent.Traces do
   alias Omniagent.Repo
   alias Omniagent.Traces.TraceSpan
 
+  # The fields shipped with the trace list / each incremental span. Excludes the
+  # heavy, never-listed payloads (`stream_events` and the header maps), which are
+  # fetched per-span on demand via `get_span/2` + `span_detail/1` when a span is
+  # opened. `request`/`response` stay in the summary because the client's trace
+  # search matches against them.
+  @summary_fields [
+    :id,
+    :external_id,
+    :sequence,
+    :provider,
+    :model,
+    :method,
+    :path,
+    :status,
+    :latency_ms,
+    :streaming,
+    :request,
+    :response,
+    :usage,
+    :labels,
+    :error
+  ]
+
+  @detail_fields [:stream_events, :request_headers, :response_headers]
+
+  @doc """
+  Summary maps for every span in a session, ordered for replay. Selects only the
+  summary columns so a long trace doesn't pull its full request/response/stream
+  history into the LiveView process or down the socket.
+  """
   def list_spans(session_id) do
     TraceSpan
     |> where([span], span.agent_session_id == ^session_id)
     |> order_by([span], asc: span.sequence)
+    |> select([span], map(span, @summary_fields))
     |> Repo.all()
   end
+
+  @doc "A single span (full row), scoped to its session, for lazy detail loads."
+  def get_span(session_id, span_id) do
+    TraceSpan
+    |> where([span], span.agent_session_id == ^session_id and span.id == ^span_id)
+    |> Repo.one()
+  end
+
+  @doc "Light span payload for the trace list (drops the heavy detail fields)."
+  def span_summary(span), do: Map.take(span, @summary_fields)
+
+  @doc "Heavy span fields fetched lazily when a span is opened."
+  def span_detail(span), do: Map.take(span, @detail_fields)
 
   def record_span(session_id, payload) when is_map(payload) do
     attrs = normalize_span(session_id, payload)

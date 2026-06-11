@@ -173,12 +173,13 @@ export function buildNode(span) {
   div.dataset.title = `#${span.sequence} · ${span.model ?? span.path ?? ""}${span.provider ? " · " + span.provider : ""}`;
 
   // The detail body — rendered prompt/assistant cards plus the (highlighted)
-  // raw request/response — is hidden in the list and only shown when the span
-  // is opened in the popup. Building it (especially `hl()` over full
-  // request/response bodies) is expensive, so defer it to first open. This is
-  // what keeps `trace_init`/session switches cheap for sessions with many or
-  // large spans, where eagerly building every body froze the UI.
-  div._buildBody = () => buildBody(span);
+  // raw request/response — is hidden in the list and only built when the span
+  // is opened in the popup. Its heaviest inputs (stream events + headers) aren't
+  // shipped with the trace list either; the Traces hook fetches them lazily and
+  // calls `buildBody` once they arrive, so `trace_init`/session switches stay
+  // cheap for sessions with many or large spans. Keep the span data on the node
+  // for the hook to find.
+  div._span = span;
 
   // Clicking the span opens its detail in a popup (handled by the Traces hook,
   // which listens for this bubbling event).
@@ -191,8 +192,9 @@ export function buildNode(span) {
 
 // Builds the (heavy) detail body for one span: prompt/assistant cards and the
 // collapsible, syntax-highlighted raw request/response/stream segments. Called
-// lazily by the Traces hook the first time a span is opened.
-function buildBody(span) {
+// by the Traces hook the first time a span is opened (after its lazy detail
+// fields have been merged in).
+export function buildBody(span) {
   const reqMessages = requestMessages(span);
   const resBlocks = responseContent(span);
   const requestSummary = renderRequest(span, reqMessages);

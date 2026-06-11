@@ -161,10 +161,7 @@ mod tests {
     fn launch_argv_falls_back_to_bare_name_when_unconfigured() {
         let commands = agent_commands();
         // codex has no config entry → run the bare selector name.
-        assert_eq!(
-            launch_argv("codex", &[], &commands),
-            argv(&["codex"])
-        );
+        assert_eq!(launch_argv("codex", &[], &commands), argv(&["codex"]));
         // extra args are appended to the fallback too.
         assert_eq!(
             launch_argv("codex", &argv(&["--search"]), &commands),

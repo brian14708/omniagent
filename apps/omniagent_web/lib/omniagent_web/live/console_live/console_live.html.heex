@@ -251,7 +251,7 @@
     </div>
   <% end %>
 
-  <%!-- ── Right: Changes / Files / Reviews ─────────────────────────────── --%>
+  <%!-- ── Right: Files / Reviews / Artifacts ───────────────────────────── --%>
   <aside class={[
     "flex flex-none flex-col border-l border-[var(--line)] bg-[var(--panel)]",
     @right_collapsed && "w-10",
@@ -268,7 +268,7 @@
       </button>
     <% else %>
       <div class="flex flex-none items-center gap-1 border-b border-[var(--line)] px-2 py-2">
-        <%= for {key, label} <- [{"changes", "Changes"}, {"files", "Files"}, {"reviews", "Reviews"}, {"artifacts", "Artifacts"}] do %>
+        <%= for {key, label} <- [{"files", "Files"}, {"reviews", "Reviews"}, {"artifacts", "Artifacts"}] do %>
           <button
             type="button"
             phx-click="select_tab"
@@ -296,37 +296,6 @@
         <%= cond do %>
           <% is_nil(@session) -> %>
             <p class="font-mono text-xs text-[var(--faint)]">select a session</p>
-          <% @right_tab == "changes" -> %>
-            <div class="mb-2 flex items-center justify-between">
-              <span class="oa-label">Working tree</span>
-              <button type="button" phx-click="refresh_changes" class="oa-btn text-xs">
-                refresh
-              </button>
-            </div>
-            <%= cond do %>
-              <% @changes_loading -> %>
-                <p class="font-mono text-xs text-[var(--faint)]">loading diff…</p>
-              <% @changes_error -> %>
-                <p class="font-mono text-xs text-[var(--prov-red)]">{@changes_error}</p>
-              <% @changed_files == [] -> %>
-                <p class="font-mono text-xs text-[var(--faint)]">no changes</p>
-              <% true -> %>
-                <div class="space-y-3">
-                  <%= for file <- @changed_files do %>
-                    <div class="overflow-hidden rounded-md border border-[var(--line)]">
-                      <div class="flex items-center justify-between bg-[var(--panel-2)] px-3 py-1.5 font-mono text-[11px]">
-                        <span class="truncate text-[var(--dim)]">{file.path}</span>
-                        <span class="flex-none">
-                          <span class="text-[var(--prov-green)]">+{file.added}</span>
-                          <span class="text-[var(--prov-red)]">-{file.removed}</span>
-                        </span>
-                      </div>
-                      <pre class="oa-diff overflow-x-auto px-2 py-1 font-mono text-[11px] leading-relaxed"><%= for line <- file.lines do %><span class={diff_line_class(line.type)}>{line.text}
-</span><% end %></pre>
-                    </div>
-                  <% end %>
-                </div>
-            <% end %>
           <% @right_tab == "files" -> %>
             <%= cond do %>
               <% not is_nil(@file_result) -> %>
