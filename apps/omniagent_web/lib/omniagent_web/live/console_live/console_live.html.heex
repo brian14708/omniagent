@@ -27,7 +27,7 @@
             class={[
               "relative flex h-9 w-9 flex-none items-center justify-center rounded-full border text-xs font-bold uppercase transition-colors",
               @session && @session.id == session.id &&
-                "border-[var(--amber)] bg-[var(--amber-soft)] text-[var(--amber)]",
+                "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]",
               !(@session && @session.id == session.id) &&
                 "border-[var(--line)] text-[var(--dim)] hover:bg-[var(--panel-2)]"
             ]}
@@ -44,7 +44,7 @@
           type="button"
           phx-click="open_new_agent"
           title="New agent"
-          class="flex h-9 w-9 flex-none items-center justify-center rounded-full border border-[var(--line)] text-[var(--faint)] hover:border-[var(--amber)] hover:text-[var(--amber)]"
+          class="flex h-9 w-9 flex-none items-center justify-center rounded-full border border-[var(--line)] text-[var(--faint)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
         >
           +
         </button>
@@ -98,7 +98,7 @@
               patch={~p"/sessions/#{session.id}"}
               class={[
                 "block rounded-md px-3 py-2 transition-colors",
-                @session && @session.id == session.id && "bg-[var(--amber-soft)]",
+                @session && @session.id == session.id && "bg-[var(--accent-soft)]",
                 !(@session && @session.id == session.id) && "hover:bg-[var(--panel-2)]"
               ]}
             >
@@ -185,7 +185,7 @@
             <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-md border border-[var(--line)] bg-black text-center">
               <p class="oa-display text-sm font-bold text-[var(--dim)]">Session ended</p>
               <p class="font-mono text-[11px] text-[var(--faint)]">
-                open the <span class="text-[var(--amber)]">Artifacts</span>
+                open the <span class="text-[var(--accent)]">Artifacts</span>
                 tab to replay or download the recording
               </p>
             </div>
@@ -221,7 +221,7 @@
       </div>
     <% else %>
       <div class="flex flex-1 flex-col items-center justify-center gap-4 text-center">
-        <span class="oa-logo" style="width:48px;height:48px;font-size:22px">Ø</span>
+        <img src={~p"/favicon.svg"} alt="" class="oa-logo" style="width:48px;height:48px" />
         <div>
           <p class="oa-display text-lg font-bold">No session selected</p>
           <p class="mt-1 font-mono text-xs text-[var(--faint)]">
@@ -275,7 +275,7 @@
             phx-value-tab={key}
             class={[
               "rounded-md px-3 py-1 font-mono text-xs transition-colors",
-              @right_tab == key && "bg-[var(--amber-soft)] text-[var(--amber)]",
+              @right_tab == key && "bg-[var(--accent-soft)] text-[var(--accent)]",
               @right_tab != key && "text-[var(--faint)] hover:text-[var(--dim)]"
             ]}
           >
@@ -322,10 +322,6 @@
                 <% end %>
               <% true -> %>
                 <%!-- File explorer: a lazy-expanding directory tree --%>
-                <form phx-submit="request_file" class="mb-3 flex gap-2">
-                  <input name="path" class="oa-input flex-1" placeholder="relative/path" />
-                  <button class="oa-btn primary">Read</button>
-                </form>
                 <% rows = file_rows(@dir_tree, @dir_expanded) %>
                 <%= cond do %>
                   <% @dir_tree == %{} and @dir_error -> %>
@@ -339,7 +335,7 @@
                     <%= if rows == [] do %>
                       <p class="font-mono text-xs text-[var(--faint)]">empty</p>
                     <% else %>
-                      <div class="overflow-hidden rounded-md border border-[var(--line)]">
+                      <div class="overflow-hidden">
                         <%= for row <- rows do %>
                           <button
                             type="button"
@@ -357,7 +353,7 @@
                             </span>
                             <span class={[
                               "truncate",
-                              row.dir && "text-[var(--amber)]",
+                              row.dir && "text-[var(--accent)]",
                               !row.dir && "text-[var(--dim)]"
                             ]}>
                               {row.name}
@@ -490,7 +486,7 @@
       <h2 class="oa-display mb-4 text-lg font-bold">New agent</h2>
       <%= if @daemons == [] do %>
         <p class="font-mono text-sm text-[var(--dim)]">
-          No daemon is connected. Start one with <code class="text-[var(--amber)]">omniagent daemon</code>, then try again.
+          No daemon is connected. Start one with <code class="text-[var(--accent)]">omniagent daemon</code>, then try again.
         </p>
         <div class="mt-4 flex justify-end">
           <button type="button" phx-click="close_new_agent" class="oa-btn">Close</button>

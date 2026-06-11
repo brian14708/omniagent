@@ -21,41 +21,43 @@
   curl -sLO https://github.com/saadeghi/daisyui/releases/latest/download/daisyui-theme.js
   We ship with two themes, a light one inspired on Phoenix colors and a dark one inspired
   on Elixir colors. Build your own at: https://daisyui.com/theme-generator/ */
-/* ── Single permanent "mission control" dark theme ──
-   Retuned to the observability-console palette so daisyUI chrome (btn, input,
-   table, card) shares the same language as the bespoke trace/terminal panes.
-   The light theme was intentionally dropped — this app is dark-only. */
+/* ── Single permanent calm-neutral dark theme ──
+   A quiet near-black instrument panel (Linear/Vercel school): neutral greys,
+   hairline borders, and one restrained electric-iris accent. daisyUI chrome
+   (btn, input, table, card) shares this language with the bespoke
+   trace/terminal panes. The light theme was intentionally dropped —
+   this app is dark-only. */
 @plugin "../vendor/daisyui-theme" {
   name: "dark";
   default: true;
   prefersdark: true;
   color-scheme: "dark";
   /* layered near-black surfaces: base-100 floats above the page shell */
-  --color-base-100: #0b0d12;
-  --color-base-200: #0f121a;
-  --color-base-300: #191d28;
-  --color-base-content: #e9edf4;
-  /* amber is the one signature accent */
-  --color-primary: #ffb454;
-  --color-primary-content: #08090c;
-  --color-secondary: #e0936f;
-  --color-secondary-content: #08090c;
-  --color-accent: #ffd9a3;
-  --color-accent-content: #08090c;
-  --color-neutral: #191d28;
-  --color-neutral-content: #e9edf4;
-  /* provider colors reused as the semantic palette */
-  --color-info: #86a8ff;
-  --color-info-content: #08090c;
-  --color-success: #5fe0aa;
-  --color-success-content: #08090c;
-  --color-warning: #ffb454;
-  --color-warning-content: #08090c;
-  --color-error: #ff6b6b;
-  --color-error-content: #08090c;
-  --radius-selector: 0.25rem;
-  --radius-field: 0.25rem;
-  --radius-box: 0.5rem;
+  --color-base-100: #111317;
+  --color-base-200: #161a20;
+  --color-base-300: #1e2228;
+  --color-base-content: #e7e9ee;
+  /* electric iris is the one signature accent */
+  --color-primary: #7c86ff;
+  --color-primary-content: #0a0b0d;
+  --color-secondary: #aab2ff;
+  --color-secondary-content: #0a0b0d;
+  --color-accent: #7c86ff;
+  --color-accent-content: #0a0b0d;
+  --color-neutral: #1e2228;
+  --color-neutral-content: #e7e9ee;
+  /* calm semantic palette */
+  --color-info: #6e8bff;
+  --color-info-content: #0a0b0d;
+  --color-success: #4ec9a0;
+  --color-success-content: #0a0b0d;
+  --color-warning: #e3a24a;
+  --color-warning-content: #0a0b0d;
+  --color-error: #f0616d;
+  --color-error-content: #0a0b0d;
+  --radius-selector: 0.375rem;
+  --radius-field: 0.375rem;
+  --radius-box: 0.625rem;
   --size-selector: 0.21875rem;
   --size-field: 0.21875rem;
   --border: 1px;
@@ -77,122 +79,115 @@
   display: contents;
 }
 
-/* Console typography app-wide: mono for body/data, display for headings. */
+/* Console typography app-wide: a crisp sans for UI chrome, mono reserved for
+   data (trace rows, code, diffs, terminal). */
 body {
-  font-family: var(--font-mono);
+  font-family: var(--font-ui);
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 h1,
 h2,
 h3,
 .oa-display {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
 }
 
 /* This file is for your main application CSS */
 
-/* ── Shared "mission control" design tokens ──
+/* ── Shared calm-neutral design tokens ──
    Promoted app-wide (previously scoped under .oa-traces) so the chrome and the
    bespoke observability panes draw from one palette. */
 :root {
-  --line: #191d28;
-  --line-hi: #2a3142;
-  --text: #e9edf4;
-  --dim: #9aa4b6;
-  --faint: #6b7589;
-  --panel: #0b0d12;
-  --panel-2: #0f121a;
-  --bg: #07080a;
-  --amber: #ffb454;
-  --amber-2: #ffd9a3;
-  --amber-soft: rgba(255, 180, 84, 0.12);
-  --prov-green: #5fe0aa;
-  --prov-red: #ff6b6b;
-  /* Slow-but-successful latency: a warning orange distinct from the error red,
+  --line: #1e2228;
+  --line-hi: #2c323b;
+  --text: #e7e9ee;
+  --dim: #a0a6b2;
+  --faint: #6a7080;
+  --panel: #111317;
+  --panel-2: #161a20;
+  --bg: #0a0b0d;
+  /* electric iris — the single signature accent */
+  --accent: #7c86ff;
+  --accent-2: #aab2ff;
+  --accent-soft: rgba(124, 134, 255, 0.12);
+  /* semantic palette (success / error / warning) */
+  --ok: #4ec9a0;
+  --err: #f0616d;
+  --warn: #e3a24a;
+  --prov-green: #4ec9a0;
+  --prov-red: #f0616d;
+  /* Slow-but-successful latency: a warning tone distinct from the error red,
      which is reserved for genuine errors in the trace panel. */
-  --prov-orange: #ff9145;
-  --prov-anthropic: #e0936f;
+  --prov-orange: #e3a24a;
+  --prov-anthropic: #d99873;
   --prov-openai: #4fd0a8;
   --prov-gemini: #86a8ff;
-  --prov-default: #6b7589;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-  --font-display: "Chakra Petch", var(--font-mono);
+  --prov-default: #6a7080;
+  --font-ui:
+    "Hanken Grotesk Variable", ui-sans-serif, system-ui, -apple-system,
+    sans-serif;
+  --font-mono:
+    "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-display: var(--font-ui);
 }
 
-/* ── Page shell: layered vignette + faint grid/scanline so panels read as
-   floating on a console surface rather than sitting on a flat fill. ── */
+/* ── Page shell: a calm neutral surface. A single soft wash lifts the top of
+   the page a few percent so panels read as floating, without scanlines,
+   vignette, or glow. ── */
 .oa-shell {
   background-color: var(--bg);
   background-image:
     radial-gradient(
-      120% 80% at 50% -10%,
-      rgba(255, 180, 84, 0.06),
-      transparent 60%
-    ),
-    radial-gradient(
-      100% 60% at 100% 0%,
-      rgba(134, 168, 255, 0.05),
+      130% 90% at 50% -20%,
+      rgba(124, 134, 255, 0.05),
       transparent 55%
     ),
-    linear-gradient(
-      transparent 0,
-      transparent calc(100% - 1px),
-      rgba(255, 255, 255, 0.018) 100%
-    ),
-    linear-gradient(
-      90deg,
-      transparent 0,
-      transparent calc(100% - 1px),
-      rgba(255, 255, 255, 0.018) 100%
-    );
-  background-size:
-    100% 100%,
-    100% 100%,
-    100% 34px,
-    34px 100%;
-  background-attachment: fixed, fixed, fixed, fixed;
+    linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent 240px);
+  background-attachment: fixed, scroll;
   color: var(--text);
 }
 
 /* ── Command-bar header ── */
 .oa-topbar {
   border-bottom: 1px solid var(--line);
-  background: linear-gradient(
-    180deg,
-    rgba(15, 18, 26, 0.9),
-    rgba(7, 8, 10, 0.9)
-  );
-  backdrop-filter: blur(6px);
+  background: rgba(10, 11, 13, 0.72);
+  backdrop-filter: blur(10px) saturate(120%);
 }
 .oa-logo {
   width: 26px;
   height: 26px;
-  border-radius: 6px;
-  display: grid;
-  place-items: center;
-  background: radial-gradient(
-    circle at 30% 25%,
-    var(--amber-2),
-    var(--amber) 55%,
-    #b9762a
-  );
-  box-shadow:
-    0 0 0 1px rgba(255, 180, 84, 0.4),
-    0 0 14px -2px var(--amber);
-  color: #08090c;
-  font: 800 13px/1 var(--font-display);
+  border-radius: 7px;
+  display: block;
 }
 .oa-wordmark {
-  font: 700 17px/1 var(--font-display);
-  letter-spacing: 0.34em;
+  font: 600 16px/1 var(--font-display);
+  letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--text);
+}
+/* Two-tone mark: the separator and the AGENT half carry the iris accent. */
+.oa-wordmark-sep {
+  font-style: normal;
+  margin: 0 0.02em;
+  color: var(--accent);
+}
+.oa-wordmark-accent {
+  color: var(--accent);
+}
+
+/* Large OMNI pillar glyph on the home page — echoes the wordmark's accent. */
+.oa-omni {
+  font: 700 30px/1 var(--font-display);
+  letter-spacing: 0.02em;
+  color: var(--accent);
 }
 
 /* ── Headings + display type ── */
 .oa-display {
   font-family: var(--font-display);
-  letter-spacing: 0.04em;
+  letter-spacing: -0.01em;
+  font-weight: 600;
 }
 
 /* ── Section / micro labels (mirrors the trace .cblock .ch treatment) ── */
@@ -207,11 +202,11 @@ h3,
 }
 .oa-label::before {
   content: "";
-  width: 6px;
-  height: 6px;
+  flex: none;
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
-  background: var(--amber);
-  box-shadow: 0 0 8px var(--amber);
+  background: var(--accent);
 }
 
 /* Column header label — same letterspaced treatment, no leading dot. */
@@ -236,14 +231,18 @@ h3,
   left: 0;
   top: 0;
   bottom: 0;
-  width: 3px;
-  background: var(--ac, var(--amber));
-  box-shadow: 0 0 10px -1px var(--ac, var(--amber));
+  width: 2px;
+  background: var(--ac, var(--accent));
 }
 .oa-panel.warn {
-  border-color: color-mix(in srgb, var(--amber) 34%, var(--line));
+  border-color: color-mix(in srgb, var(--warn) 34%, var(--line));
   background:
-    linear-gradient(180deg, var(--amber-soft), transparent), var(--panel);
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--warn) 8%, transparent),
+      transparent
+    ),
+    var(--panel);
 }
 
 /* ── Status pills with glowing dot, colored per state ── */
@@ -263,36 +262,32 @@ h3,
 }
 .oa-status::before {
   content: "";
-  width: 7px;
-  height: 7px;
+  flex: none;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   background: var(--sc);
-  box-shadow: 0 0 7px var(--sc);
 }
 .oa-status.online {
-  --sc: var(--prov-green);
+  --sc: var(--ok);
 }
 .oa-status.online::before {
-  animation: oa-pulse 1.8s ease-in-out infinite;
+  animation: oa-pulse 2.2s ease-in-out infinite;
 }
 .oa-status.exited {
-  --sc: var(--amber);
+  --sc: var(--warn);
 }
 .oa-status.error {
-  --sc: var(--prov-red);
+  --sc: var(--err);
 }
 
 @keyframes oa-pulse {
   0%,
   100% {
-    box-shadow: 0 0 6px var(--sc);
     opacity: 1;
   }
   50% {
-    box-shadow:
-      0 0 12px var(--sc),
-      0 0 20px var(--sc);
-    opacity: 0.7;
+    opacity: 0.45;
   }
 }
 
@@ -321,30 +316,35 @@ h3,
   border-color: var(--line-hi);
 }
 .oa-btn.primary {
-  color: var(--amber);
-  border-color: color-mix(in srgb, var(--amber) 40%, var(--line));
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+  background: var(--accent-soft);
 }
 .oa-btn.primary:hover {
-  background: var(--amber-soft);
-  box-shadow: 0 0 14px -4px var(--amber);
+  color: var(--accent-2);
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--line));
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
 .oa-btn.ok {
-  color: var(--prov-green);
-  border-color: color-mix(in srgb, var(--prov-green) 38%, var(--line));
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 38%, var(--line));
 }
 .oa-btn.ok:hover {
-  box-shadow: 0 0 14px -4px var(--prov-green);
+  border-color: color-mix(in srgb, var(--ok) 58%, var(--line));
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
 }
 .oa-btn.danger {
-  color: var(--prov-red);
-  border-color: color-mix(in srgb, var(--prov-red) 34%, var(--line));
+  color: var(--err);
+  border-color: color-mix(in srgb, var(--err) 34%, var(--line));
 }
 .oa-btn.danger:hover {
-  box-shadow: 0 0 14px -4px var(--prov-red);
+  border-color: color-mix(in srgb, var(--err) 56%, var(--line));
+  background: color-mix(in srgb, var(--err) 12%, transparent);
 }
 
 /* Small state dot inside a toggle button (e.g. auto-approve). */
 .oa-dot {
+  flex: none;
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -354,13 +354,12 @@ h3,
     box-shadow 0.14s ease;
 }
 .oa-dot.on {
-  --sc: var(--prov-green);
-  background: var(--prov-green);
-  box-shadow: 0 0 7px var(--prov-green);
-  animation: oa-pulse 1.8s ease-in-out infinite;
+  --sc: var(--ok);
+  background: var(--ok);
+  animation: oa-pulse 2.2s ease-in-out infinite;
 }
 
-/* ── Console inputs (amber focus ring) ── */
+/* ── Console inputs (accent focus ring) ── */
 .oa-input {
   font: 400 12px/1 var(--font-mono);
   color: var(--text);
@@ -377,8 +376,8 @@ h3,
 }
 .oa-input:focus {
   outline: none;
-  border-color: color-mix(in srgb, var(--amber) 50%, var(--line));
-  box-shadow: 0 0 0 3px var(--amber-soft);
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 /* ── Console output panes (File / Diff) ── */
@@ -400,7 +399,7 @@ h3,
 @keyframes oa-rise {
   from {
     opacity: 0;
-    transform: translateY(10px);
+    transform: translateY(6px);
   }
   to {
     opacity: 1;
@@ -409,37 +408,37 @@ h3,
 }
 .oa-reveal {
   opacity: 0;
-  animation: oa-rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  animation: oa-rise 0.34s cubic-bezier(0.22, 1, 0.36, 1) forwards;
 }
 .oa-reveal:nth-child(1) {
-  animation-delay: 0.02s;
+  animation-delay: 0.01s;
 }
 .oa-reveal:nth-child(2) {
-  animation-delay: 0.07s;
+  animation-delay: 0.04s;
 }
 .oa-reveal:nth-child(3) {
-  animation-delay: 0.12s;
+  animation-delay: 0.07s;
 }
 .oa-reveal:nth-child(4) {
-  animation-delay: 0.17s;
+  animation-delay: 0.1s;
 }
 .oa-reveal:nth-child(5) {
-  animation-delay: 0.22s;
+  animation-delay: 0.13s;
 }
 .oa-reveal:nth-child(6) {
-  animation-delay: 0.27s;
+  animation-delay: 0.16s;
 }
 .oa-reveal:nth-child(7) {
-  animation-delay: 0.32s;
+  animation-delay: 0.19s;
 }
 .oa-reveal:nth-child(8) {
-  animation-delay: 0.37s;
+  animation-delay: 0.22s;
 }
 .oa-reveal:nth-child(9) {
-  animation-delay: 0.42s;
+  animation-delay: 0.25s;
 }
 .oa-reveal:nth-child(10) {
-  animation-delay: 0.47s;
+  animation-delay: 0.28s;
 }
 @media (prefers-reduced-motion: reduce) {
   .oa-reveal {
@@ -457,8 +456,6 @@ h3,
    Design tokens now come from :root (above). */
 .oa-traces {
   font-family: var(--font-mono);
-  border: 1px solid var(--line);
-  border-radius: 8px;
   overflow-y: auto;
   overflow-x: hidden;
   scrollbar-width: thin;
@@ -488,9 +485,8 @@ h3,
   left: 0;
   top: 0;
   bottom: 0;
-  width: 3px;
+  width: 2px;
   background: var(--pc, var(--faint));
-  box-shadow: 0 0 10px -1px var(--pc, transparent);
 }
 .oa-traces .span:hover {
   background: var(--panel-2);
@@ -547,7 +543,7 @@ h3,
   color: var(--prov-green);
 }
 .oa-traces .r1stat .lat.mid {
-  color: var(--amber);
+  color: var(--warn);
 }
 .oa-traces .r1stat .lat.slow {
   color: var(--prov-orange);
@@ -592,22 +588,22 @@ h3,
   background: var(--panel);
 }
 .oa-traces .pill.method {
-  color: var(--amber);
+  color: var(--accent);
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 .oa-traces .pill .lc {
+  flex: none;
   width: 5px;
   height: 5px;
   border-radius: 50%;
   background: currentColor;
-  box-shadow: 0 0 6px currentColor;
 }
 .oa-traces .lat.fast {
   color: var(--prov-green);
 }
 .oa-traces .lat.mid {
-  color: var(--amber);
+  color: var(--warn);
 }
 .oa-traces .lat.slow {
   color: var(--prov-orange);
@@ -646,10 +642,10 @@ h3,
   height: 100%;
 }
 .oa-traces .flow .bar .in {
-  background: linear-gradient(90deg, #34465f, var(--prov-gemini));
+  background: linear-gradient(90deg, #2b313d, #4a5161);
 }
 .oa-traces .flow .bar .out {
-  background: linear-gradient(90deg, var(--amber), var(--amber-2));
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
 }
 .oa-traces .flow b {
   color: var(--text);
@@ -702,14 +698,14 @@ h3,
   opacity: 0.7;
 }
 .oa-traces .cblock .ch .tname {
-  color: var(--amber);
+  color: var(--accent);
   letter-spacing: 0.06em;
 }
 .oa-traces .cblock.think .ch {
   color: var(--prov-anthropic);
 }
 .oa-traces .cblock.tool .ch {
-  color: var(--amber);
+  color: var(--accent);
 }
 .oa-traces .cblock.req .ch {
   color: var(--prov-gemini);
@@ -767,11 +763,11 @@ h3,
 }
 .oa-traces .seg-head .mini {
   letter-spacing: 0.08em;
-  color: var(--amber);
-  border: 1px solid color-mix(in srgb, var(--amber) 28%, var(--line));
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--line));
   border-radius: 20px;
   padding: 2px 7px;
-  background: var(--amber-soft);
+  background: var(--accent-soft);
 }
 .oa-traces .copy {
   font: 500 9px/1 var(--font-mono);
@@ -786,7 +782,7 @@ h3,
   transition: 0.14s;
 }
 .oa-traces .copy:hover {
-  color: var(--amber);
+  color: var(--accent);
   border-color: var(--line-hi);
 }
 .oa-traces .body pre {
@@ -811,7 +807,7 @@ h3,
   color: var(--prov-openai);
 }
 .oa-traces .body pre .n {
-  color: var(--amber);
+  color: var(--accent);
 }
 .oa-traces .body pre .b {
   color: var(--prov-anthropic);
@@ -874,7 +870,7 @@ h3,
   transition: 0.14s;
 }
 .oa-trace-modal-close:hover {
-  color: var(--amber);
+  color: var(--accent);
   border-color: var(--line-hi);
 }
 .oa-trace-modal-summary {
@@ -926,7 +922,7 @@ h3,
   height: 100%;
 }
 
-/* Focus indicator: amber ring while the terminal has keyboard focus, so it's
+/* Focus indicator: accent ring while the terminal has keyboard focus, so it's
    clear whether keystrokes go to the agent. Toggled by the Terminal hook. */
 .oa-terminal {
   transition:
@@ -934,14 +930,12 @@ h3,
     box-shadow 0.14s ease;
 }
 .oa-terminal.is-focused {
-  border-color: var(--amber);
-  box-shadow:
-    0 0 0 1px var(--amber),
-    0 0 16px -5px var(--amber);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 /* Drag-resizable panel dividers (gutters), driven by the Resize hook. A thin
-   grab strip that shows an amber line on hover / while dragging. */
+   grab strip that shows an accent line on hover / while dragging. */
 .oa-gutter {
   flex: 0 0 auto;
   background: transparent;
@@ -961,12 +955,12 @@ h3,
 }
 .oa-gutter-x:hover,
 .oa-gutter-x.dragging {
-  background: linear-gradient(var(--amber), var(--amber)) center / 2px 100%
+  background: linear-gradient(var(--accent), var(--accent)) center / 2px 100%
     no-repeat;
 }
 .oa-gutter-y:hover,
 .oa-gutter-y.dragging {
-  background: linear-gradient(var(--amber), var(--amber)) center / 100% 2px
+  background: linear-gradient(var(--accent), var(--accent)) center / 100% 2px
     no-repeat;
 }
 
@@ -1009,8 +1003,8 @@ h3,
   color: var(--faint);
 }
 .rtype.tool {
-  color: var(--amber);
-  border-color: var(--amber);
+  color: var(--accent);
+  border-color: var(--accent);
 }
 .rtype.assistant {
   color: var(--prov-green);
@@ -1039,7 +1033,7 @@ h3,
   font-size: 11px;
 }
 .oa-codex-turn[data-state="running"] {
-  color: var(--amber);
+  color: var(--accent);
 }
 .oa-codex-turn[data-state="failed"] {
   color: var(--prov-red);
@@ -1082,11 +1076,11 @@ h3,
   margin-left: 12%;
 }
 .oa-codex-item.kind-userMessage > .oa-codex-item-label {
-  color: var(--amber);
+  color: var(--accent);
   background: transparent;
 }
 .oa-codex-item.kind-userMessage .oa-md-p {
-  color: var(--amber-2);
+  color: var(--accent-2);
 }
 .oa-codex-item-label {
   padding: 4px 10px;
@@ -1154,7 +1148,7 @@ h3,
   color: var(--dim);
 }
 .oa-codex-cmd {
-  color: var(--amber);
+  color: var(--accent);
 }
 .oa-codex-meta {
   margin-top: 6px;
@@ -1233,10 +1227,10 @@ h3,
   border-radius: 4px;
   padding: 0 4px;
   font: 400 0.92em var(--font-mono);
-  color: var(--amber);
+  color: var(--accent);
 }
 .oa-codex-item-body a {
-  color: var(--amber);
+  color: var(--accent);
   text-decoration: underline;
 }
 .oa-codex-composer {

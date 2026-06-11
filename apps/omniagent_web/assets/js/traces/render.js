@@ -267,7 +267,7 @@ export function buildBody(span) {
       navigator.clipboard?.writeText(text);
       const old = btn.textContent;
       btn.textContent = "copied";
-      btn.style.color = "var(--prov-green, #58d3a0)";
+      btn.style.color = "var(--prov-green, #4ec9a0)";
       setTimeout(() => {
         btn.textContent = old;
         btn.style.color = "";

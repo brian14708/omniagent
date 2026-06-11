@@ -12,6 +12,27 @@ defmodule OmniagentWeb.Layouts do
   embed_templates "layouts/*"
 
   @doc """
+  The OmniAgent wordmark: all-caps `OMNI·AGENT` with the middot separator and
+  the `AGENT` half in the iris accent. Single source of truth so the mark reads
+  identically in the topbar, home page, and login.
+
+  ## Examples
+
+      <Layouts.wordmark />
+      <Layouts.wordmark style="font-size:19px" />
+  """
+  attr :class, :string, default: nil
+  attr :rest, :global
+
+  def wordmark(assigns) do
+    ~H"""
+    <span class={["oa-wordmark", @class]} {@rest}>
+      Omni<i class="oa-wordmark-sep">·</i><span class="oa-wordmark-accent">Agent</span>
+    </span>
+    """
+  end
+
+  @doc """
   Renders your app layout.
 
   This function is typically invoked from every template,
@@ -38,10 +59,10 @@ defmodule OmniagentWeb.Layouts do
     <header class="oa-topbar sticky top-0 z-40 px-6 py-3">
       <div class="mx-auto flex max-w-7xl items-center justify-between gap-4">
         <a href="/" class="group flex items-center gap-3">
-          <span class="oa-logo">Ø</span>
-          <span class="oa-wordmark">Omniagent</span>
+          <img src="/favicon.svg" alt="" class="oa-logo" />
+          <.wordmark />
         </a>
-        <span class="oa-status">control plane</span>
+        <span class="oa-status">console</span>
       </div>
     </header>
 

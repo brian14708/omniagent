@@ -5,6 +5,8 @@
   "description": "OmniAgent web assets",
   "license": "MIT",
   "dependencies": {
+    "@fontsource-variable/hanken-grotesk": "^5.2.8",
+    "@fontsource-variable/jetbrains-mono": "^5.2.8",
     "asciinema-player": "^3.15.1",
     "ghostty-web": "^0.4.0"
   }

@@ -10,31 +10,31 @@
 import { Terminal as GhosttyTerminal, FitAddon, init } from "ghostty-web";
 
 const THEME = {
-  background: "#060708",
-  foreground: "#e2e6ee",
-  cursor: "#ffb454",
-  cursorAccent: "#060708",
-  // Solid amber highlight with dark text. Without an explicit
+  background: "#0a0b0d",
+  foreground: "#e7e9ee",
+  cursor: "#7c86ff",
+  cursorAccent: "#0a0b0d",
+  // Solid iris highlight with dark text. Without an explicit
   // selectionForeground, selected glyphs keep their own (often dark) colour and
   // become unreadable over a dark highlight.
-  selectionBackground: "#ffb454",
-  selectionForeground: "#08090c",
-  black: "#11141b",
+  selectionBackground: "#7c86ff",
+  selectionForeground: "#0a0b0d",
+  black: "#161a20",
   brightBlack: "#535b6b",
-  red: "#ff6b6b",
+  red: "#f0616d",
   brightRed: "#ff8f8f",
-  green: "#58d3a0",
+  green: "#4ec9a0",
   brightGreen: "#7ee8bd",
-  yellow: "#ffb454",
-  brightYellow: "#ffd9a3",
+  yellow: "#e3a24a",
+  brightYellow: "#f0bd72",
   blue: "#7aa2ff",
   brightBlue: "#a3c0ff",
-  magenta: "#d98b6a",
+  magenta: "#d99873",
   brightMagenta: "#e8a98f",
   cyan: "#4fc8a3",
   brightCyan: "#7ee8bd",
   white: "#c5cbd6",
-  brightWhite: "#e2e6ee",
+  brightWhite: "#e7e9ee",
 };
 
 export const Terminal = {

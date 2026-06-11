@@ -61,7 +61,8 @@ defmodule OmniagentWeb.ConsoleLive do
 
     case user && Sessions.get_user_session(user.id, id) do
       nil ->
-        {:noreply, socket |> put_flash(:error, "Session not found.") |> push_patch(to: ~p"/")}
+        {:noreply,
+         socket |> put_flash(:error, "Session not found.") |> push_patch(to: ~p"/console")}
 
       session ->
         {:noreply, select_session(socket, session)}
@@ -220,7 +221,7 @@ defmodule OmniagentWeb.ConsoleLive do
 
     case Sessions.delete_session(session.user_id, session.id) do
       {:ok, _} ->
-        {:noreply, socket |> put_flash(:info, "Session deleted.") |> push_patch(to: ~p"/")}
+        {:noreply, socket |> put_flash(:info, "Session deleted.") |> push_patch(to: ~p"/console")}
 
       {:error, :session_online} ->
         {:noreply, put_flash(socket, :error, "Cannot delete an online session.")}

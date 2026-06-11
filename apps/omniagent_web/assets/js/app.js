@@ -19,6 +19,13 @@
 
 // Include phoenix_html to handle method=PUT/DELETE in forms and buttons.
 import "phoenix_html";
+// Self-hosted fonts via Fontsource — esbuild bundles the @font-face rules into
+// assets/js/app.css and copies the woff2 files alongside it (see the .woff2
+// file loader in config/config.exs). Replaces the Google Fonts CDN link.
+import "@fontsource-variable/hanken-grotesk";
+import "@fontsource-variable/hanken-grotesk/wght-italic.css";
+import "@fontsource-variable/jetbrains-mono";
+import "@fontsource-variable/jetbrains-mono/wght-italic.css";
 // asciinema-player styles — esbuild emits these into assets/js/app.css, which
 // the root layout links alongside the Tailwind stylesheet.
 import "asciinema-player/dist/bundle/asciinema-player.css";
@@ -52,7 +59,10 @@ const liveSocket = new LiveSocket("/live", Socket, {
 });
 
 // Show progress bar on live navigation and form submits
-topbar.config({ barColors: { 0: "#29d" }, shadowColor: "rgba(0, 0, 0, .3)" });
+topbar.config({
+  barColors: { 0: "#7c86ff" },
+  shadowColor: "rgba(0, 0, 0, .3)",
+});
 window.addEventListener("phx:page-loading-start", (_info) => topbar.show(300));
 window.addEventListener("phx:page-loading-stop", (_info) => topbar.hide());
 

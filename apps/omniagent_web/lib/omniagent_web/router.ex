@@ -15,11 +15,30 @@ defmodule OmniagentWeb.Router do
     plug OmniagentWeb.Plugs.ApiAuth
   end
 
+  pipeline :require_auth do
+    plug OmniagentWeb.Auth
+  end
+
   scope "/", OmniagentWeb do
     pipe_through :browser
 
-    live "/", ConsoleLive, :index
-    live "/sessions/:id", ConsoleLive, :show
+    get "/", PageController, :home
+    get "/login", SessionController, :new
+    post "/login", SessionController, :create
+    delete "/logout", SessionController, :delete
+
+    # Download the pre-built omniagent CLI for a given platform, e.g.
+    # GET /cli/linux/x86_64, /cli/linux/aarch64, /cli/darwin/aarch64.
+    get "/cli/:os/:arch", CliController, :download
+  end
+
+  scope "/", OmniagentWeb do
+    pipe_through [:browser, :require_auth]
+
+    live_session :authenticated, on_mount: {OmniagentWeb.Auth, :require_admin} do
+      live "/console", ConsoleLive, :index
+      live "/sessions/:id", ConsoleLive, :show
+    end
 
     get "/sessions/:session_id/artifacts/:id/download", ArtifactController, :download
   end
