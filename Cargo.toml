@@ -35,7 +35,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rustix = { version = "1.1", features = ["process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 opentelemetry = { version = "0.32", features = ["trace"] }
 opentelemetry_sdk = { version = "0.32", features = ["trace", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
@@ -47,12 +47,14 @@ thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "macros", "serde"] }
 tokio = { version = "1.40", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
-tonic = { version = "0.12", default-features = false, features = ["transport", "codegen", "prost"] }
-prost = "0.13"
-prost-types = "0.13"
-tonic-build = "0.12"
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "router"] }
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+tonic-build = "0.14"
+tonic-prost-build = "0.14"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
