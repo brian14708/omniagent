@@ -93,7 +93,13 @@ anywhere and no client heartbeat within the staleness window is marked offline
 
 ## Rust client
 
-Build/check:
+Install the latest nightly:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/brian14708/omniagent/main/install.sh | sh
+```
+
+Build/check from source:
 
 ```sh
 cargo check -p omniagent-cli
@@ -106,24 +112,57 @@ Store server credentials:
 omniagent login --server-url "$OMNIAGENT_SERVER_URL" --token "$OMNIAGENT_API_TOKEN"
 ```
 
-Start a central session:
+Allow a workspace the daemon may spawn agents under:
 
 ```sh
-omniagent serve --name demo -- codex
-# or
-omniagent serve --name demo -- claude
+omniagent workspaces add /path/to/your/project
 ```
 
-List locally remembered sessions:
+Run the daemon (foreground; connects out to the control plane). Sessions are
+started from the OmniAgent web console:
+
+```sh
+omniagent daemon
+```
+
+List locally remembered sessions, or stop one:
 
 ```sh
 omniagent sessions list
-```
-
-Resume a remembered server session:
-
-```sh
-omniagent resume <session-id>
+omniagent stop <session-id>
 ```
 
 The CLI keeps provider API keys local, starts a local recording proxy, streams terminal/trace/review/compare events to the OmniAgent control plane over an outbound WebSocket, and serves file/diff requests from the local workspace only.
+
+### Upgrading
+
+Re-run the installer; it pulls the latest nightly, overwrites the binary in
+place, and reports the version change:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/brian14708/omniagent/main/install.sh | sh
+```
+
+Verify with `omniagent --version` (the build's git SHA and date are stamped in).
+
+### Uninstalling
+
+Remove the binary along with the config (which holds your saved API token) and
+trace/session data:
+
+```sh
+omniagent uninstall            # prompts before deleting
+omniagent uninstall --yes      # no prompt
+omniagent uninstall --keep-data  # remove only the binary, keep config + data
+```
+
+Stop the daemon first — `uninstall` refuses while one is running. If automatic
+removal of the binary fails (e.g. it lives in a root-owned directory), remove
+these paths manually:
+
+```sh
+rm ~/.local/bin/omniagent          # or wherever INSTALL_DIR put it
+rm -rf ~/.config/omniagent         # config + API token
+rm -rf ~/.local/share/omniagent    # traces + sessions
+```
+

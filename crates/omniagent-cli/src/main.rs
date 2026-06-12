@@ -28,7 +28,7 @@ mod upload;
 mod worker;
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -37,16 +37,27 @@ use time::OffsetDateTime;
 use tokio::net::TcpListener;
 
 use crate::client::{ClientConfig, WorkspacePolicy};
-use crate::config::ConfigStore;
+use crate::config::{ConfigStore, omniagent_config_dir};
 use crate::control::{ControlRequest, ControlResponse};
 use crate::proxy::ProxyState;
 use crate::record::TraceStore;
 use crate::review::ReviewStore;
 use crate::session::omniagent_data_dir;
 
+/// Version string stamped by `build.rs`: the crate version plus the build's git
+/// short SHA and commit date, so `--version` identifies the exact build.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("OMNIAGENT_BUILD_SHA"),
+    " ",
+    env!("OMNIAGENT_BUILD_DATE"),
+    ")"
+);
+
 /// Supervise and record coding agents.
 #[derive(Debug, Parser)]
-#[command(name = "omniagent", version, about, long_about = None)]
+#[command(name = "omniagent", version = VERSION, about, long_about = None)]
 struct Cli {
     /// Address to bind servers to.
     #[arg(
@@ -89,6 +100,8 @@ enum Command {
     Sessions(SessionsArgs),
     /// Manage the allowed workspaces the daemon may spawn agents under.
     Workspaces(WorkspacesArgs),
+    /// Remove the omniagent binary and (by default) its config and data.
+    Uninstall(UninstallArgs),
 }
 
 #[derive(Debug, Args)]
@@ -152,6 +165,18 @@ enum WorkspacesCommand {
     List,
 }
 
+#[derive(Debug, Args)]
+struct UninstallArgs {
+    /// Keep the config (including the saved API token) and trace/session data;
+    /// remove only the binary.
+    #[arg(long)]
+    keep_data: bool,
+
+    /// Do not prompt for confirmation.
+    #[arg(long, short = 'y')]
+    yes: bool,
+}
+
 #[tokio::main]
 async fn main() {
     init_tracing();
@@ -179,6 +204,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Stop(args) => stop_via_daemon(args).await,
         Command::Sessions(args) => sessions(&args).await,
         Command::Workspaces(args) => workspaces(&args),
+        Command::Uninstall(args) => uninstall(args).await,
     }
 }
 
@@ -231,6 +257,103 @@ fn workspaces(args: &WorkspacesArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `omniagent uninstall`: remove the binary and, unless `--keep-data`, the config
+/// (which stores the long-lived API token) and the trace/session data dir.
+async fn uninstall(args: UninstallArgs) -> Result<()> {
+    // Refuse while a daemon is live so we don't pull files out from under it. A
+    // `Pong` reply is the reliable signal; a lingering socket file is not.
+    if matches!(
+        control::send_request(&ControlRequest::Ping).await,
+        Ok(ControlResponse::Pong)
+    ) {
+        bail!("an omniagent daemon is running; stop it (and its sessions) before uninstalling");
+    }
+
+    let binary = std::env::current_exe().context("cannot determine the omniagent binary path")?;
+    let config_dir = omniagent_config_dir();
+    let data_dir = omniagent_data_dir();
+    let socket = control::socket_path();
+
+    println!("omniagent uninstall will remove:");
+    println!("  binary: {}", binary.display());
+    if args.keep_data {
+        println!(
+            "  keeping config and data (--keep-data); your API token stays in {}",
+            config_dir.join("config.json").display()
+        );
+    } else {
+        println!(
+            "  config (includes your saved API token): {}",
+            config_dir.display()
+        );
+        println!("  data (traces, sessions): {}", data_dir.display());
+    }
+
+    if !args.yes && !confirm("Proceed?").await? {
+        println!("omniagent: uninstall cancelled");
+        return Ok(());
+    }
+
+    if !args.keep_data {
+        remove_dir_if_present(&config_dir)?;
+        remove_dir_if_present(&data_dir)?;
+        remove_file_if_present(&socket)?;
+    }
+
+    // Remove the binary last: on Unix the running process keeps its inode until exit.
+    match std::fs::remove_file(&binary) {
+        Ok(()) => println!("omniagent: removed {}", binary.display()),
+        Err(err) => eprintln!(
+            "omniagent: could not remove {} ({err}); remove it manually with:\n    rm {}",
+            binary.display(),
+            binary.display()
+        ),
+    }
+
+    println!("omniagent: uninstall complete");
+    Ok(())
+}
+
+/// Removes a directory tree, treating an already-absent path as success.
+fn remove_dir_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {
+            println!("omniagent: removed {}", path.display());
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+/// Removes a file, treating an already-absent path as success.
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+/// Prompts on stdout and reads a yes/no answer from stdin, defaulting to no.
+async fn confirm(prompt: &str) -> Result<bool> {
+    let prompt = prompt.to_string();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        print!("{prompt} [y/N] ");
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        Ok::<bool, std::io::Error>(matches!(
+            input.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    })
+    .await
+    .context("failed to read confirmation")?
+    .context("failed to read from stdin")
 }
 
 /// Default trace archive for this session, under the XDG data dir:
