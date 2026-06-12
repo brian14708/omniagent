@@ -17,10 +17,10 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::agents::AgentInfo;
 use crate::atif::{
     Agent, FinalMetrics, Metrics, Observation, ObservationResult, Step, ToolCall, Trajectory,
 };
+use crate::executor::AgentInfo;
 
 const SCHEMA_VERSION: &str = "ATIF-v1.7";
 
