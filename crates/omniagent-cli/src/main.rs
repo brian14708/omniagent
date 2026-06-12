@@ -9,7 +9,6 @@
 
 mod agent;
 mod agent_log;
-mod agents;
 mod atif;
 mod cast;
 mod client;
@@ -17,6 +16,7 @@ mod codex;
 mod config;
 mod control;
 mod daemon;
+mod executor;
 mod files;
 mod git;
 mod protocol;

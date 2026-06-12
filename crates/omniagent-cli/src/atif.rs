@@ -27,7 +27,7 @@
 
 use serde::Serialize;
 
-use crate::agents::AgentInfo;
+use crate::executor::AgentInfo;
 use crate::record::{LlmSpan, Provider, Usage};
 
 /// Current ATIF schema version we emit.

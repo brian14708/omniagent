@@ -36,6 +36,15 @@ pub struct Config {
     /// binary. Editing the file overrides or extends this map.
     #[serde(default = "default_agent_commands")]
     pub agent_commands: BTreeMap<String, Vec<String>>,
+    /// Shell script run (via `sh -lc`) in the session's cwd before the coding
+    /// agent starts — e.g. installing dependencies. A non-zero exit aborts the
+    /// session before the agent runs.
+    #[serde(default)]
+    pub setup_script: Option<String>,
+    /// Shell script run (via `sh -lc`) in the session's cwd after the coding
+    /// agent exits, before artifacts are finalized.
+    #[serde(default)]
+    pub cleanup_script: Option<String>,
 }
 
 impl Default for Config {
@@ -46,6 +55,8 @@ impl Default for Config {
             full_access: false,
             allowed_workspaces: Vec::new(),
             agent_commands: default_agent_commands(),
+            setup_script: None,
+            cleanup_script: None,
         }
     }
 }
@@ -187,6 +198,16 @@ impl ConfigStore {
     /// Returns an error if the config cannot be read.
     pub fn agent_commands(&self) -> Result<BTreeMap<String, Vec<String>>> {
         Ok(self.load()?.agent_commands)
+    }
+
+    /// The configured setup/cleanup shell scripts, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be read.
+    pub fn session_scripts(&self) -> Result<(Option<String>, Option<String>)> {
+        let config = self.load()?;
+        Ok((config.setup_script, config.cleanup_script))
     }
 
     fn save(&self, config: &Config) -> Result<()> {

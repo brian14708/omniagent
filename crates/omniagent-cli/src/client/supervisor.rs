@@ -21,12 +21,13 @@ use tokio::sync::{Notify, broadcast, mpsc};
 
 use crate::agent::AgentHandle;
 use crate::agent_log;
-use crate::agents::{self, AgentInfo};
 use crate::atif;
 use crate::cast::CastRecorder;
 use crate::codex::client::{Notification, ServerRequest};
 use crate::codex::{self, CodexWorkerHandle};
 use crate::config::{ConfigStore, path_within_roots};
+use crate::executor::action::{ActionType, ExecutorAction, ScriptRequest};
+use crate::executor::{self, AgentInfo, Backend};
 use crate::files;
 use crate::protocol::{RegisterSessionRequest, ServerCommand};
 use crate::record::{Provider, TraceStore};
@@ -147,25 +148,6 @@ fn sanitized_workspace_name(name: &str) -> Result<String> {
     }
 }
 
-/// Final argv for a PTY-spawned agent: claude gets a `--session-id` injected so
-/// its transcript is locatable; codex gets the proxy provider overrides (it
-/// ignores `OPENAI_BASE_URL` for its built-in providers, so env redirection
-/// alone doesn't route the TUI through the proxy). Returns claude's chosen id.
-fn pty_spawn_argv(
-    agent: &str,
-    info: Option<AgentInfo>,
-    resolved: &[String],
-    proxy_url: &str,
-) -> (Vec<String>, Option<String>) {
-    let (argv, id) = agents::prepare_argv(info, resolved);
-    let argv = if agent == "codex" {
-        codex::worker::tui_argv(&argv, proxy_url)
-    } else {
-        argv
-    };
-    (argv, id)
-}
-
 /// Picks the worktree resolution mode from a spec: an explicit existing
 /// worktree wins, then an isolated-worktree request (defaulting the branch name
 /// when unset), otherwise spawn in place.
@@ -197,11 +179,11 @@ fn select_mode(spec: &SessionSpec) -> WorktreeMode {
 fn session_metadata(
     spec: &SessionSpec,
     resolved: &workspace::ResolvedWorkspace,
-    codex_native: bool,
+    kind: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut metadata = serde_json::Map::new();
-    if codex_native {
-        metadata.insert("kind".to_string(), json!("codex-app-server"));
+    if let Some(kind) = kind {
+        metadata.insert("kind".to_string(), json!(kind));
     }
     if let Some(model) = &spec.model {
         metadata.insert("model".to_string(), json!(model));
@@ -317,6 +299,62 @@ impl DaemonSupervisor {
         Ok(resolved)
     }
 
+    /// Builds the session's step chain (`setup? -> agent -> cleanup?`) from
+    /// config, runs any leading setup scripts to completion, and returns the
+    /// trailing (cleanup) chain for the reaper. On setup failure, announces the
+    /// aborted session, closes its channel, and returns the error.
+    async fn prepare_session_chain(
+        &self,
+        channel: &ChannelHandle,
+        cwd: &Path,
+        env: &[(String, String)],
+        agent_info: Option<AgentInfo>,
+        resolved: &workspace::ResolvedWorkspace,
+    ) -> Result<Option<ExecutorAction>> {
+        let (setup_script, cleanup_script) = ConfigStore::default()
+            .session_scripts()
+            .unwrap_or((None, None));
+        let chain = ExecutorAction::session_chain(setup_script, cleanup_script);
+        match self.run_setup_scripts(channel, cwd, env, &chain).await {
+            Ok(cleanup) => Ok(cleanup),
+            Err(err) => {
+                abort_before_agent(channel, agent_info, resolved, &err).await;
+                self.socket.handle().close_session(&channel.topic());
+                Err(err)
+            }
+        }
+    }
+
+    /// Runs the chain's leading [`ActionType::Script`] steps (setup) to
+    /// completion, streaming their output to the session's terminal. Returns the
+    /// remaining chain after the [`ActionType::CodingAgent`] step (the cleanup
+    /// scripts the reaper will run). A non-zero setup exit is an error: the
+    /// caller aborts the session before the agent starts.
+    async fn run_setup_scripts(
+        &self,
+        channel: &ChannelHandle,
+        cwd: &Path,
+        env: &[(String, String)],
+        chain: &ExecutorAction,
+    ) -> Result<Option<ExecutorAction>> {
+        let mut step = Some(chain);
+        while let Some(node) = step {
+            match &node.typ {
+                ActionType::Script(req) => {
+                    let code = run_script_action(channel, cwd, env, req).await?;
+                    if code != 0 {
+                        return Err(anyhow!("{} script failed with exit code {code}", req.label));
+                    }
+                    step = node.next();
+                }
+                // The agent step itself is spawned by the caller; everything after
+                // it (cleanup) runs in the reaper.
+                ActionType::CodingAgent => return Ok(node.next().cloned()),
+            }
+        }
+        Ok(None)
+    }
+
     /// Launch a new session: register with the server, start its proxy, spawn the
     /// agent, and wire up the bidirectional bridges. Returns once the server has
     /// confirmed the registration.
@@ -326,17 +364,20 @@ impl DaemonSupervisor {
         let handle = self.socket.handle();
         let cwd_string = spec.cwd.display().to_string();
 
-        // The user's explicit selection picks the backend (codex app-server vs
-        // PTY) and labels the session for the console's renderer choice.
-        let agent_info = agents::agent_info(&spec.agent);
-        let codex_native = spec.app_server && spec.agent == "codex";
+        // The user's explicit selection resolves to an executor that drives the
+        // backend choice, argv transforms, ATIF capability, and the console's
+        // renderer label.
+        let executor = executor::resolve_executor(&spec.agent);
+        let agent_info = executor.info();
+        let backend = executor.backend(spec.app_server);
 
         // Resolve the launch command (configured command + the user's extra args)
         // once, so registration and either backend share one argv.
         let agent_commands = ConfigStore::default().agent_commands().unwrap_or_default();
-        let resolved_argv = agents::launch_argv(&spec.agent, &spec.custom_command, &agent_commands);
+        let resolved_argv =
+            executor::launch_argv(&spec.agent, &spec.custom_command, &agent_commands);
 
-        let metadata = session_metadata(&spec, &resolved, codex_native);
+        let metadata = session_metadata(&spec, &resolved, executor.metadata_kind(spec.app_server));
 
         let opened = handle
             .open_session(RegisterSessionRequest {
@@ -366,34 +407,26 @@ impl DaemonSupervisor {
         let env = proxy::agent_env(&proxy_url);
         let started_at = SystemTime::now();
 
-        // Choose the backend. Codex-native drives `codex app-server` over JSON-RPC
-        // and renders structured events; everything else runs in a PTY. The two
-        // diverge entirely on I/O wiring but share the reaper/finalize path below.
-        let (worker, recorder, native_session_id) = if codex_native {
-            let app_argv = codex::worker::app_server_argv(&resolved_argv, &proxy_url);
-            let (codex_worker, events) =
-                CodexWorkerHandle::spawn(&app_argv, &env, &spec.cwd, spec.model.as_deref()).await?;
-            spawn_codex_event_bridge(&channel, codex_worker.clone(), events.notifications);
-            spawn_codex_approval_bridge(reviews.clone(), codex_worker.clone(), events.approvals);
-            spawn_codex_command_bridge(&channel, codex_worker.clone(), spec.cwd.clone());
-            (WorkerHandle::new_codex(codex_worker), None, None)
-        } else {
-            // For claude-code, inject a known `--session-id` so its transcript is
-            // locatable at close; other agents are spawned unchanged.
-            let (spawn_argv, native_session_id) =
-                pty_spawn_argv(&spec.agent, agent_info, &resolved_argv, &proxy_url);
-            let agent = AgentHandle::spawn(
-                &spawn_argv,
-                &env,
-                Some(spec.cwd.as_path()),
-                DEFAULT_PTY_ROWS,
-                DEFAULT_PTY_COLS,
-            )?;
-            let worker = WorkerHandle::new_pty(agent);
-            let recorder = start_cast_recorder(&session_id, &worker);
-            spawn_worker_bridge(&channel, worker.clone(), spec.cwd.clone());
-            (worker, recorder, native_session_id)
-        };
+        // Build the session's step chain and run any leading setup scripts before
+        // the agent; the remaining (cleanup) chain is deferred to the reaper. A
+        // non-zero setup exit aborts the session before the agent starts.
+        let cleanup_chain = self
+            .prepare_session_chain(&channel, &spec.cwd, &env, agent_info, &resolved)
+            .await?;
+
+        // Choose the backend (codex app-server vs PTY) and wire its bridges.
+        let (worker, recorder, native_session_id) = spawn_backend(
+            backend,
+            executor.as_ref(),
+            &resolved_argv,
+            &proxy_url,
+            &env,
+            &channel,
+            &reviews,
+            &spec,
+            &session_id,
+        )
+        .await?;
 
         // Review decisions flow back the same way for both backends.
         spawn_review_decision_bridge(&channel, reviews.clone());
@@ -434,6 +467,8 @@ impl DaemonSupervisor {
             started_at,
             created_worktree: resolved.created_worktree.clone(),
             origin_root: resolved.origin_root.clone(),
+            cleanup_chain,
+            env,
         };
         tokio::spawn(async move {
             let exit_code = worker.wait_exit().await;
@@ -557,12 +592,30 @@ struct FinalizeCtx {
     created_worktree: Option<PathBuf>,
     /// Origin repo the worktree belongs to (the `git worktree remove` anchor).
     origin_root: PathBuf,
+    /// Trailing chain steps (cleanup scripts) to run after the agent exits,
+    /// before artifacts are collected.
+    cleanup_chain: Option<ExecutorAction>,
+    /// Agent environment (proxy base-URL overrides) — reused for cleanup scripts.
+    env: Vec<(String, String)>,
 }
 
 /// Finalizes recordings, uploads artifacts, and emits the `session_close`
 /// event. Best-effort throughout: failing to record, build, or upload any one
 /// artifact is logged and never blocks teardown.
 async fn finalize_session(ctx: FinalizeCtx, exit_code: i32) {
+    // Run trailing cleanup scripts before collecting artifacts (the cwd, and any
+    // auto-created worktree, still exist — the worktree is pruned last below).
+    // Best-effort: a failing cleanup script is logged, not fatal.
+    let mut step = ctx.cleanup_chain.as_ref();
+    while let Some(node) = step {
+        if let ActionType::Script(req) = &node.typ
+            && let Err(err) = run_script_action(&ctx.channel, &ctx.cwd, &ctx.env, req).await
+        {
+            tracing::warn!(error = %err, label = req.label, "cleanup script failed to run");
+        }
+        step = node.next();
+    }
+
     // Collect each artifact's bytes (cheap, sequential), then upload them
     // concurrently below so a slow upload doesn't serialize the others.
     let mut pending: Vec<(&'static str, Vec<u8>)> = Vec::new();
@@ -780,50 +833,144 @@ fn start_cast_recorder(session_id: &str, worker: &WorkerHandle) -> Option<CastRe
 /// output broadcast does not reliably close on exit — late attachers may keep a
 /// sender alive — so we can't rely on a `Closed` to mark the end of output.)
 fn spawn_terminal_output_bridge(channel: &ChannelHandle, worker: WorkerHandle) {
-    let output_channel = channel.clone();
+    let channel = channel.clone();
     tokio::spawn(async move {
-        let mut terminal = worker.attach();
-        // Carry an incomplete trailing UTF-8 sequence across chunks so a
-        // multi-byte codepoint split at a chunk boundary isn't corrupted.
-        let mut carry: Vec<u8> = Vec::new();
-        let push_output = |carry: &mut Vec<u8>, bytes: &[u8]| {
-            let data = decode_streaming(carry, bytes);
-            if !data.is_empty() {
-                output_channel.push("pty_output", json!({ "data": data }));
-            }
-        };
-        if !terminal.backlog.is_empty() {
-            let backlog = std::mem::take(&mut terminal.backlog);
-            push_output(&mut carry, &backlog);
-        }
-
-        let exit = worker.wait_exit();
-        tokio::pin!(exit);
-        let exit_code = loop {
-            tokio::select! {
-                // Prefer draining output over noticing the exit so buffered
-                // chunks are always pushed (with lower sequences) first.
-                biased;
-                chunk = terminal.output.recv() => match chunk {
-                    Ok(chunk) => push_output(&mut carry, &chunk),
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break worker.wait_exit().await,
-                },
-                code = &mut exit => break code,
-            }
-        };
-
-        // Process exited: flush any output still buffered in the broadcast
-        // before announcing the exit.
-        loop {
-            match terminal.output.try_recv() {
-                Ok(chunk) => push_output(&mut carry, &chunk),
-                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-                Err(_) => break,
-            }
-        }
-        output_channel.push("pty_exit", json!({ "exit_code": exit_code }));
+        let exit_code = pump_terminal_output(&channel, &worker).await;
+        channel.push("pty_exit", json!({ "exit_code": exit_code }));
     });
+}
+
+/// Drains a worker's PTY output to the channel as `pty_output` events until the
+/// worker exits, returning its exit code. Does **not** emit `pty_exit` — the
+/// caller decides whether the exit ends the session (the agent) or is just the
+/// end of an intermediate step (a setup/cleanup script).
+async fn pump_terminal_output(channel: &ChannelHandle, worker: &WorkerHandle) -> i32 {
+    let mut terminal = worker.attach();
+    // Carry an incomplete trailing UTF-8 sequence across chunks so a multi-byte
+    // codepoint split at a chunk boundary isn't corrupted.
+    let mut carry: Vec<u8> = Vec::new();
+    let push_output = |carry: &mut Vec<u8>, bytes: &[u8]| {
+        let data = decode_streaming(carry, bytes);
+        if !data.is_empty() {
+            channel.push("pty_output", json!({ "data": data }));
+        }
+    };
+    if !terminal.backlog.is_empty() {
+        let backlog = std::mem::take(&mut terminal.backlog);
+        push_output(&mut carry, &backlog);
+    }
+
+    let exit = worker.wait_exit();
+    tokio::pin!(exit);
+    let exit_code = loop {
+        tokio::select! {
+            // Prefer draining output over noticing the exit so buffered
+            // chunks are always pushed (with lower sequences) first.
+            biased;
+            chunk = terminal.output.recv() => match chunk {
+                Ok(chunk) => push_output(&mut carry, &chunk),
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break worker.wait_exit().await,
+            },
+            code = &mut exit => break code,
+        }
+    };
+
+    // Process exited: flush any output still buffered in the broadcast.
+    loop {
+        match terminal.output.try_recv() {
+            Ok(chunk) => push_output(&mut carry, &chunk),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(_) => break,
+        }
+    }
+    exit_code
+}
+
+/// Spawns the session's agent on the chosen backend and wires its bridges,
+/// returning the worker handle, an optional terminal recorder (PTY only), and any
+/// native session id we injected (claude). Codex-native drives `codex app-server`
+/// over JSON-RPC and renders structured events; everything else runs in a PTY.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_backend(
+    backend: Backend,
+    executor: &dyn executor::Executor,
+    resolved_argv: &[String],
+    proxy_url: &str,
+    env: &[(String, String)],
+    channel: &ChannelHandle,
+    reviews: &Arc<ReviewStore>,
+    spec: &SessionSpec,
+    session_id: &str,
+) -> Result<(WorkerHandle, Option<CastRecorder>, Option<String>)> {
+    match backend {
+        Backend::CodexAppServer => {
+            let app_argv = executor.app_server_argv(resolved_argv, proxy_url);
+            let (codex_worker, events) =
+                CodexWorkerHandle::spawn(&app_argv, env, &spec.cwd, spec.model.as_deref()).await?;
+            spawn_codex_event_bridge(channel, codex_worker.clone(), events.notifications);
+            spawn_codex_approval_bridge(reviews.clone(), codex_worker.clone(), events.approvals);
+            spawn_codex_command_bridge(channel, codex_worker.clone(), spec.cwd.clone());
+            Ok((WorkerHandle::new_codex(codex_worker), None, None))
+        }
+        Backend::Pty => {
+            // For claude-code, inject a known `--session-id` so its transcript is
+            // locatable at close; other agents are spawned unchanged.
+            let (spawn_argv, native_session_id) = executor.pty_argv(resolved_argv, proxy_url);
+            let agent = AgentHandle::spawn(
+                &spawn_argv,
+                env,
+                Some(spec.cwd.as_path()),
+                DEFAULT_PTY_ROWS,
+                DEFAULT_PTY_COLS,
+            )?;
+            let worker = WorkerHandle::new_pty(agent);
+            let recorder = start_cast_recorder(session_id, &worker);
+            spawn_worker_bridge(channel, worker.clone(), spec.cwd.clone());
+            Ok((worker, recorder, native_session_id))
+        }
+    }
+}
+
+/// streaming its output to the session's terminal, and returns its exit code.
+/// Used for setup (before the agent) and cleanup (after the agent) steps.
+async fn run_script_action(
+    channel: &ChannelHandle,
+    cwd: &Path,
+    env: &[(String, String)],
+    req: &ScriptRequest,
+) -> Result<i32> {
+    let argv = vec!["sh".to_string(), "-lc".to_string(), req.script.clone()];
+    let agent = AgentHandle::spawn(&argv, env, Some(cwd), DEFAULT_PTY_ROWS, DEFAULT_PTY_COLS)
+        .with_context(|| format!("failed to spawn {} script", req.label))?;
+    let worker = WorkerHandle::new_pty(agent);
+    Ok(pump_terminal_output(channel, &worker).await)
+}
+
+/// Announces a session that failed before its agent started (e.g. a setup script
+/// errored), then prunes any auto-created worktree. The caller closes the channel
+/// and returns the error.
+async fn abort_before_agent(
+    channel: &ChannelHandle,
+    agent: Option<AgentInfo>,
+    resolved: &workspace::ResolvedWorkspace,
+    err: &anyhow::Error,
+) {
+    let payload = json!({
+        "exit_code": -1,
+        "agent": {
+            "name": agent.map(|info| info.name),
+            "supported": agent.is_some(),
+        },
+        "artifacts": [],
+        "error": format!("{err:#}"),
+    });
+    if let Err(send_err) = channel.send_now("session_close", payload).await {
+        tracing::debug!(error = %send_err, "session_close (abort) not delivered (socket down)");
+    }
+    if let Some(worktree) = &resolved.created_worktree {
+        workspace::remove_worktree(&resolved.origin_root, worktree);
+    }
 }
 
 /// Applies server->client commands (input, resize, file/diff, shutdown).
