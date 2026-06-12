@@ -81,7 +81,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Download CLI artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: omniagent-cli-*
           path: release-assets
