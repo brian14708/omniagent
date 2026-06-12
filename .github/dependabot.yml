@@ -10,7 +10,7 @@ updates:
       timezone: "UTC"
     open-pull-requests-limit: 5
     commit-message:
-      prefix: "deps"
+      prefix: "chore"
       include: "scope"
     groups:
       cargo-minor-patch:
@@ -29,7 +29,7 @@ updates:
       timezone: "UTC"
     open-pull-requests-limit: 5
     commit-message:
-      prefix: "deps"
+      prefix: "chore"
       include: "scope"
     groups:
       mix-minor-patch:
@@ -48,7 +48,7 @@ updates:
       timezone: "UTC"
     open-pull-requests-limit: 5
     commit-message:
-      prefix: "deps"
+      prefix: "chore"
       include: "scope"
     groups:
       npm-minor-patch:
@@ -67,7 +67,7 @@ updates:
       timezone: "UTC"
     open-pull-requests-limit: 5
     commit-message:
-      prefix: "deps"
+      prefix: "chore"
       include: "scope"
     groups:
       docker-minor-patch:
@@ -86,7 +86,7 @@ updates:
       timezone: "UTC"
     open-pull-requests-limit: 5
     commit-message:
-      prefix: "deps"
+      prefix: "chore"
       include: "scope"
     groups:
       actions-minor-patch:
