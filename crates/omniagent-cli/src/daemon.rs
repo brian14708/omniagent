@@ -89,11 +89,20 @@ async fn handle_request(
         ControlRequest::Stop { session_id } => ControlResponse::Stopped {
             found: supervisor.stop_session(&session_id).await,
         },
+        ControlRequest::RefreshWorkspaces => match supervisor
+            .refresh_workspaces(control_metadata())
+            .await
+        {
+            Ok(()) => ControlResponse::WorkspacesRefreshed,
+            Err(err) => ControlResponse::Error {
+                message: format!("{err:#}"),
+            },
+        },
         ControlRequest::ServerConfig { .. } => ControlResponse::Error {
             message: "server_config passthrough is not implemented yet".to_string(),
         },
         ControlRequest::Spawn(spawn) => {
-            spawn_session(&supervisor, bind, persist_traces, spawn).await
+            spawn_session(&supervisor, bind, persist_traces, *spawn).await
         }
     }
 }
@@ -120,6 +129,11 @@ async fn spawn_session(
         trace_path: persist_traces.then(crate::default_trace_path),
         app_server: spawn.app_server,
         model: spawn.model,
+        workspace: spawn.workspace.map(PathBuf::from),
+        branch: spawn.branch,
+        create_worktree: spawn.create_worktree,
+        worktree: spawn.worktree.map(PathBuf::from),
+        base_branch: spawn.base_branch,
     };
     match supervisor.spawn_session(spec).await {
         Ok(summary) => ControlResponse::Spawned(summary),
@@ -158,6 +172,11 @@ fn spawn_control_listener(supervisor: Arc<DaemonSupervisor>, bind: IpAddr, persi
                     name,
                     app_server,
                     model,
+                    workspace,
+                    branch,
+                    create_worktree,
+                    worktree,
+                    base_branch,
                 }) => {
                     let cwd = cwd.map_or_else(
                         || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -176,6 +195,11 @@ fn spawn_control_listener(supervisor: Arc<DaemonSupervisor>, bind: IpAddr, persi
                         trace_path: persist_traces.then(crate::default_trace_path),
                         app_server,
                         model,
+                        workspace: workspace.map(PathBuf::from),
+                        branch,
+                        create_worktree,
+                        worktree: worktree.map(PathBuf::from),
+                        base_branch,
                     };
                     let supervisor = Arc::clone(&supervisor);
                     tokio::spawn(async move {
@@ -189,6 +213,26 @@ fn spawn_control_listener(supervisor: Arc<DaemonSupervisor>, bind: IpAddr, persi
                         }
                     });
                 }
+                Ok(ServerCommand::CreateWorkspace { name }) => {
+                    let supervisor = Arc::clone(&supervisor);
+                    tokio::spawn(async move {
+                        match DaemonSupervisor::create_workspace(&name) {
+                            Ok(path) => {
+                                tracing::info!(path = %path.display(), "created workspace via control channel");
+                                // Re-advertise so the new workspace appears in the
+                                // console's pickers immediately.
+                                if let Err(err) =
+                                    supervisor.refresh_workspaces(control_metadata()).await
+                                {
+                                    tracing::warn!(error = %err, "workspace created but re-advertise failed");
+                                }
+                            }
+                            Err(err) => {
+                                tracing::error!(error = %err, "create workspace failed");
+                            }
+                        }
+                    });
+                }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -196,7 +240,8 @@ fn spawn_control_listener(supervisor: Arc<DaemonSupervisor>, bind: IpAddr, persi
     });
 }
 
-/// Metadata advertised to the control plane so the UI can label this daemon.
+/// Metadata advertised to the control plane so the UI can label this daemon and
+/// populate its workspace/branch pickers.
 fn control_metadata() -> Value {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -206,7 +251,24 @@ fn control_metadata() -> Value {
         "pid": std::process::id(),
         "cwd": cwd,
         "agents": ["claude", "codex", "gemini"],
+        "workspaces": advertised_workspaces(),
     })
+}
+
+/// Detects each allowed workspace root, yielding the classified info (path, kind,
+/// branches, worktrees) the console uses to drive its spawn pickers.
+fn advertised_workspaces() -> Vec<Value> {
+    crate::config::ConfigStore::default()
+        .workspace_roots()
+        .unwrap_or_default()
+        .iter()
+        .map(|root| {
+            crate::workspace::detect(root)
+                .ok()
+                .and_then(|ws| serde_json::to_value(&ws).ok())
+                .unwrap_or_else(|| json!({ "path": root, "kind": "plain" }))
+        })
+        .collect()
 }
 
 /// Best-effort host name: `HOSTNAME`/`HOST` env, else the `hostname` command,

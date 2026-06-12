@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -34,6 +34,7 @@ use crate::review::{ReviewDecision, ReviewEvent, ReviewItem, ReviewPhase, Review
 use crate::session::omniagent_data_dir;
 use crate::upload::{self, UploadConfig, UploadedArtifact};
 use crate::worker::WorkerHandle;
+use crate::workspace::{self, WorktreeMode};
 use crate::{proxy, start_proxy};
 
 /// Default PTY geometry for a spawned agent.
@@ -78,6 +79,16 @@ pub struct SessionSpec {
     pub app_server: bool,
     /// Optional model override passed to codex's `thread/start`.
     pub model: Option<String>,
+    /// Allowed workspace root the agent runs under (preferred over `cwd`).
+    pub workspace: Option<PathBuf>,
+    /// Branch to use, or the new branch name when creating a worktree.
+    pub branch: Option<String>,
+    /// Create (or reuse) an isolated `git worktree` for `branch`.
+    pub create_worktree: bool,
+    /// Spawn in this existing linked worktree.
+    pub worktree: Option<PathBuf>,
+    /// Base ref a newly-created worktree branches from.
+    pub base_branch: Option<String>,
 }
 
 /// A snapshot of a live session for control-plane listing.
@@ -116,6 +127,26 @@ pub struct DaemonSupervisor {
     upload: UploadConfig,
     /// Whether spawns are confined to the allowed-workspaces allowlist.
     policy: WorkspacePolicy,
+    /// The daemon's control channel, once registered with the control plane. Used
+    /// to re-advertise the workspace allowlist after the CLI edits it.
+    control: Mutex<Option<crate::client::ControlChannelHandle>>,
+}
+
+/// Validates a control-panel-supplied workspace name as a single safe path
+/// component, rejecting empties, separators, and `.`/`..` so creation can never
+/// escape `<data dir>/workspaces/`.
+fn sanitized_workspace_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        bail!("workspace name is empty");
+    }
+    let mut components = Path::new(trimmed).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(part)), None) => {
+            Ok(part.to_string_lossy().into_owned())
+        }
+        _ => bail!("workspace name must be a single path component: {trimmed:?}"),
+    }
 }
 
 /// Final argv for a PTY-spawned agent: claude gets a `--session-id` injected so
@@ -137,6 +168,62 @@ fn pty_spawn_argv(
     (argv, id)
 }
 
+/// Picks the worktree resolution mode from a spec: an explicit existing
+/// worktree wins, then an isolated-worktree request (defaulting the branch name
+/// when unset), otherwise spawn in place.
+fn select_mode(spec: &SessionSpec) -> WorktreeMode {
+    if let Some(path) = &spec.worktree {
+        return WorktreeMode::Existing(path.clone());
+    }
+    if spec.create_worktree {
+        let branch = spec
+            .branch
+            .clone()
+            .filter(|b| !b.trim().is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "omniagent/{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..8]
+                )
+            });
+        return WorktreeMode::Create {
+            branch,
+            base: spec.base_branch.clone().filter(|b| !b.trim().is_empty()),
+        };
+    }
+    WorktreeMode::InPlace
+}
+
+/// Builds the session metadata map registered with the control plane: backend
+/// kind, model, and the resolved workspace/branch/worktree for the console.
+fn session_metadata(
+    spec: &SessionSpec,
+    resolved: &workspace::ResolvedWorkspace,
+    codex_native: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut metadata = serde_json::Map::new();
+    if codex_native {
+        metadata.insert("kind".to_string(), json!("codex-app-server"));
+    }
+    if let Some(model) = &spec.model {
+        metadata.insert("model".to_string(), json!(model));
+    }
+    metadata.insert(
+        "workspace".to_string(),
+        json!(resolved.origin_root.display().to_string()),
+    );
+    if let Some(branch) = &spec.branch {
+        metadata.insert("branch".to_string(), json!(branch));
+    }
+    if let Some(worktree) = &resolved.created_worktree {
+        metadata.insert(
+            "worktree".to_string(),
+            json!(worktree.display().to_string()),
+        );
+    }
+    metadata
+}
+
 impl DaemonSupervisor {
     /// Start the supervisor; the socket connects in the background.
     #[must_use]
@@ -151,6 +238,7 @@ impl DaemonSupervisor {
             idle: Arc::new(Notify::new()),
             upload,
             policy,
+            control: Mutex::new(None),
         }
     }
 
@@ -159,35 +247,81 @@ impl DaemonSupervisor {
         &self,
         metadata: serde_json::Value,
     ) -> Result<crate::client::ControlChannelHandle> {
-        self.socket.handle().open_control_channel(metadata).await
+        let handle = self.socket.handle().open_control_channel(metadata).await?;
+        *self.control.lock().expect("control lock") = Some(handle.clone());
+        Ok(handle)
     }
 
-    /// Enforces the allowed-workspaces policy for a spawn `cwd`.
+    /// Re-advertise the daemon's workspace allowlist (and other metadata) to the
+    /// control plane after the CLI edited it, so the console's pickers update
+    /// without a daemon restart. Errors if the control channel isn't registered
+    /// yet (the new allowlist still applies on the next (re)registration).
+    pub async fn refresh_workspaces(&self, metadata: serde_json::Value) -> Result<()> {
+        let handle = self.control.lock().expect("control lock").clone();
+        let handle = handle.ok_or_else(|| {
+            anyhow!("daemon is not registered with the control plane yet; allowlist applies on connect")
+        })?;
+        handle.refresh_metadata(metadata).await
+    }
+
+    /// Create a new project workspace under the local data dir
+    /// (`<data dir>/workspaces/<name>`), initialize it as a git repo, and add it
+    /// to the allowlist. Returns the created (canonical) path. Driven by the
+    /// control panel via the `create_workspace` command; the caller re-advertises
+    /// the updated allowlist afterward.
+    pub fn create_workspace(name: &str) -> Result<PathBuf> {
+        let name = sanitized_workspace_name(name)?;
+        let root = omniagent_data_dir().join("workspaces").join(&name);
+        if root.exists() {
+            bail!("workspace {} already exists", root.display());
+        }
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("failed to create workspace {}", root.display()))?;
+        // Default to a git repo so worktree-based sessions work out of the box.
+        crate::git::git(&root, &["init"])
+            .ok_or_else(|| anyhow!("git init failed in {}", root.display()))?;
+        ConfigStore::default().add_workspace(&root)
+    }
+
+    /// Enforces the allowed-workspaces policy by the resolved **origin repo**.
     ///
-    /// Under [`WorkspacePolicy::Restricted`], the canonicalized cwd must fall
-    /// within a configured allowed workspace (an empty allowlist denies all).
-    fn authorize_workspace(&self, cwd: &Path) -> Result<()> {
+    /// Under [`WorkspacePolicy::Restricted`], the origin root must fall within a
+    /// configured allowed workspace (an empty allowlist denies all). Auto-created
+    /// worktrees live outside the allowlist but authorize via their origin repo.
+    fn authorize_workspace(&self, origin_root: &Path) -> Result<()> {
         if self.policy == WorkspacePolicy::FullAccess {
             return Ok(());
         }
-        let canonical = std::fs::canonicalize(cwd)
-            .with_context(|| format!("cannot resolve cwd {}", cwd.display()))?;
         let roots = ConfigStore::default().workspace_roots()?;
-        if path_within_roots(&canonical, &roots) {
+        if path_within_roots(origin_root, &roots) {
             Ok(())
         } else {
             Err(anyhow!(
-                "cwd {0} is not an allowed workspace — add it with `omniagent workspaces add {0}` or run the daemon with --full-access",
-                canonical.display()
+                "{0} is not an allowed workspace — add it with `omniagent workspaces add {0}` or run the daemon with --full-access",
+                origin_root.display()
             ))
         }
+    }
+
+    /// Resolves a spec's workspace selection to an effective cwd: authorizes by
+    /// the origin repo first, then performs any side-effecting `git worktree
+    /// add`. Mutates `spec.cwd` to the resolved directory.
+    fn resolve_workspace(&self, spec: &mut SessionSpec) -> Result<workspace::ResolvedWorkspace> {
+        let root = spec.workspace.clone().unwrap_or_else(|| spec.cwd.clone());
+        let mode = select_mode(spec);
+        let origin = workspace::resolve_origin(&root)
+            .with_context(|| format!("cannot resolve workspace {}", root.display()))?;
+        self.authorize_workspace(&origin)?;
+        let resolved = workspace::resolve(&root, &mode)?;
+        spec.cwd.clone_from(&resolved.cwd);
+        Ok(resolved)
     }
 
     /// Launch a new session: register with the server, start its proxy, spawn the
     /// agent, and wire up the bidirectional bridges. Returns once the server has
     /// confirmed the registration.
-    pub async fn spawn_session(&self, spec: SessionSpec) -> Result<SessionSummary> {
-        self.authorize_workspace(&spec.cwd)?;
+    pub async fn spawn_session(&self, mut spec: SessionSpec) -> Result<SessionSummary> {
+        let resolved = self.resolve_workspace(&mut spec)?;
 
         let handle = self.socket.handle();
         let cwd_string = spec.cwd.display().to_string();
@@ -202,13 +336,7 @@ impl DaemonSupervisor {
         let agent_commands = ConfigStore::default().agent_commands().unwrap_or_default();
         let resolved_argv = agents::launch_argv(&spec.agent, &spec.custom_command, &agent_commands);
 
-        let mut metadata = serde_json::Map::new();
-        if codex_native {
-            metadata.insert("kind".to_string(), json!("codex-app-server"));
-        }
-        if let Some(model) = &spec.model {
-            metadata.insert("model".to_string(), json!(model));
-        }
+        let metadata = session_metadata(&spec, &resolved, codex_native);
 
         let opened = handle
             .open_session(RegisterSessionRequest {
@@ -304,6 +432,8 @@ impl DaemonSupervisor {
             cwd: spec.cwd.clone(),
             native_session_id,
             started_at,
+            created_worktree: resolved.created_worktree.clone(),
+            origin_root: resolved.origin_root.clone(),
         };
         tokio::spawn(async move {
             let exit_code = worker.wait_exit().await;
@@ -423,6 +553,10 @@ struct FinalizeCtx {
     native_session_id: Option<String>,
     /// When the agent was spawned — bounds native-log discovery by recency.
     started_at: SystemTime,
+    /// An auto-created worktree to prune on close, if any.
+    created_worktree: Option<PathBuf>,
+    /// Origin repo the worktree belongs to (the `git worktree remove` anchor).
+    origin_root: PathBuf,
 }
 
 /// Finalizes recordings, uploads artifacts, and emits the `session_close`
@@ -536,6 +670,12 @@ async fn finalize_session(ctx: FinalizeCtx, exit_code: i32) {
     });
     if let Err(err) = ctx.channel.send_now("session_close", payload).await {
         tracing::debug!(error = %err, "session_close not delivered (socket down)");
+    }
+
+    // Prune an auto-created worktree last — after all artifacts (including the
+    // native session log living under it) have been collected above.
+    if let Some(worktree) = &ctx.created_worktree {
+        workspace::remove_worktree(&ctx.origin_root, worktree);
     }
 }
 
@@ -712,6 +852,7 @@ fn spawn_command_bridge(channel: &ChannelHandle, worker: WorkerHandle, workspace
                 // codex command bridge) or not applicable to a PTY session.
                 ServerCommand::ReviewDecision { .. }
                 | ServerCommand::SpawnAgent { .. }
+                | ServerCommand::CreateWorkspace { .. }
                 | ServerCommand::CodexInput { .. }
                 | ServerCommand::CodexInterrupt => {}
                 file_or_diff_or_dir => {
@@ -943,6 +1084,7 @@ fn spawn_codex_command_bridge(
                 // or not applicable to a codex session.
                 ServerCommand::ReviewDecision { .. }
                 | ServerCommand::SpawnAgent { .. }
+                | ServerCommand::CreateWorkspace { .. }
                 | ServerCommand::PtyInput { .. }
                 | ServerCommand::PtyResize { .. } => {}
                 file_or_diff_or_dir => {
@@ -951,4 +1093,21 @@ fn spawn_codex_command_bridge(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitized_workspace_name;
+
+    #[test]
+    fn accepts_a_plain_name_and_trims_it() {
+        assert_eq!(sanitized_workspace_name("  my-project  ").unwrap(), "my-project");
+    }
+
+    #[test]
+    fn rejects_empty_separators_and_traversal() {
+        for bad in ["", "  ", ".", "..", "a/b", "/abs", "../escape", "foo/../bar"] {
+            assert!(sanitized_workspace_name(bad).is_err(), "should reject {bad:?}");
+        }
+    }
 }

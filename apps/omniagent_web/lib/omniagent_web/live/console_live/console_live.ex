@@ -46,9 +46,15 @@ defmodule OmniagentWeb.ConsoleLive do
      |> assign(:dir_loading, false)
      |> assign(:dir_error, nil)
      |> assign(:show_new_agent, false)
+     |> assign(:new_agent_daemon, nil)
+     |> assign(:new_agent_workspace, nil)
+     |> assign(:new_agent_mode, "in_place")
+     |> assign(:show_new_workspace, false)
+     |> assign(:new_workspace_daemon, nil)
+     |> assign(:sessions_collapsed, true)
      |> assign(:sidebar_collapsed, false)
      |> assign(:right_collapsed, false)
-     |> assign(:left_w, 288)
+     |> assign(:left_w, 312)
      |> assign(:right_w, 384)
      |> assign(:term_pct, 62)
      |> assign(:pending_focus, false)
@@ -137,6 +143,7 @@ defmodule OmniagentWeb.ConsoleLive do
       socket
       |> assign_bool_pref(:sidebar_collapsed, prefs["sidebar_collapsed"])
       |> assign_bool_pref(:right_collapsed, prefs["right_collapsed"])
+      |> assign_bool_pref(:sessions_collapsed, prefs["sessions_collapsed"])
       |> assign_num_pref(:left_w, prefs["left_w"], 180, 520)
       |> assign_num_pref(:right_w, prefs["right_w"], 240, 600)
       |> assign_num_pref(:term_pct, prefs["term_pct"], 20, 85)
@@ -231,14 +238,35 @@ defmodule OmniagentWeb.ConsoleLive do
     end
   end
 
-  # ── New-agent modal (create via daemon) ─────────────────────────────────────
+  # ── New-agent modal (launched from a workspace) ─────────────────────────────
 
-  def handle_event("open_new_agent", _params, socket) do
-    {:noreply, assign(socket, :daemons, Daemons.list()) |> assign(:show_new_agent, true)}
+  # Collapse/expand the "Sessions" panel (inactive + unmatched sessions). Default
+  # collapsed; persisted.
+  def handle_event("toggle_sessions", _params, socket) do
+    {:noreply,
+     socket |> assign(:sessions_collapsed, not socket.assigns.sessions_collapsed) |> save_prefs()}
+  end
+
+  # Open the agent modal pre-scoped to a specific daemon + workspace.
+  def handle_event("launch_workspace", %{"daemon_id" => daemon_id, "path" => path}, socket) do
+    {:noreply,
+     socket
+     |> assign(:daemons, Daemons.list())
+     |> assign(:show_new_agent, true)
+     |> assign(:new_agent_daemon, daemon_id)
+     |> assign(:new_agent_workspace, path)
+     |> assign(:new_agent_mode, "in_place")}
   end
 
   def handle_event("close_new_agent", _params, socket) do
     {:noreply, assign(socket, :show_new_agent, false)}
+  end
+
+  # Keeps the modal's worktree sub-pickers in sync as the user changes the
+  # worktree mode. Daemon + workspace are fixed (hidden inputs) once launched.
+  def handle_event("new_agent_change", params, socket) do
+    {:noreply,
+     assign(socket, :new_agent_mode, params["worktree_mode"] || socket.assigns.new_agent_mode)}
   end
 
   def handle_event("create_agent", params, socket) do
@@ -260,10 +288,12 @@ defmodule OmniagentWeb.ConsoleLive do
       true ->
         payload =
           %{"agent" => agent, "custom_command" => extra}
+          |> put_present("workspace", params["workspace"])
           |> put_present("cwd", params["cwd"])
           |> put_present("name", params["name"])
           |> put_present("model", params["model"])
           |> put_app_server(app_server?)
+          |> apply_worktree(params["worktree_mode"], params)
 
         case Daemons.spawn_agent(daemon_id, payload) do
           :ok ->
@@ -272,6 +302,50 @@ defmodule OmniagentWeb.ConsoleLive do
              |> assign(:show_new_agent, false)
              |> assign(:pending_focus, true)
              |> put_flash(:info, "Starting #{Enum.join([agent | extra], " ")}…")}
+
+          {:error, :offline} ->
+            {:noreply, put_flash(socket, :error, "That daemon is no longer connected.")}
+        end
+    end
+  end
+
+  # ── New-workspace modal (create a git repo via daemon) ──────────────────────
+
+  def handle_event("open_new_workspace", params, socket) do
+    daemons = Daemons.list()
+    daemon_id = params["daemon_id"] || (List.first(daemons) || %{}) |> Map.get(:id)
+
+    {:noreply,
+     socket
+     |> assign(:daemons, daemons)
+     |> assign(:show_new_workspace, true)
+     |> assign(:new_workspace_daemon, daemon_id)}
+  end
+
+  def handle_event("close_new_workspace", _params, socket) do
+    {:noreply, assign(socket, :show_new_workspace, false)}
+  end
+
+  def handle_event("create_workspace", params, socket) do
+    %{"daemon_id" => daemon_id, "name" => name} = params
+    name = String.trim(name || "")
+
+    cond do
+      daemon_id in [nil, ""] ->
+        {:noreply, put_flash(socket, :error, "Pick a daemon to create the workspace on.")}
+
+      name == "" ->
+        {:noreply, put_flash(socket, :error, "Enter a workspace name.")}
+
+      true ->
+        # The daemon creates the workspace asynchronously and re-advertises its
+        # metadata; the resulting {:daemons_updated} refreshes the pickers.
+        case Daemons.create_workspace(daemon_id, %{"name" => name}) do
+          :ok ->
+            {:noreply,
+             socket
+             |> assign(:show_new_workspace, false)
+             |> put_flash(:info, "Creating workspace #{name}…")}
 
           {:error, :offline} ->
             {:noreply, put_flash(socket, :error, "That daemon is no longer connected.")}
@@ -521,7 +595,8 @@ defmodule OmniagentWeb.ConsoleLive do
       right_tab: socket.assigns.right_tab,
       left_w: socket.assigns.left_w,
       right_w: socket.assigns.right_w,
-      term_pct: socket.assigns.term_pct
+      term_pct: socket.assigns.term_pct,
+      sessions_collapsed: socket.assigns.sessions_collapsed
     })
   end
 
@@ -620,6 +695,137 @@ defmodule OmniagentWeb.ConsoleLive do
   # agents.
   defp put_app_server(map, true), do: Map.put(map, "app_server", true)
   defp put_app_server(map, _value), do: map
+
+  # Folds the chosen worktree mode into the spawn payload: "create" requests an
+  # isolated worktree (optionally for a named branch off a base); "existing"
+  # reuses a linked worktree; anything else spawns in place.
+  defp apply_worktree(map, "create", params) do
+    map
+    |> Map.put("create_worktree", true)
+    |> put_present("branch", params["branch"])
+    |> put_present("base_branch", params["base_branch"])
+  end
+
+  defp apply_worktree(map, "existing", params),
+    do: put_present(map, "worktree", params["worktree"])
+
+  defp apply_worktree(map, _mode, _params), do: map
+
+  # ── New-agent workspace pickers (data from daemon-advertised metadata) ───────
+
+  @doc false
+  def daemon_by_id(_daemons, nil), do: nil
+  def daemon_by_id(daemons, id), do: Enum.find(daemons, &(&1.id == id))
+
+  # "hostname:pid" label for a daemon (just the hostname when no pid advertised).
+  @doc false
+  def daemon_label(daemon) do
+    host = daemon.metadata["hostname"] || "daemon"
+
+    case daemon.metadata["pid"] do
+      nil -> host
+      pid -> "#{host}:#{pid}"
+    end
+  end
+
+  @doc false
+  def daemon_workspaces(nil), do: []
+  def daemon_workspaces(daemon), do: daemon.metadata["workspaces"] || []
+
+  @doc false
+  def workspace_by_path(daemon, path) do
+    daemon |> daemon_workspaces() |> Enum.find(&(&1["path"] == path))
+  end
+
+  # Git details for a workspace map (`nil` for plain dirs / older daemons).
+  @doc false
+  def workspace_git(nil), do: nil
+  def workspace_git(ws), do: ws["git"]
+
+  # The sidebar shows a workspace by its trailing segment (the project name) — the
+  # meaningful suffix — with the full path in a tooltip.
+  @doc false
+  def workspace_label(path) when is_binary(path) do
+    case Path.basename(path) do
+      "" -> path
+      base -> base
+    end
+  end
+
+  def workspace_label(path), do: path
+
+  # Inactive = ended sessions (exited or offline), treated alike. They collect in
+  # the collapsible "Sessions" panel rather than under their workspace.
+  @inactive_statuses ~w(exited offline)
+
+  @doc false
+  def active?(session), do: session.status not in @inactive_statuses
+
+  # Active sessions launched against a given workspace root (matched on the origin
+  # repo path recorded in session metadata at spawn). These nest under the
+  # workspace in the tree.
+  @doc false
+  def workspace_sessions(sessions, path) do
+    Enum.filter(sessions, &(active?(&1) and &1.metadata["workspace"] == path))
+  end
+
+  # The "Sessions" panel: everything not nested live under a visible workspace —
+  # all inactive (exited/offline) sessions plus any active session whose workspace
+  # isn't advertised by a connected daemon. Kept reachable but tucked away.
+  @doc false
+  def panel_sessions(sessions, daemons) do
+    paths = for d <- daemons, ws <- daemon_workspaces(d), into: MapSet.new(), do: ws["path"]
+
+    Enum.reject(sessions, fn session ->
+      active?(session) and MapSet.member?(paths, session.metadata["workspace"])
+    end)
+  end
+
+  # Footer identity. Auth is admin-session based, so fall back to "admin" when no
+  # user row is resolved.
+  @doc false
+  def user_label(nil), do: "admin"
+  def user_label(user), do: user.email || "admin"
+
+  @doc false
+  def user_initial(user) do
+    (user |> user_label() |> String.first() || "a") |> String.upcase()
+  end
+
+  # A single session entry in the sidebar. `compact` renders the subordinate form
+  # nested under a workspace (no argv line); the full form is used standalone.
+  attr :session, :map, required: true
+  attr :active_id, :string, default: nil
+  attr :compact, :boolean, default: false
+
+  def session_row(assigns) do
+    ~H"""
+    <.link
+      patch={~p"/sessions/#{@session.id}"}
+      class={[
+        "block rounded-md transition-colors",
+        (@compact && "px-2 py-1") || "px-3 py-2",
+        @active_id == @session.id && "bg-[var(--accent-soft)]",
+        @active_id != @session.id && "hover:bg-[var(--panel-2)]"
+      ]}
+    >
+      <div class="flex items-center gap-1.5">
+        <.icon name="hero-command-line-micro" class="size-3.5 flex-none text-[var(--faint)]" />
+        <span class={[
+          "truncate text-[var(--text)]",
+          (@compact && "text-[12px]") || "text-sm"
+        ]}>
+          {@session.name || @session.id}
+        </span>
+      </div>
+      <%= unless @compact do %>
+        <div class="mt-1 truncate pl-4 font-mono text-[11px] text-[var(--faint)]">
+          {Enum.join(@session.argv || [], " ")}
+        </div>
+      <% end %>
+    </.link>
+    """
+  end
 
   # Shell-aware argv split (honours quotes); falls back to whitespace on any
   # malformed input (e.g. an unbalanced quote) rather than raising.

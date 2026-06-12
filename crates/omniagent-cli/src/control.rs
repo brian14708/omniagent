@@ -26,11 +26,15 @@ pub enum ControlRequest {
     /// Health check.
     Ping,
     /// Launch a new session.
-    Spawn(SpawnRequest),
+    Spawn(Box<SpawnRequest>),
     /// List live sessions.
     List,
     /// Stop a session by server session id.
     Stop { session_id: String },
+    /// Re-advertise the daemon's workspace allowlist to the control plane after
+    /// the CLI has edited it (e.g. `workspaces add`), so the console's pickers
+    /// update without a daemon restart.
+    RefreshWorkspaces,
     /// Reserved: relay a server-configuration call through the daemon.
     ServerConfig { payload: serde_json::Value },
 }
@@ -61,6 +65,21 @@ pub struct SpawnRequest {
     /// Optional model override passed to `codex app-server` `thread/start`.
     #[serde(default)]
     pub model: Option<String>,
+    /// Allowed workspace root the agent runs under (preferred over `cwd`).
+    #[serde(default)]
+    pub workspace: Option<String>,
+    /// Branch to use, or the new branch name when creating a worktree.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Create (or reuse) an isolated `git worktree` for `branch`.
+    #[serde(default)]
+    pub create_worktree: bool,
+    /// Spawn in this existing linked worktree.
+    #[serde(default)]
+    pub worktree: Option<String>,
+    /// Base ref a newly-created worktree branches from.
+    #[serde(default)]
+    pub base_branch: Option<String>,
 }
 
 /// A response from the daemon to the CLI.
@@ -71,6 +90,7 @@ pub enum ControlResponse {
     Spawned(SessionSummary),
     Sessions(Vec<SessionSummary>),
     Stopped { found: bool },
+    WorkspacesRefreshed,
     Error { message: String },
 }
 

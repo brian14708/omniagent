@@ -44,4 +44,21 @@ defmodule OmniagentWeb.DaemonChannelTest do
   test "spawn_agent on an unknown daemon reports offline" do
     assert {:error, :offline} = Daemons.spawn_agent("nope", %{"agent" => "claude"})
   end
+
+  test "relays a create_workspace command to the daemon", %{
+    socket: socket,
+    daemon_id: daemon_id
+  } do
+    {:ok, _reply, channel} = subscribe_and_join(socket, DaemonChannel, "daemon:#{daemon_id}", %{})
+
+    ref = push(channel, "daemon_register", %{"hostname" => "testhost", "agents" => ["claude"]})
+    assert_reply(ref, :ok, %{daemon_id: ^daemon_id})
+
+    assert :ok = Daemons.create_workspace(daemon_id, %{"name" => "my-project"})
+    assert_push("create_workspace", %{"name" => "my-project"})
+  end
+
+  test "create_workspace on an unknown daemon reports offline" do
+    assert {:error, :offline} = Daemons.create_workspace("nope", %{"name" => "x"})
+  end
 end

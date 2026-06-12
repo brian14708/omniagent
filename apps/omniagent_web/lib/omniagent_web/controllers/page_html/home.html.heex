@@ -3,7 +3,7 @@
 <header class="oa-topbar sticky top-0 z-40 px-6 py-3">
   <div class="mx-auto flex max-w-6xl items-center justify-between gap-4">
     <a href={~p"/"} class="flex items-center gap-3">
-      <img src={~p"/favicon.svg"} alt="" class="oa-logo" />
+      <img src={~p"/logo.svg"} alt="" class="oa-logo" />
       <Layouts.wordmark />
     </a>
     <div class="flex items-center gap-2.5">
@@ -72,30 +72,25 @@
     <ol class="space-y-5">
       <li>
         <p class="text-[13px] leading-relaxed text-[var(--dim)]">
-          <span class="text-[var(--text)]">1. Authenticate</span> against this
-          console with a long-lived API token.
+          <span class="text-[var(--text)]">1. Run setup.</span> It saves your
+          console credentials and allows the workspaces the daemon may run agents
+          under — point it at <code class="text-[var(--accent)]">{url(~p"/")}</code>.
         </p>
-        <pre class="oa-pre mt-2 text-[12px]"><span class="text-[var(--faint)]">$ </span>omniagent login --server-url {url(~p"/")} <span class="text-[var(--accent)]">--token</span> &lt;API token&gt;</pre>
+        <pre class="oa-pre mt-2 text-[12px]"><span class="text-[var(--faint)]">$ </span>omniagent setup</pre>
       </li>
       <li>
         <p class="text-[13px] leading-relaxed text-[var(--dim)]">
-          <span class="text-[var(--text)]">2. Allow a workspace</span> the daemon
-          may run agents under.
-        </p>
-        <pre class="oa-pre mt-2 text-[12px]"><span class="text-[var(--faint)]">$ </span>omniagent workspaces add /path/to/your/project</pre>
-      </li>
-      <li>
-        <p class="text-[13px] leading-relaxed text-[var(--dim)]">
-          <span class="text-[var(--text)]">3. Start the daemon.</span> It connects
+          <span class="text-[var(--text)]">2. Start the daemon.</span> It connects
           out to this console and waits for sessions to spawn.
         </p>
         <pre class="oa-pre mt-2 text-[12px]"><span class="text-[var(--faint)]">$ </span>omniagent daemon</pre>
       </li>
       <li>
         <p class="text-[13px] leading-relaxed text-[var(--dim)]">
-          <span class="text-[var(--text)]">4. Start a session</span> from the
-          console — terminal, trace, and review events stream over a single
-          outbound WebSocket, while provider keys never leave your machine.
+          <span class="text-[var(--text)]">3. Start a session</span> from the
+          console — pick a workspace and an isolated git worktree, and terminal,
+          trace, and review events stream over a single outbound WebSocket while
+          provider keys never leave your machine.
         </p>
         <div class="mt-3">
           <%= if @logged_in do %>

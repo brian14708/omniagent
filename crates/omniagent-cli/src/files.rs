@@ -5,9 +5,10 @@
 //! within the root. This blocks `..` traversal and symlink escapes.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::Serialize;
+
+use crate::git::git;
 
 /// Largest file the viewer will return inline.
 const MAX_FILE_BYTES: u64 = 512 * 1024;
@@ -160,19 +161,6 @@ fn git_file_diff(root: &Path, path: &str) -> Option<String> {
     // worktree diff for repos without a HEAD commit yet.
     let head = git(root, &["diff", "HEAD", "--", path]).filter(|d| !d.trim().is_empty());
     head.or_else(|| git(root, &["diff", "--", path]))
-}
-
-fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(test)]

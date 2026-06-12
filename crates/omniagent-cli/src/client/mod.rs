@@ -129,11 +129,38 @@ pub fn decode_command(event: &str, payload: &Value) -> Option<ServerCommand> {
                 .get("model")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            workspace: payload
+                .get("workspace")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            branch: payload
+                .get("branch")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            create_worktree: payload
+                .get("create_worktree")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            worktree: payload
+                .get("worktree")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            base_branch: payload
+                .get("base_branch")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         }),
         "codex_input" => Some(ServerCommand::CodexInput {
             text: payload.get("text")?.as_str()?.to_string(),
         }),
         "codex_interrupt" => Some(ServerCommand::CodexInterrupt),
+        "create_workspace" => Some(ServerCommand::CreateWorkspace {
+            name: payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }),
         _ => None,
     }
 }

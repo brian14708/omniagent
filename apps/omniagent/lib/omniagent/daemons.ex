@@ -60,6 +60,23 @@ defmodule Omniagent.Daemons do
     end
   end
 
+  @doc """
+  Ask `daemon_id` to create a new project workspace. `params` is a map with
+  `name`; the daemon creates it under its local data dir, git-inits it, adds it
+  to its allowed-workspaces allowlist, and re-advertises its metadata (so the
+  new workspace appears in the pickers). Returns `:ok` or `{:error, :offline}`.
+  """
+  def create_workspace(daemon_id, params) do
+    case :pg.get_members(@pg, {:daemon, daemon_id}) do
+      [] ->
+        {:error, :offline}
+
+      [pid | _] ->
+        send(pid, {:daemon_command, "create_workspace", params})
+        :ok
+    end
+  end
+
   @impl true
   def init(_state) do
     :net_kernel.monitor_nodes(true)
