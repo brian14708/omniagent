@@ -106,6 +106,12 @@ defmodule Omniagent.Sessions do
       nil ->
         {:error, :not_found}
 
+      # "exited" is a terminal state: the agent finished cleanly. A later generic
+      # "offline" write — the disconnect reaper firing after the clean exit — must
+      # not downgrade it, so exited takes precedence over offline.
+      %AgentSession{status: "exited"} = session when status == "offline" ->
+        {:ok, session}
+
       session ->
         update_session(session, %{
           status: status,

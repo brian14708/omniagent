@@ -3,9 +3,9 @@
 //! local control socket and a resilient control-plane connection.
 //!
 //! Each agent runs in a PTY with its `*_BASE_URL` env vars pointed at a local
-//! recording proxy. The CLI is daemon-centric: run `omniagent daemon`, then
-//! `run`/`stop`/`sessions` to drive it and `workspaces` to bound where it may
-//! spawn agents.
+//! recording proxy. The CLI is daemon-centric: run `omniagent setup` once, then
+//! `omniagent daemon`; use `stop`/`sessions` to drive it and `workspaces` to
+//! bound where it may spawn agents.
 
 mod agent;
 mod agent_log;
@@ -18,14 +18,17 @@ mod config;
 mod control;
 mod daemon;
 mod files;
+mod git;
 mod protocol;
 mod proxy;
 mod record;
 mod review;
+mod service;
 mod session;
 mod sse;
 mod upload;
 mod worker;
+mod workspace;
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -89,6 +92,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Interactive first-run setup: save credentials and allow workspaces.
+    Setup(SetupArgs),
     /// Store `OmniAgent` control-plane credentials the daemon connects with.
     Login(LoginArgs),
     /// Run the persistent daemon: host many sessions over one resilient
@@ -100,6 +105,8 @@ enum Command {
     Sessions(SessionsArgs),
     /// Manage the allowed workspaces the daemon may spawn agents under.
     Workspaces(WorkspacesArgs),
+    /// Install or remove omniagent as a background service (systemd/launchd).
+    Service(ServiceArgs),
     /// Remove the omniagent binary and (by default) its config and data.
     Uninstall(UninstallArgs),
 }
@@ -138,6 +145,22 @@ struct LoginArgs {
 }
 
 #[derive(Debug, Args)]
+struct SetupArgs {
+    /// Control-plane URL (skips the prompt).
+    #[arg(long, env = "OMNIAGENT_SERVER_URL")]
+    server_url: Option<String>,
+
+    /// Long-lived CLI API token (skips the prompt).
+    #[arg(long, env = "OMNIAGENT_API_TOKEN", hide = true, hide_env_values = true)]
+    token: Option<String>,
+
+    /// Allow a workspace directory the daemon may spawn agents under (repeatable;
+    /// skips the prompt).
+    #[arg(long = "workspace")]
+    workspaces: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct SessionsArgs {
     #[command(subcommand)]
     command: SessionsCommand,
@@ -163,6 +186,24 @@ enum WorkspacesCommand {
     Remove { path: PathBuf },
     /// List the allowed workspaces.
     List,
+}
+
+#[derive(Debug, Args)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    command: ServiceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Install and start omniagent as a user background service.
+    Install {
+        /// Run the daemon with --full-access (bypass the workspace allowlist).
+        #[arg(long)]
+        full_access: bool,
+    },
+    /// Stop and remove the omniagent background service.
+    Uninstall,
 }
 
 #[derive(Debug, Args)]
@@ -199,11 +240,13 @@ fn init_tracing() {
 async fn run(cli: Cli) -> Result<()> {
     let trace_path = resolve_trace_path(cli.trace_file, cli.no_trace_file);
     match cli.command {
+        Command::Setup(args) => setup(args).await,
         Command::Login(args) => login(args),
         Command::Daemon(args) => run_daemon_cmd(cli.bind, args, trace_path).await,
         Command::Stop(args) => stop_via_daemon(args).await,
         Command::Sessions(args) => sessions(&args).await,
-        Command::Workspaces(args) => workspaces(&args),
+        Command::Workspaces(args) => workspaces(&args).await,
+        Command::Service(args) => service(&args).await,
         Command::Uninstall(args) => uninstall(args).await,
     }
 }
@@ -212,6 +255,128 @@ fn login(args: LoginArgs) -> Result<()> {
     ConfigStore::default().set_credentials(args.server_url.clone(), args.token)?;
     println!("omniagent: saved credentials for {}", args.server_url);
     Ok(())
+}
+
+/// `omniagent setup`: interactive first-run wizard. Saves control-plane
+/// credentials and allows one or more workspaces. Prompts on a TTY; otherwise
+/// requires `--server-url`/`--token` flags.
+async fn setup(args: SetupArgs) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+
+    let store = ConfigStore::default();
+    let interactive = std::io::stdin().is_terminal();
+    let saved = store.credentials()?;
+
+    let server_url = match args.server_url {
+        Some(url) => url,
+        None if interactive => {
+            let default = saved.as_ref().map_or_else(
+                || "http://127.0.0.1:4000".to_string(),
+                |(url, _)| url.clone(),
+            );
+            print!("Control-plane URL [{default}]: ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                default
+            } else {
+                trimmed.to_string()
+            }
+        }
+        None => bail!(
+            "missing OmniAgent control-plane URL; pass --server-url (no terminal for prompts)"
+        ),
+    };
+
+    let token = match args.token {
+        Some(token) => token,
+        None if interactive => {
+            let hint = if saved.is_some() {
+                " [keep current]"
+            } else {
+                ""
+            };
+            println!("Note: the API token is read visibly (it is stored 0600 in the config).");
+            print!("API token{hint}: ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                saved
+                    .as_ref()
+                    .map(|(_, token)| token.clone())
+                    .context("an API token is required")?
+            } else {
+                trimmed.to_string()
+            }
+        }
+        None => bail!("missing OmniAgent API token; pass --token (no terminal for prompts)"),
+    };
+
+    store.set_credentials(server_url.clone(), token)?;
+    println!("omniagent: saved credentials for {server_url}");
+
+    let mut workspaces = args.workspaces;
+    if workspaces.is_empty() && interactive {
+        workspaces = prompt_workspaces()?;
+    }
+
+    for ws in &workspaces {
+        match store.add_workspace(ws) {
+            Ok(canonical) => println!("omniagent: allowed workspace {}", canonical.display()),
+            Err(err) => eprintln!("omniagent: skipped {}: {err:#}", ws.display()),
+        }
+    }
+
+    if store.list_workspaces()?.is_empty() {
+        println!(
+            "omniagent: no workspaces allowed yet — add one with `omniagent workspaces add <dir>`"
+        );
+    }
+    println!("omniagent: setup complete — start the daemon with `omniagent daemon`");
+    if interactive {
+        offer_service_install().await;
+    }
+    Ok(())
+}
+
+/// Interactively collects workspace directories for `setup`, defaulting the
+/// first entry to the current directory and finishing on a blank line or EOF.
+fn prompt_workspaces() -> Result<Vec<PathBuf>> {
+    use std::io::Write;
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    println!("Allow workspaces the daemon may run agents under (blank line to finish):");
+    let mut workspaces = Vec::new();
+    let mut first = true;
+    loop {
+        if first {
+            print!("Workspace directory [{}]: ", cwd.display());
+        } else {
+            print!("Workspace directory (blank to finish): ");
+        }
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input)? == 0 {
+            break;
+        }
+        let trimmed = input.trim();
+        let path = if trimmed.is_empty() {
+            if first {
+                cwd.clone()
+            } else {
+                break;
+            }
+        } else {
+            PathBuf::from(trimmed)
+        };
+        workspaces.push(path);
+        first = false;
+    }
+    Ok(workspaces)
 }
 
 async fn sessions(args: &SessionsArgs) -> Result<()> {
@@ -236,16 +401,18 @@ async fn sessions(args: &SessionsArgs) -> Result<()> {
 }
 
 /// `omniagent workspaces`: manage the daemon's allowed-workspaces allowlist.
-fn workspaces(args: &WorkspacesArgs) -> Result<()> {
+async fn workspaces(args: &WorkspacesArgs) -> Result<()> {
     let store = ConfigStore::default();
     match &args.command {
         WorkspacesCommand::Add { path } => {
             let canonical = store.add_workspace(path)?;
             println!("omniagent: allowed workspace {}", canonical.display());
+            notify_daemon_workspaces().await;
         }
         WorkspacesCommand::Remove { path } => {
             if store.remove_workspace(path)? {
                 println!("omniagent: removed workspace {}", path.display());
+                notify_daemon_workspaces().await;
             } else {
                 println!("omniagent: no matching workspace {}", path.display());
             }
@@ -259,18 +426,50 @@ fn workspaces(args: &WorkspacesArgs) -> Result<()> {
     Ok(())
 }
 
+/// `omniagent service`: install or remove omniagent as a user-level background
+/// service (systemd `--user` on Linux, launchd `LaunchAgent` on macOS).
+async fn service(args: &ServiceArgs) -> Result<()> {
+    match args.command {
+        ServiceCommand::Install { full_access } => service::install(full_access).await,
+        ServiceCommand::Uninstall => service::uninstall().await,
+    }
+}
+
+/// Prompts at the end of `setup` to install the background service. Best-effort:
+/// a declined prompt or a failed install never fails `setup`.
+async fn offer_service_install() {
+    let yes = confirm("Install omniagent as a background service so it starts automatically?")
+        .await
+        .unwrap_or(false);
+    if !yes {
+        return;
+    }
+    if let Err(err) = service::install(false).await {
+        eprintln!("omniagent: could not install service: {err:#}");
+        eprintln!("omniagent: you can retry later with `omniagent service install`");
+    }
+}
+
+/// Best-effort: tell a running daemon to re-advertise its workspace allowlist so
+/// the console's pickers update without a restart. A missing daemon is not an
+/// error — the new allowlist applies the next time the daemon registers.
+async fn notify_daemon_workspaces() {
+    match control::send_request(&ControlRequest::RefreshWorkspaces).await {
+        Ok(ControlResponse::WorkspacesRefreshed) => {
+            println!("omniagent: notified running daemon");
+        }
+        Ok(ControlResponse::Error { message }) => {
+            eprintln!("omniagent: daemon could not refresh workspaces: {message}");
+        }
+        // No running daemon (socket unreachable) or an unexpected reply: nothing
+        // to do — the allowlist takes effect when the daemon next registers.
+        Ok(_) | Err(_) => {}
+    }
+}
+
 /// `omniagent uninstall`: remove the binary and, unless `--keep-data`, the config
 /// (which stores the long-lived API token) and the trace/session data dir.
 async fn uninstall(args: UninstallArgs) -> Result<()> {
-    // Refuse while a daemon is live so we don't pull files out from under it. A
-    // `Pong` reply is the reliable signal; a lingering socket file is not.
-    if matches!(
-        control::send_request(&ControlRequest::Ping).await,
-        Ok(ControlResponse::Pong)
-    ) {
-        bail!("an omniagent daemon is running; stop it (and its sessions) before uninstalling");
-    }
-
     let binary = std::env::current_exe().context("cannot determine the omniagent binary path")?;
     let config_dir = omniagent_config_dir();
     let data_dir = omniagent_data_dir();
@@ -278,6 +477,9 @@ async fn uninstall(args: UninstallArgs) -> Result<()> {
 
     println!("omniagent uninstall will remove:");
     println!("  binary: {}", binary.display());
+    if let Some(unit) = service::unit_path() {
+        println!("  service unit: {}", unit.display());
+    }
     if args.keep_data {
         println!(
             "  keeping config and data (--keep-data); your API token stays in {}",
@@ -294,6 +496,24 @@ async fn uninstall(args: UninstallArgs) -> Result<()> {
     if !args.yes && !confirm("Proceed?").await? {
         println!("omniagent: uninstall cancelled");
         return Ok(());
+    }
+
+    // Remove the background service first: it supervises (and would restart) the
+    // daemon, so tearing it down also stops the daemon it manages.
+    if let Err(err) = service::uninstall().await {
+        eprintln!("omniagent: could not remove service: {err:#}");
+    }
+
+    // Refuse while a daemon is still live (e.g. one started by hand) so we don't
+    // pull files out from under it. A `Pong` reply is the reliable signal; a
+    // lingering socket file is not.
+    if matches!(
+        control::send_request(&ControlRequest::Ping).await,
+        Ok(ControlResponse::Pong)
+    ) {
+        bail!(
+            "an omniagent daemon is still running; stop it (and its sessions) before uninstalling"
+        );
     }
 
     if !args.keep_data {

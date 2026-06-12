@@ -59,7 +59,7 @@ defmodule OmniagentWeb.Layouts do
     <header class="oa-topbar sticky top-0 z-40 px-6 py-3">
       <div class="mx-auto flex max-w-7xl items-center justify-between gap-4">
         <a href="/" class="group flex items-center gap-3">
-          <img src="/favicon.svg" alt="" class="oa-logo" />
+          <img src="/logo.svg" alt="" class="oa-logo" />
           <.wordmark />
         </a>
         <span class="oa-status">console</span>

@@ -162,8 +162,10 @@ struct SessionState {
 
 /// Per-control-channel handshake state.
 struct ControlState {
-    /// Daemon metadata sent on `daemon_register`.
-    metadata: Value,
+    /// Daemon metadata sent on `daemon_register`. Behind a `Mutex` so the daemon
+    /// can re-advertise an updated allowlist (via [`ControlChannelHandle::refresh_metadata`])
+    /// and so reconnect rejoins send the latest snapshot.
+    metadata: Mutex<Value>,
     /// Fulfilled once when the daemon channel is first registered.
     ready: Mutex<Option<oneshot::Sender<Result<()>>>>,
 }
@@ -304,7 +306,7 @@ impl SocketHandle {
         let state = Arc::new(ChannelState {
             topic: topic.clone(),
             kind: ChannelKind::Control(ControlState {
-                metadata,
+                metadata: Mutex::new(metadata),
                 ready: Mutex::new(Some(tx)),
             }),
             commands,
@@ -315,7 +317,7 @@ impl SocketHandle {
         self.register_channel(&topic, &state, rx, "daemon").await?;
 
         Ok(ControlChannelHandle {
-            _shared: Arc::clone(&self.shared),
+            shared: Arc::clone(&self.shared),
             state,
         })
     }
@@ -359,7 +361,7 @@ impl SocketHandle {
 /// Handle to the daemon control channel; streams server->daemon commands.
 #[derive(Clone)]
 pub struct ControlChannelHandle {
-    _shared: Arc<Shared>,
+    shared: Arc<Shared>,
     state: Arc<ChannelState>,
 }
 
@@ -368,6 +370,25 @@ impl ControlChannelHandle {
     #[must_use]
     pub fn subscribe_commands(&self) -> broadcast::Receiver<ServerCommand> {
         self.state.commands.subscribe()
+    }
+
+    /// Re-advertise the daemon's metadata (e.g. an updated workspace allowlist)
+    /// by storing it and re-sending `daemon_register` on the live channel. The
+    /// stored copy is what future reconnect rejoins replay, so the server stays
+    /// current across both this push and any later reconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket is disconnected or the server rejects the
+    /// re-registration.
+    pub async fn refresh_metadata(&self, metadata: Value) -> Result<()> {
+        if let ChannelKind::Control(control) = &self.state.kind {
+            *control.metadata.lock().expect("control metadata lock") = metadata.clone();
+        }
+        request(&self.shared, &self.state.topic, "daemon_register", metadata)
+            .await
+            .context("daemon re-register failed")?;
+        Ok(())
     }
 }
 
@@ -633,14 +654,14 @@ async fn handshake_control(
     state: &Arc<ChannelState>,
     control: &ControlState,
 ) -> Result<()> {
-    request(
-        shared,
-        &state.topic,
-        "daemon_register",
-        control.metadata.clone(),
-    )
-    .await
-    .context("daemon register failed")?;
+    let metadata = control
+        .metadata
+        .lock()
+        .expect("control metadata lock")
+        .clone();
+    request(shared, &state.topic, "daemon_register", metadata)
+        .await
+        .context("daemon register failed")?;
 
     let waiter = control.ready.lock().expect("ready lock").take();
     if let Some(tx) = waiter {

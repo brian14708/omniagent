@@ -134,11 +134,9 @@ esac
 cat <<'EOF'
 
 Next steps:
-  1. Authenticate against your OmniAgent console:
-       omniagent login --server-url https://your-console.example --token <API token>
-  2. Allow a workspace the daemon may run agents under:
-       omniagent workspaces add /path/to/your/project
-  3. Start the daemon (foreground; connects out to the console):
+  1. Run the interactive setup (saves credentials, allows a workspace):
+       omniagent setup
+  2. Start the daemon (foreground; connects out to the console):
        omniagent daemon
   Then start a session from the OmniAgent web console.
 EOF

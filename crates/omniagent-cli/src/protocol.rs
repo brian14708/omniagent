@@ -93,6 +93,21 @@ pub enum ServerCommand {
         /// Optional model override applied to every request from this session.
         #[serde(default)]
         model: Option<String>,
+        /// Allowed workspace root the agent runs under (preferred over `cwd`).
+        #[serde(default)]
+        workspace: Option<String>,
+        /// Branch to use, or the new branch name when creating a worktree.
+        #[serde(default)]
+        branch: Option<String>,
+        /// Create (or reuse) an isolated `git worktree` for `branch`.
+        #[serde(default)]
+        create_worktree: bool,
+        /// Spawn in this existing linked worktree.
+        #[serde(default)]
+        worktree: Option<String>,
+        /// Base ref a newly-created worktree branches from.
+        #[serde(default)]
+        base_branch: Option<String>,
     },
     /// Codex app-server: submit a user turn.
     CodexInput {
@@ -100,4 +115,9 @@ pub enum ServerCommand {
     },
     /// Codex app-server: interrupt the in-progress turn.
     CodexInterrupt,
+    /// Daemon control: create a new project workspace under the local data dir,
+    /// initialize it as a git repo, and add it to the allowlist.
+    CreateWorkspace {
+        name: String,
+    },
 }

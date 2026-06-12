@@ -37,5 +37,22 @@ defmodule Omniagent.SessionsTest do
     end
   end
 
+  describe "mark_offline/2" do
+    test "exited takes precedence: a later offline does not downgrade it", %{session: session} do
+      {:ok, exited} = Sessions.mark_offline(session.id, "exited")
+      assert exited.status == "exited"
+
+      # The disconnect reaper fires after the clean exit; it must not clobber it.
+      {:ok, after_reap} = Sessions.mark_offline(session.id, "offline")
+      assert after_reap.status == "exited"
+      assert get_session!(session.id).status == "exited"
+    end
+
+    test "an online session still transitions to offline", %{session: session} do
+      {:ok, updated} = Sessions.mark_offline(session.id, "offline")
+      assert updated.status == "offline"
+    end
+  end
+
   defp get_session!(id), do: Omniagent.Repo.get!(Omniagent.Sessions.AgentSession, id)
 end

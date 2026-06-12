@@ -37,6 +37,35 @@ const THEME = {
   brightWhite: "#e7e9ee",
 };
 
+// ghostty-web's keydown fast-path emits the *unmodified* sequence for these
+// special keys even when Shift is held, so Shift+<key> silently behaves like the
+// bare key (e.g. Shift+Tab sends "\t" instead of back-tab). We send the correct
+// xterm modifier-encoded sequences ourselves. Only pure Shift is affected:
+// Ctrl/Alt/Meta combinations and the arrow keys already route through ghostty's
+// real key encoder. Shift+Enter/Backspace/Escape are intentionally omitted —
+// they have no standard legacy sequence and conventionally act as the bare key.
+const SHIFT_KEY_SEQUENCES = {
+  Tab: "\x1b[Z",
+  Home: "\x1b[1;2H",
+  End: "\x1b[1;2F",
+  Insert: "\x1b[2;2~",
+  Delete: "\x1b[3;2~",
+  PageUp: "\x1b[5;2~",
+  PageDown: "\x1b[6;2~",
+  F1: "\x1b[1;2P",
+  F2: "\x1b[1;2Q",
+  F3: "\x1b[1;2R",
+  F4: "\x1b[1;2S",
+  F5: "\x1b[15;2~",
+  F6: "\x1b[17;2~",
+  F7: "\x1b[18;2~",
+  F8: "\x1b[19;2~",
+  F9: "\x1b[20;2~",
+  F10: "\x1b[21;2~",
+  F11: "\x1b[23;2~",
+  F12: "\x1b[24;2~",
+};
+
 export const Terminal = {
   mounted() {
     // The dynamic import resolves asynchronously, so output that arrives before
@@ -91,6 +120,24 @@ export const Terminal = {
 
     term.onData((data) => this.pushEvent("pty_input", { data }));
     term.onResize?.(() => this.sendResize());
+
+    // Work around ghostty-web dropping Shift on special keys (see
+    // SHIFT_KEY_SEQUENCES). Returning true suppresses ghostty's default handling
+    // (and the browser's focus shift for Shift+Tab).
+    term.attachCustomKeyEventHandler?.((e) => {
+      if (
+        e.type === "keydown" &&
+        e.shiftKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.metaKey &&
+        Object.prototype.hasOwnProperty.call(SHIFT_KEY_SEQUENCES, e.key)
+      ) {
+        this.pushEvent("pty_input", { data: SHIFT_KEY_SEQUENCES[e.key] });
+        return true;
+      }
+      return false;
+    });
 
     this.term = term;
     this.fit = fit;
