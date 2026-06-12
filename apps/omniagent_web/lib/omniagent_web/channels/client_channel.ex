@@ -103,7 +103,7 @@ defmodule OmniagentWeb.ClientChannel do
   end
 
   def handle_in(event, payload, socket)
-      when event in ["file_response", "diff_response", "dir_response"] do
+      when event in ["diff_response", "fs_change"] do
     with {:ok, session_id} <- session_id(socket) do
       Events.broadcast(session_id, {String.to_existing_atom(event), payload})
       {:noreply, socket}
@@ -128,6 +128,15 @@ defmodule OmniagentWeb.ClientChannel do
       end
 
     {:reply, {:ok, reply}, socket}
+  end
+
+  # Defensive catch-all: an inbound event with no matching clause above (e.g. a
+  # version-skewed daemon still emitting an event this server no longer handles)
+  # would otherwise crash the channel with FunctionClauseError and drop the
+  # socket — taking every session multiplexed on it down. Log and ignore.
+  def handle_in(event, _payload, socket) do
+    Logger.warning("client channel: ignoring unhandled inbound event #{inspect(event)}")
+    {:noreply, socket}
   end
 
   @impl true

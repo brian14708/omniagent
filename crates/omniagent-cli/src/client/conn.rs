@@ -412,7 +412,7 @@ impl ChannelHandle {
     }
 
     /// Enqueue an event. Replayable events are buffered and acked; transient
-    /// request replies (`file_response`, `diff_response`) are best-effort.
+    /// request replies (`diff_response`, `fs_change`) are best-effort.
     pub fn push(&self, event: impl Into<String>, payload: Value) {
         let event = event.into();
         if REPLAYABLE_EVENTS.contains(&event.as_str()) {

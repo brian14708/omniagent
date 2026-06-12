@@ -40,11 +40,7 @@ defmodule OmniagentWeb.ConsoleLive do
      |> assign(:playing_artifact, nil)
      |> assign(:auto_approve, true)
      |> assign(:right_tab, "files")
-     |> assign(:file_result, nil)
-     |> assign(:dir_tree, %{})
-     |> assign(:dir_expanded, MapSet.new())
-     |> assign(:dir_loading, false)
-     |> assign(:dir_error, nil)
+     |> reset_changes()
      |> assign(:show_new_agent, false)
      |> assign(:new_agent_daemon, nil)
      |> assign(:new_agent_workspace, nil)
@@ -174,33 +170,16 @@ defmodule OmniagentWeb.ConsoleLive do
     {:reply, detail, socket}
   end
 
-  # Expand/collapse a directory in the file-explorer tree. Children are fetched
-  # lazily the first time a directory is expanded.
-  def handle_event("toggle_dir", %{"path" => path}, socket) do
-    expanded = socket.assigns.dir_expanded
-
-    socket =
-      if MapSet.member?(expanded, path) do
-        assign(socket, :dir_expanded, MapSet.delete(expanded, path))
-      else
-        socket = assign(socket, :dir_expanded, MapSet.put(expanded, path))
-        if Map.has_key?(socket.assigns.dir_tree, path), do: socket, else: list_dir(socket, path)
-      end
-
-    {:noreply, socket}
+  def handle_event("open_diff", %{"path" => path}, socket) do
+    {:noreply, open_diff(socket, path)}
   end
 
-  def handle_event("open_file", %{"path" => path}, socket) do
-    {:noreply, open_file(socket, path)}
+  def handle_event("close_diff", _params, socket) do
+    {:noreply, assign(socket, :diff_result, nil)}
   end
 
-  # Manual path entry, kept as a fallback alongside the clickable browser.
-  def handle_event("request_file", %{"path" => path}, socket) do
-    {:noreply, open_file(socket, path)}
-  end
-
-  def handle_event("close_file", _params, socket) do
-    {:noreply, assign(socket, :file_result, nil)}
+  def handle_event("refresh_changes", _params, socket) do
+    {:noreply, list_changes(socket)}
   end
 
   def handle_event("review_decision", %{"id" => id, "action" => action}, socket) do
@@ -407,21 +386,51 @@ defmodule OmniagentWeb.ConsoleLive do
     {:noreply, refresh_artifacts(socket)}
   end
 
-  def handle_info({:file_response, payload}, socket) do
-    {:noreply, assign(socket, :file_result, payload)}
-  end
-
-  def handle_info({:dir_response, payload}, socket) do
+  # Every diff response carries the full changed-files list (cheap git status),
+  # so it doubles as the changes-list refresh. A non-empty path also carries that
+  # file's unified diff for the viewer.
+  def handle_info({:diff_response, payload}, socket) do
     socket =
       if payload["ok"] do
-        tree = Map.put(socket.assigns.dir_tree, payload["path"] || "", payload["entries"] || [])
-        assign(socket, dir_tree: tree, dir_loading: false, dir_error: nil)
+        diff = payload["diff"] || %{}
+
+        socket
+        |> assign(changes: diff["files"] || [], changes_loading: false, changes_error: nil)
+        |> assign_open_diff(payload["path"], diff["diff"])
       else
-        assign(socket,
-          dir_loading: false,
-          dir_error: payload["error"] || "could not list directory"
-        )
+        error = payload["error"] || "could not read changes"
+
+        socket
+        |> assign(changes_loading: false, changes_error: error)
+        |> assign_diff_error(payload["path"], error)
       end
+
+    {:noreply, socket}
+  end
+
+  # The daemon's filesystem watcher pushes the changed-files list whenever the
+  # workspace changes — assign it directly, no round-trip.
+  def handle_info({:fs_change, payload}, socket) do
+    files = payload["files"] || []
+    changed? = files != socket.assigns.changes
+    socket = assign(socket, changes: files, changes_loading: false, changes_error: nil)
+
+    # Keep an open diff fresh if its file is among the changes. Refresh in
+    # place — re-request without flipping the viewer back to its loading state,
+    # so a stream of edits doesn't make the open diff flicker. Only when the
+    # changed-files set actually moved, so an unchanged re-push (e.g. a watcher
+    # re-prime on reconnect) doesn't trigger a redundant round-trip.
+    if changed? do
+      case socket.assigns.diff_result do
+        %{"path" => path} when is_binary(path) and path != "" ->
+          if Enum.any?(files, &(&1["path"] == path)) do
+            send_command(socket, "diff_request", %{"path" => path})
+          end
+
+        _ ->
+          :ok
+      end
+    end
 
     {:noreply, socket}
   end
@@ -487,15 +496,11 @@ defmodule OmniagentWeb.ConsoleLive do
     |> assign(:artifacts, Artifacts.list_artifacts(session.id))
     |> assign(:playing_artifact, nil)
     |> assign(:right_tab, "files")
-    |> assign(:file_result, nil)
-    |> assign(:dir_tree, %{})
-    |> assign(:dir_expanded, MapSet.new())
-    |> assign(:dir_loading, false)
-    |> assign(:dir_error, nil)
+    |> reset_changes()
     |> assign(:page_title, session.name || "Session")
     |> push_session_backlog(session)
     |> push_event("trace_init", %{spans: Traces.list_spans(session.id)})
-    |> list_dir("")
+    |> list_changes()
   end
 
   # Primes the middle-pane renderer for a freshly selected session: the codex
@@ -526,11 +531,7 @@ defmodule OmniagentWeb.ConsoleLive do
     |> assign(:reviews, [])
     |> assign(:artifacts, [])
     |> assign(:playing_artifact, nil)
-    |> assign(:file_result, nil)
-    |> assign(:dir_tree, %{})
-    |> assign(:dir_expanded, MapSet.new())
-    |> assign(:dir_loading, false)
-    |> assign(:dir_error, nil)
+    |> reset_changes()
     |> assign(:page_title, "Console")
   end
 
@@ -539,26 +540,53 @@ defmodule OmniagentWeb.ConsoleLive do
     assign(socket, :subscribed_id, nil)
   end
 
-  # Browse into a directory (empty path = workspace root).
-  defp list_dir(%{assigns: %{session: nil}} = socket, _path), do: socket
+  # Clears the Changes panel + diff viewer to their empty state.
+  defp reset_changes(socket) do
+    assign(socket, changes: [], changes_loading: false, changes_error: nil, diff_result: nil)
+  end
 
-  defp list_dir(socket, path) do
-    case send_command(socket, "dir_request", %{"path" => path}) do
-      :ok -> assign(socket, dir_loading: true, dir_error: nil)
-      _ -> assign(socket, dir_loading: false, dir_error: offline_msg())
+  # Fetch the working-tree changes (git status vs HEAD). Empty path = the whole
+  # changed-files list only; the daemon folds that list into every diff response.
+  defp list_changes(%{assigns: %{session: nil}} = socket), do: socket
+
+  defp list_changes(socket) do
+    case send_command(socket, "diff_request", %{"path" => ""}) do
+      :ok -> assign(socket, changes_loading: true, changes_error: nil)
+      _ -> assign(socket, changes_loading: false, changes_error: offline_msg())
     end
   end
 
-  # Read a single file into the viewer.
-  defp open_file(socket, path) do
+  # Fetch one file's unified diff into the diff viewer.
+  defp open_diff(socket, path) do
     result =
-      case send_command(socket, "file_request", %{"path" => path}) do
+      case send_command(socket, "diff_request", %{"path" => path}) do
         :ok -> %{"path" => path, "loading" => true}
         _ -> %{"path" => path, "ok" => false, "error" => offline_msg()}
       end
 
-    assign(socket, :file_result, result)
+    assign(socket, :diff_result, result)
   end
+
+  # Updates the diff viewer only when a specific file was requested (path != "").
+  # The list-only refresh (path "") leaves any open diff untouched.
+  defp assign_open_diff(socket, path, diff_text) when is_binary(path) and path != "" do
+    result =
+      if diff_text in [nil, ""] do
+        %{"path" => path, "ok" => true, "diff" => "", "empty" => true}
+      else
+        %{"path" => path, "ok" => true, "diff" => diff_text}
+      end
+
+    assign(socket, :diff_result, result)
+  end
+
+  defp assign_open_diff(socket, _path, _diff_text), do: socket
+
+  defp assign_diff_error(socket, path, error) when is_binary(path) and path != "" do
+    assign(socket, :diff_result, %{"path" => path, "ok" => false, "error" => error})
+  end
+
+  defp assign_diff_error(socket, _path, _error), do: socket
 
   defp send_command(socket, event, payload) do
     case socket.assigns.session do
@@ -575,13 +603,11 @@ defmodule OmniagentWeb.ConsoleLive do
     end
   end
 
-  defp offline_msg, do: "agent offline — reconnect to browse files"
+  defp offline_msg, do: "agent offline — reconnect to read changes"
 
   # Lazily fetch the data a right-pane tab needs the first time it's shown.
   defp ensure_tab_loaded(socket, "files") do
-    if socket.assigns.dir_tree == %{} and is_nil(socket.assigns.file_result),
-      do: list_dir(socket, ""),
-      else: socket
+    if socket.assigns.changes == [], do: list_changes(socket), else: socket
   end
 
   defp ensure_tab_loaded(socket, _tab), do: socket
@@ -616,25 +642,17 @@ defmodule OmniagentWeb.ConsoleLive do
 
   defp restore_tab(socket, _tab), do: socket
 
-  # Path of an entry given its parent directory (empty parent = root).
+  # Maps a `git status --porcelain` code to a one-letter badge + colour.
   @doc false
-  def join_path("", name), do: name
-  def join_path(dir, name), do: dir <> "/" <> name
-
-  # Flattens the loaded subtree into indented render rows, honouring which
-  # directories are expanded. Only loaded + expanded directories contribute
-  # children, so the tree fills in lazily as `dir_response`s arrive.
-  @doc false
-  def file_rows(tree, expanded, dir \\ "", depth \\ 0) do
-    tree
-    |> Map.get(dir, [])
-    |> Enum.flat_map(fn entry ->
-      path = join_path(dir, entry["name"])
-      is_dir = !!entry["dir"]
-      open? = is_dir and MapSet.member?(expanded, path)
-      row = %{name: entry["name"], path: path, dir: is_dir, depth: depth, expanded: open?}
-      [row | if(open?, do: file_rows(tree, expanded, path, depth + 1), else: [])]
-    end)
+  def status_badge(status) do
+    cond do
+      status == "??" -> %{label: "U", color: "var(--prov-green)"}
+      String.contains?(status, "D") -> %{label: "D", color: "var(--prov-red)"}
+      String.contains?(status, "A") -> %{label: "A", color: "var(--prov-green)"}
+      String.contains?(status, "R") -> %{label: "R", color: "var(--accent)"}
+      String.contains?(status, "M") -> %{label: "M", color: "var(--prov-orange)"}
+      true -> %{label: status, color: "var(--faint)"}
+    end
   end
 
   defp refresh_reviews(socket) do

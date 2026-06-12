@@ -66,13 +66,7 @@ pub enum ServerCommand {
         id: String,
         decision: serde_json::Value,
     },
-    FileRequest {
-        path: String,
-    },
     DiffRequest {
-        path: String,
-    },
-    ListDir {
         path: String,
     },
     Shutdown,

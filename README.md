@@ -165,4 +165,3 @@ rm ~/.local/bin/omniagent          # or wherever INSTALL_DIR put it
 rm -rf ~/.config/omniagent         # config + API token
 rm -rf ~/.local/share/omniagent    # traces + sessions
 ```
-

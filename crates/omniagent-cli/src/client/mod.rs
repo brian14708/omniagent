@@ -5,6 +5,7 @@
 //! reconnection model.
 
 mod conn;
+mod fs_watch;
 mod supervisor;
 
 pub use conn::{ChannelHandle, ControlChannelHandle, PhoenixSocket, SocketHandle};
@@ -75,21 +76,7 @@ pub fn decode_command(event: &str, payload: &Value) -> Option<ServerCommand> {
             id: payload.get("id")?.as_str()?.to_string(),
             decision: payload.get("decision").cloned().unwrap_or(Value::Null),
         }),
-        "file_request" => Some(ServerCommand::FileRequest {
-            path: payload
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        }),
         "diff_request" => Some(ServerCommand::DiffRequest {
-            path: payload
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        }),
-        "dir_request" => Some(ServerCommand::ListDir {
             path: payload
                 .get("path")
                 .and_then(Value::as_str)

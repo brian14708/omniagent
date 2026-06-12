@@ -52,4 +52,17 @@ defmodule OmniagentWeb.ConsoleLiveTest do
     shown = view |> element("button[phx-click=\"toggle_sessions\"]") |> render_click()
     assert shown =~ "ghost-session"
   end
+
+  describe "git-native changes helpers" do
+    alias OmniagentWeb.ConsoleLive
+
+    test "status_badge maps porcelain codes to letter + colour" do
+      assert %{label: "U"} = ConsoleLive.status_badge("??")
+      assert %{label: "M"} = ConsoleLive.status_badge("M")
+      assert %{label: "M"} = ConsoleLive.status_badge("MM")
+      assert %{label: "A"} = ConsoleLive.status_badge("A")
+      assert %{label: "D"} = ConsoleLive.status_badge("D")
+      assert %{label: "R"} = ConsoleLive.status_badge("R")
+    end
+  end
 end

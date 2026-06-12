@@ -22,23 +22,20 @@ const SERVICE_NAME: &str = "omniagent.service";
 #[cfg(target_os = "macos")]
 const SERVICE_LABEL: &str = "dev.omniagent.daemon";
 
-/// Path of the service unit/plist this platform would manage, for display in the
-/// `uninstall` preview. `None` on unsupported platforms.
+/// Path of the service unit this platform would manage, for display in the
+/// `uninstall` preview.
 #[must_use]
-#[cfg_attr(target_os = "linux", allow(clippy::unnecessary_wraps))]
+#[cfg(target_os = "linux")]
+pub fn unit_path() -> PathBuf {
+    systemd_user_dir().join(SERVICE_NAME)
+}
+
+/// Path of the service plist this platform would manage, for display in the
+/// `uninstall` preview.
+#[must_use]
+#[cfg(target_os = "macos")]
 pub fn unit_path() -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        Some(systemd_user_dir().join(SERVICE_NAME))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        launch_agents_dir().map(|d| d.join(format!("{SERVICE_LABEL}.plist")))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
+    launch_agents_dir().map(|d| d.join(format!("{SERVICE_LABEL}.plist")))
 }
 
 // --- Shared helpers (only compiled where a service backend exists) ------------

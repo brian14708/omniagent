@@ -39,6 +39,7 @@ import { Codex } from "./hooks/codex";
 import { Recording } from "./hooks/recording";
 import { Prefs } from "./hooks/prefs";
 import { Resize } from "./hooks/resize";
+import { DiffHighlight } from "./hooks/highlight";
 import { Traces } from "./traces/index";
 
 const csrfToken = document
@@ -54,6 +55,7 @@ const liveSocket = new LiveSocket("/live", Socket, {
     Recording,
     Prefs,
     Resize,
+    DiffHighlight,
     Traces,
   },
 });

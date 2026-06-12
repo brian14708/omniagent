@@ -1245,3 +1245,97 @@ h3,
   resize: none;
   font: 400 12px/1.5 var(--font-mono);
 }
+
+/* ── Diff viewer (DiffHighlight hook) ──
+   Each line is a +/- gutter sign plus syntax-highlighted code. Added/removed
+   lines carry a faint background tint so highlight.js token colours stay
+   readable; hunk/meta headers are coloured directly. */
+.diff-line {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding-left: 1ch;
+  text-indent: -1ch;
+  color: var(--text);
+}
+.diff-sign {
+  display: inline-block;
+  width: 1ch;
+  user-select: none;
+  color: var(--faint);
+}
+.diff-add {
+  background: color-mix(in srgb, var(--prov-green) 12%, transparent);
+}
+.diff-del {
+  background: color-mix(in srgb, var(--prov-red) 12%, transparent);
+}
+.diff-add .diff-sign {
+  color: var(--prov-green);
+}
+.diff-del .diff-sign {
+  color: var(--prov-red);
+}
+.diff-hunk {
+  color: var(--accent);
+}
+.diff-meta {
+  color: var(--faint);
+}
+.diff-ctx {
+  color: var(--dim);
+}
+
+/* highlight.js token palette mapped onto the app theme. */
+.hljs-comment,
+.hljs-quote {
+  color: var(--faint);
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-built_in,
+.hljs-literal,
+.hljs-selector-tag {
+  color: var(--accent);
+}
+.hljs-string,
+.hljs-regexp,
+.hljs-attr,
+.hljs-attribute,
+.hljs-addition {
+  color: var(--prov-green);
+}
+.hljs-number,
+.hljs-meta,
+.hljs-symbol,
+.hljs-bullet {
+  color: var(--prov-orange);
+}
+.hljs-title,
+.hljs-section,
+.hljs-name,
+.hljs-selector-id,
+.hljs-selector-class {
+  color: var(--prov-gemini);
+}
+.hljs-type,
+.hljs-class .hljs-title,
+.hljs-title.class_,
+.hljs-title.function_ {
+  color: var(--prov-openai);
+}
+.hljs-variable,
+.hljs-template-variable,
+.hljs-property,
+.hljs-params {
+  color: var(--prov-anthropic);
+}
+.hljs-deletion {
+  color: var(--prov-red);
+}
+.hljs-emphasis {
+  font-style: italic;
+}
+.hljs-strong {
+  font-weight: 600;
+}

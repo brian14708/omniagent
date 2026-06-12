@@ -477,6 +477,9 @@ async fn uninstall(args: UninstallArgs) -> Result<()> {
 
     println!("omniagent uninstall will remove:");
     println!("  binary: {}", binary.display());
+    #[cfg(target_os = "linux")]
+    println!("  service unit: {}", service::unit_path().display());
+    #[cfg(target_os = "macos")]
     if let Some(unit) = service::unit_path() {
         println!("  service unit: {}", unit.display());
     }

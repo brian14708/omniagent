@@ -431,6 +431,10 @@ impl DaemonSupervisor {
         // Review decisions flow back the same way for both backends.
         spawn_review_decision_bridge(&channel, reviews.clone());
 
+        // Push the git changed-files list to the control plane whenever the
+        // workspace changes, so the UI's Changes panel stays live.
+        let fs_watcher = super::fs_watch::spawn_fs_watcher(channel.clone(), spec.cwd.clone());
+
         let summary = SessionSummary {
             session_id: session_id.clone(),
             name: spec.name.clone().or_else(|| opened.registered.name.clone()),
@@ -472,6 +476,7 @@ impl DaemonSupervisor {
         };
         tokio::spawn(async move {
             let exit_code = worker.wait_exit().await;
+            fs_watcher.abort();
             finalize_session(finalize, exit_code).await;
             remove_session(&sessions, &socket, &idle, &reap_id);
         });
@@ -1002,35 +1007,22 @@ fn spawn_command_bridge(channel: &ChannelHandle, worker: WorkerHandle, workspace
                 | ServerCommand::CreateWorkspace { .. }
                 | ServerCommand::CodexInput { .. }
                 | ServerCommand::CodexInterrupt => {}
-                file_or_diff_or_dir => {
-                    handle_workspace_request(&channel, &workspace, &file_or_diff_or_dir).await;
+                workspace_request @ ServerCommand::DiffRequest { .. } => {
+                    handle_workspace_request(&channel, &workspace, &workspace_request).await;
                 }
             }
         }
     });
 }
 
-/// Serves the workspace file/diff/dir read commands shared by the PTY and codex
-/// command bridges. Returns `true` if `command` was a workspace request.
+/// Serves the workspace diff read command shared by the PTY and codex command
+/// bridges. Returns `true` if `command` was a workspace request.
 async fn handle_workspace_request(
     channel: &ChannelHandle,
     workspace: &Path,
     command: &ServerCommand,
 ) -> bool {
     match command {
-        ServerCommand::FileRequest { path } => {
-            let workspace = workspace.to_path_buf();
-            let path = path.clone();
-            let payload =
-                tokio::task::spawn_blocking(move || match files::read_file(&workspace, &path) {
-                    Ok(text) => json!({"path": path, "ok": true, "text": text}),
-                    Err(err) => json!({"path": path, "ok": false, "error": err.to_string()}),
-                })
-                .await
-                .unwrap_or_else(|_| json!({"ok": false, "error": "file task panicked"}));
-            channel.push("file_response", payload);
-            true
-        }
         ServerCommand::DiffRequest { path } => {
             let workspace = workspace.to_path_buf();
             let path = path.clone();
@@ -1042,19 +1034,6 @@ async fn handle_workspace_request(
             .await
             .unwrap_or_else(|_| json!({"ok": false, "error": "diff task panicked"}));
             channel.push("diff_response", payload);
-            true
-        }
-        ServerCommand::ListDir { path } => {
-            let workspace = workspace.to_path_buf();
-            let path = path.clone();
-            let payload =
-                tokio::task::spawn_blocking(move || match files::list_dir(&workspace, &path) {
-                    Ok(entries) => json!({"path": path, "ok": true, "entries": entries}),
-                    Err(err) => json!({"path": path, "ok": false, "error": err.to_string()}),
-                })
-                .await
-                .unwrap_or_else(|_| json!({"ok": false, "error": "dir task panicked"}));
-            channel.push("dir_response", payload);
             true
         }
         _ => false,
@@ -1234,8 +1213,8 @@ fn spawn_codex_command_bridge(
                 | ServerCommand::CreateWorkspace { .. }
                 | ServerCommand::PtyInput { .. }
                 | ServerCommand::PtyResize { .. } => {}
-                file_or_diff_or_dir => {
-                    handle_workspace_request(&channel, &workspace, &file_or_diff_or_dir).await;
+                workspace_request @ ServerCommand::DiffRequest { .. } => {
+                    handle_workspace_request(&channel, &workspace, &workspace_request).await;
                 }
             }
         }

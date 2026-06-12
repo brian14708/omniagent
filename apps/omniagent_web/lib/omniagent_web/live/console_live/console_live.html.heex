@@ -375,72 +375,56 @@
           <% is_nil(@session) -> %>
             <p class="font-mono text-xs text-[var(--faint)]">select a session</p>
           <% @right_tab == "files" -> %>
+            <%!-- Header: Changes label, count, refresh --%>
+            <div class="mb-3 flex items-center gap-1">
+              <span class="font-mono text-[11px] text-[var(--dim)]">Changes</span>
+              <span class="ml-auto font-mono text-[10px] text-[var(--faint)]">
+                <%= if @changes != [] do %>
+                  {length(@changes)} changed
+                <% end %>
+              </span>
+              <button
+                type="button"
+                phx-click="refresh_changes"
+                title="Refresh changes"
+                class="flex-none px-1.5 text-[var(--faint)] hover:text-[var(--text)]"
+              >
+                ⟳
+              </button>
+            </div>
+
+            <%!-- Changed-files list (git status vs HEAD); a click opens the
+                 diff in a modal --%>
             <%= cond do %>
-              <% not is_nil(@file_result) -> %>
-                <%!-- Single-file viewer (reached by clicking a file or manual path) --%>
-                <div class="mb-2 flex items-center justify-between gap-2">
-                  <span class="truncate font-mono text-[11px] text-[var(--dim)]">
-                    {@file_result["path"]}
-                  </span>
-                  <button type="button" phx-click="close_file" class="oa-btn flex-none text-xs">
-                    ← back
-                  </button>
-                </div>
-                <%= cond do %>
-                  <% @file_result["loading"] -> %>
-                    <p class="font-mono text-xs text-[var(--faint)]">
-                      loading {@file_result["path"]}…
-                    </p>
-                  <% @file_result["ok"] -> %>
-                    <pre class="oa-pre overflow-x-auto text-[11px]">{@file_result["text"]}</pre>
-                  <% true -> %>
-                    <p class="font-mono text-xs text-[var(--prov-red)]">
-                      {@file_result["error"]}
-                    </p>
-                <% end %>
+              <% @changes == [] and @changes_error -> %>
+                <p class="font-mono text-xs text-[var(--prov-red)]">{@changes_error}</p>
+              <% @changes == [] and @changes_loading -> %>
+                <p class="font-mono text-xs text-[var(--faint)]">loading…</p>
+              <% @changes == [] -> %>
+                <p class="font-mono text-xs text-[var(--faint)]">no changes</p>
               <% true -> %>
-                <%!-- File explorer: a lazy-expanding directory tree --%>
-                <% rows = file_rows(@dir_tree, @dir_expanded) %>
-                <%= cond do %>
-                  <% @dir_tree == %{} and @dir_error -> %>
-                    <p class="font-mono text-xs text-[var(--prov-red)]">{@dir_error}</p>
-                  <% @dir_tree == %{} -> %>
-                    <p class="font-mono text-xs text-[var(--faint)]">loading…</p>
-                  <% true -> %>
-                    <%= if @dir_error do %>
-                      <p class="mb-2 font-mono text-xs text-[var(--prov-red)]">{@dir_error}</p>
-                    <% end %>
-                    <%= if rows == [] do %>
-                      <p class="font-mono text-xs text-[var(--faint)]">empty</p>
-                    <% else %>
-                      <div class="overflow-hidden">
-                        <%= for row <- rows do %>
-                          <button
-                            type="button"
-                            phx-click={if row.dir, do: "toggle_dir", else: "open_file"}
-                            phx-value-path={row.path}
-                            style={"padding-left: #{row.depth * 14 + 8}px"}
-                            class="flex w-full items-center gap-1.5 py-1 pr-2 text-left font-mono text-[11px] hover:bg-[var(--panel-2)]"
-                          >
-                            <span class="w-3 flex-none text-center text-[var(--faint)]">
-                              {cond do
-                                not row.dir -> ""
-                                row.expanded -> "▾"
-                                true -> "▸"
-                              end}
-                            </span>
-                            <span class={[
-                              "truncate",
-                              row.dir && "text-[var(--accent)]",
-                              !row.dir && "text-[var(--dim)]"
-                            ]}>
-                              {row.name}
-                            </span>
-                          </button>
-                        <% end %>
-                      </div>
-                    <% end %>
+                <%= if @changes_error do %>
+                  <p class="mb-2 font-mono text-xs text-[var(--prov-red)]">{@changes_error}</p>
                 <% end %>
+                <div class="overflow-hidden">
+                  <%= for file <- @changes do %>
+                    <% badge = status_badge(file["status"]) %>
+                    <button
+                      type="button"
+                      phx-click="open_diff"
+                      phx-value-path={file["path"]}
+                      class="flex w-full items-center gap-2 py-1 pl-2 pr-2 text-left font-mono text-[11px] hover:bg-[var(--panel-2)]"
+                    >
+                      <span
+                        class="w-4 flex-none text-center font-semibold"
+                        style={"color: #{badge.color}"}
+                      >
+                        {badge.label}
+                      </span>
+                      <span class="truncate text-[var(--dim)]">{file["path"]}</span>
+                    </button>
+                  <% end %>
+                </div>
             <% end %>
           <% @right_tab == "reviews" -> %>
             <div class="mb-3 flex items-center justify-between">
@@ -556,6 +540,53 @@
     <% end %>
   </aside>
 </div>
+
+<%!-- ── Diff modal (a changed file's unified diff) ───────────────────── --%>
+<%= if @diff_result do %>
+  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+    <div
+      class="oa-panel flex max-h-[85vh] w-full max-w-4xl flex-col p-0"
+      phx-click-away="close_diff"
+    >
+      <div class="flex flex-none items-center justify-between gap-2 border-b border-[var(--line)] px-4 py-2.5">
+        <span class="truncate font-mono text-xs text-[var(--dim)]" title={@diff_result["path"]}>
+          {@diff_result["path"]}
+        </span>
+        <button
+          type="button"
+          phx-click="close_diff"
+          title="Close"
+          class="flex-none px-1.5 text-[var(--faint)] hover:text-[var(--text)]"
+        >
+          ✕
+        </button>
+      </div>
+      <div class="min-h-0 flex-1 overflow-auto p-4">
+        <%= cond do %>
+          <% @diff_result["loading"] -> %>
+            <p class="font-mono text-xs text-[var(--faint)]">loading diff…</p>
+          <% @diff_result["empty"] -> %>
+            <p class="font-mono text-xs text-[var(--faint)]">no changes for this file</p>
+          <% @diff_result["ok"] -> %>
+            <%!-- Key the id by a hash of the diff text so an in-place refresh
+                 (same file, new content) forces a remount — phx-update="ignore"
+                 would otherwise leave the DiffHighlight hook showing stale text. --%>
+            <div
+              id={"diff-view-#{@diff_result["path"]}-#{:erlang.phash2(@diff_result["diff"])}"}
+              phx-hook="DiffHighlight"
+              phx-update="ignore"
+              data-diff={@diff_result["diff"]}
+              data-path={@diff_result["path"]}
+              class="font-mono text-[11px] leading-[1.5]"
+            >
+            </div>
+          <% true -> %>
+            <p class="font-mono text-xs text-[var(--prov-red)]">{@diff_result["error"]}</p>
+        <% end %>
+      </div>
+    </div>
+  </div>
+<% end %>
 
 <%!-- ── New-agent modal ──────────────────────────────────────────────── --%>
 <%= if @show_new_agent do %>

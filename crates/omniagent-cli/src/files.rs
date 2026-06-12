@@ -1,4 +1,4 @@
-//! Workspace file access for the central UI's file and diff requests.
+//! Workspace diff access for the central UI's diff requests.
 //!
 //! All paths are sandboxed to the agent's workspace root: the requested path is
 //! joined onto the canonical root, canonicalized, and rejected unless it stays
@@ -10,15 +10,10 @@ use serde::Serialize;
 
 use crate::git::git;
 
-/// Largest file the viewer will return inline.
-const MAX_FILE_BYTES: u64 = 512 * 1024;
-
 #[derive(Debug)]
 pub enum FsError {
     Forbidden,
     NotFound,
-    TooLarge,
-    NotText,
     Io(String),
 }
 
@@ -27,8 +22,6 @@ impl std::fmt::Display for FsError {
         match self {
             Self::Forbidden => f.write_str("path outside workspace"),
             Self::NotFound => f.write_str("not found"),
-            Self::TooLarge => f.write_str("file too large"),
-            Self::NotText => f.write_str("not a text file"),
             Self::Io(message) => f.write_str(message),
         }
     }
@@ -36,7 +29,7 @@ impl std::fmt::Display for FsError {
 
 impl std::error::Error for FsError {}
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChangedFile {
     pub path: String,
     pub status: String,
@@ -47,13 +40,6 @@ pub struct DiffResult {
     pub files: Vec<ChangedFile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
-}
-
-/// One entry in a directory listing returned to the file browser.
-#[derive(Debug, Serialize)]
-pub struct DirEntry {
-    pub name: String,
-    pub dir: bool,
 }
 
 /// Resolves `rel` under `root`, ensuring the result stays inside `root`.
@@ -81,44 +67,6 @@ fn resolve_within(root: &Path, rel: &str) -> Result<PathBuf, FsError> {
     Ok(canonical)
 }
 
-/// Reads a text file under `root`/`rel`, capped at [`MAX_FILE_BYTES`].
-pub fn read_file(root: &Path, rel: &str) -> Result<String, FsError> {
-    let file = resolve_within(root, rel)?;
-    let meta = file.metadata().map_err(|_| FsError::NotFound)?;
-    if !meta.is_file() {
-        return Err(FsError::NotFound);
-    }
-    if meta.len() > MAX_FILE_BYTES {
-        return Err(FsError::TooLarge);
-    }
-    let bytes = std::fs::read(&file).map_err(|e| FsError::Io(e.to_string()))?;
-    String::from_utf8(bytes).map_err(|_| FsError::NotText)
-}
-
-/// Lists the entries of a directory under `root`/`rel` (empty `rel` = root).
-/// Directories sort before files, each alphabetically; `.git` is hidden.
-pub fn list_dir(root: &Path, rel: &str) -> Result<Vec<DirEntry>, FsError> {
-    let dir = resolve_within(root, rel)?;
-    let meta = dir.metadata().map_err(|_| FsError::NotFound)?;
-    if !meta.is_dir() {
-        return Err(FsError::NotFound);
-    }
-    let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&dir).map_err(|e| FsError::Io(e.to_string()))? {
-        let entry = entry.map_err(|e| FsError::Io(e.to_string()))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name == ".git" {
-            continue;
-        }
-        // `file_type()` avoids a stat for most platforms; fall back to false
-        // (treat as a file) when it can't be determined.
-        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-        entries.push(DirEntry { name, dir: is_dir });
-    }
-    entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.cmp(&b.name)));
-    Ok(entries)
-}
-
 /// Collects the agent's changed files (and optionally one file's unified diff)
 /// from git. Degrades to an empty result when the workspace is not a repo.
 pub fn git_diff(root: &Path, path: Option<&str>) -> DiffResult {
@@ -131,7 +79,13 @@ pub fn git_diff(root: &Path, path: Option<&str>) -> DiffResult {
 }
 
 fn git_status(root: &Path) -> Vec<ChangedFile> {
-    let Some(out) = git(root, &["status", "--porcelain"]) else {
+    // `core.quotePath=false` keeps non-ASCII paths literal; git would otherwise
+    // C-quote them (e.g. `"caf\303\251.txt"`), and that quoted string would
+    // never match when fed back to `git diff` as a pathspec.
+    let Some(out) = git(
+        root,
+        &["-c", "core.quotePath=false", "status", "--porcelain"],
+    ) else {
         return Vec::new();
     };
     let mut files = Vec::new();
@@ -151,16 +105,61 @@ fn git_status(root: &Path) -> Vec<ChangedFile> {
 }
 
 fn git_file_diff(root: &Path, path: &str) -> Option<String> {
-    if Path::new(path)
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
+    // Reject traversal and absolute paths: the `--no-index` fallback below
+    // treats `path` as a literal filesystem path, so an absolute path or one
+    // escaping the workspace would let the diff viewer read arbitrary files.
+    if Path::new(path).components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
         return None;
     }
     // Prefer diff against HEAD (covers staged + unstaged); fall back to the
-    // worktree diff for repos without a HEAD commit yet.
-    let head = git(root, &["diff", "HEAD", "--", path]).filter(|d| !d.trim().is_empty());
-    head.or_else(|| git(root, &["diff", "--", path]))
+    // worktree diff for repos without a HEAD commit yet. `--no-ext-diff`/
+    // `--no-color` defeat any external diff driver or colour the user has
+    // configured globally, so we always get plain unified-diff text.
+    let tracked = git(
+        root,
+        &["diff", "--no-ext-diff", "--no-color", "HEAD", "--", path],
+    )
+    .filter(|d| !d.trim().is_empty())
+    .or_else(|| {
+        git(root, &["diff", "--no-ext-diff", "--no-color", "--", path])
+            .filter(|d| !d.trim().is_empty())
+    });
+    if tracked.is_some() {
+        return tracked;
+    }
+    // Untracked/new files don't appear in `git diff`; diff against the null
+    // device so the viewer shows the whole file as additions. `--no-index`
+    // returns exit code 1 when the files differ, so go through `git_diff`.
+    //
+    // Unlike the pathspec-confined branches above, `--no-index` reads `path`
+    // straight from the filesystem, so the component check at the top isn't
+    // enough — a symlinked directory component could still escape the workspace.
+    // Apply the same canonicalized containment guard the rest of this module
+    // uses before handing the path to git.
+    if resolve_within(root, path).is_err() {
+        return None;
+    }
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    crate::git::git_diff(
+        root,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-index",
+            "--",
+            null,
+            path,
+        ],
+    )
+    .filter(|d| !d.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -175,57 +174,37 @@ mod tests {
     }
 
     #[test]
-    fn list_dir_sorts_dirs_first_then_alpha_and_hides_git() {
+    fn diff_shows_untracked_file_as_additions() {
         let root = temp_root();
-        fs::create_dir_all(root.join(".git")).unwrap();
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::create_dir_all(root.join("assets")).unwrap();
-        fs::write(root.join("README.md"), b"hi").unwrap();
-        fs::write(root.join("Cargo.toml"), b"[package]").unwrap();
+        fs::write(root.join("new.txt"), b"hello\nworld\n").unwrap();
 
-        let entries = list_dir(&root, "").unwrap();
-        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        // Directories first (alpha), then files (alpha); `.git` excluded.
-        assert_eq!(names, vec!["assets", "src", "Cargo.toml", "README.md"]);
-        assert!(entries[0].dir && entries[1].dir);
-        assert!(!entries[2].dir && !entries[3].dir);
+        let diff = git_diff(&root, Some("new.txt"))
+            .diff
+            .expect("untracked file should yield an additions diff");
+        assert!(diff.contains("+hello"), "diff was: {diff}");
+        assert!(diff.contains("+world"), "diff was: {diff}");
 
         fs::remove_dir_all(&root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
-    fn list_dir_lists_a_subdirectory() {
-        let root = temp_root();
-        fs::create_dir_all(root.join("src/inner")).unwrap();
-        fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
+    fn diff_rejects_symlinked_dir_escape() {
+        use std::os::unix::fs::symlink;
 
-        let entries = list_dir(&root, "src").unwrap();
-        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["inner", "main.rs"]);
+        // A symlinked directory component whose target is outside the workspace
+        // must not let the `--no-index` fallback read files from outside it.
+        let root = temp_root();
+        let outside = temp_root();
+        fs::write(outside.join("secret.txt"), b"top secret\n").unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+
+        assert!(
+            git_file_diff(&root, "link/secret.txt").is_none(),
+            "symlinked-dir escape should be rejected"
+        );
 
         fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn list_dir_rejects_parent_traversal() {
-        let root = temp_root();
-        fs::create_dir_all(root.join("sub")).unwrap();
-        assert!(matches!(list_dir(&root, "../"), Err(FsError::Forbidden)));
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn list_dir_errors_on_a_file_path() {
-        let root = temp_root();
-        fs::write(root.join("a.txt"), b"x").unwrap();
-        assert!(matches!(list_dir(&root, "a.txt"), Err(FsError::NotFound)));
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn list_dir_errors_on_missing_dir() {
-        let root = temp_root();
-        assert!(matches!(list_dir(&root, "nope"), Err(FsError::NotFound)));
-        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
     }
 }
