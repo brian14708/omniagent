@@ -139,6 +139,8 @@ struct ChannelState {
     /// Sequenced delivery state (only used by session channels; a control
     /// channel's outbox stays empty).
     inner: Mutex<ChannelInner>,
+    /// Signaled when this channel's outbox gains items (kicks its flusher).
+    dirty: Notify,
 }
 
 /// What a channel is for, and the per-kind handshake/ready state.
@@ -172,8 +174,6 @@ struct Shared {
     channels: Mutex<HashMap<String, Arc<ChannelState>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<Value>>>>,
     sink: AsyncMutex<Option<WsSink>>,
-    /// Signaled when an outbox gains items (kick the flusher).
-    dirty: Notify,
     /// Signaled when the channel set changes (kick reconciliation).
     reconcile: Notify,
 }
@@ -213,7 +213,6 @@ impl PhoenixSocket {
             channels: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             sink: AsyncMutex::new(None),
-            dirty: Notify::new(),
             reconcile: Notify::new(),
         });
         let supervisor = tokio::spawn(run_supervisor(Arc::clone(&shared)));
@@ -262,6 +261,7 @@ impl SocketHandle {
             }),
             commands,
             inner: Mutex::new(ChannelInner::default()),
+            dirty: Notify::new(),
         });
 
         let registered = self.register_channel(&topic, &state, rx, "session").await?;
@@ -309,6 +309,7 @@ impl SocketHandle {
             }),
             commands,
             inner: Mutex::new(ChannelInner::default()),
+            dirty: Notify::new(),
         });
 
         self.register_channel(&topic, &state, rx, "daemon").await?;
@@ -415,7 +416,7 @@ impl ChannelHandle {
         });
         shed_outbox(&mut inner, OUTBOX_BYTE_CAP);
         drop(inner);
-        self.shared.dirty.notify_one();
+        self.state.dirty.notify_one();
     }
 
     fn push_ephemeral(&self, event: String, payload: Value) {
@@ -473,24 +474,40 @@ async fn run_supervisor(shared: Arc<Shared>) {
 
                 backoff.reset();
                 tracing::debug!("connected to control plane; {} channel(s) live", live.len());
-                let flusher = spawn_flusher(Arc::clone(&shared));
                 let heartbeat = spawn_heartbeat(Arc::clone(&shared));
-                shared.dirty.notify_one();
+                // One flusher per channel so a slow ack on one channel can't stall
+                // delivery on the others (per-channel head-of-line isolation).
+                let mut flushers: Vec<JoinHandle<()>> = shared
+                    .snapshot()
+                    .into_iter()
+                    .map(|state| spawn_channel_flusher(Arc::clone(&shared), state))
+                    .collect();
 
                 loop {
                     tokio::select! {
                         () = disconnect.notified() => break,
                         () = shared.reconcile.notified() => {
-                            if let Err(err) = reconcile(&shared, &mut live).await {
-                                tracing::warn!(error = %err, "reconcile failed; reconnecting");
-                                break;
+                            match reconcile(&shared, &mut live).await {
+                                Ok(new_channels) => {
+                                    for state in new_channels {
+                                        flushers.push(spawn_channel_flusher(
+                                            Arc::clone(&shared),
+                                            state,
+                                        ));
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "reconcile failed; reconnecting");
+                                    break;
+                                }
                             }
-                            shared.dirty.notify_one();
                         }
                     }
                 }
 
-                flusher.abort();
+                for flusher in &flushers {
+                    flusher.abort();
+                }
                 heartbeat.abort();
                 reader.abort();
                 *shared.sink.lock().await = None;
@@ -523,15 +540,18 @@ async fn handshake_all(shared: &Arc<Shared>, live: &mut Vec<String>) -> Result<(
     Ok(())
 }
 
-/// Handshake any channel registered since the last reconcile.
-async fn reconcile(shared: &Arc<Shared>, live: &mut Vec<String>) -> Result<()> {
+/// Handshake any channel registered since the last reconcile. Returns the
+/// channels newly brought live so the supervisor can start their flushers.
+async fn reconcile(shared: &Arc<Shared>, live: &mut Vec<String>) -> Result<Vec<Arc<ChannelState>>> {
+    let mut started = Vec::new();
     for state in shared.snapshot() {
         if !live.contains(&state.topic) {
             handshake(shared, &state).await?;
             live.push(state.topic.clone());
+            started.push(state);
         }
     }
-    Ok(())
+    Ok(started)
 }
 
 /// Join the channel, then run the per-kind registration handshake.
@@ -629,68 +649,75 @@ async fn handshake_control(
     Ok(())
 }
 
-/// Drains every channel's outbox suffix to the wire whenever new items appear.
+/// Drains one channel's outbox suffix to the wire whenever new items appear.
 ///
-/// Contiguous `pty_output` items are coalesced into a single `pty_output_batch`
-/// frame sent as a request, and the reply's `last_client_sequence` trims the
-/// outbox (piggybacked ack). Other replayable events are sent individually.
-fn spawn_flusher(shared: Arc<Shared>) -> JoinHandle<()> {
+/// One such task runs per channel for the lifetime of a connection, so a slow
+/// ack on one channel never stalls delivery on another (per-channel head-of-line
+/// isolation). Contiguous `pty_output` items are coalesced into a single
+/// `pty_output_batch` frame sent as a request, and the reply's
+/// `last_client_sequence` trims the outbox (piggybacked ack). Other replayable
+/// events are sent individually.
+fn spawn_channel_flusher(shared: Arc<Shared>, state: Arc<ChannelState>) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            shared.dirty.notified().await;
-            for state in shared.snapshot() {
-                // Snapshot the unacked suffix WITHOUT advancing sent_upto here —
-                // it is advanced per item only after delivery (advance_sent_upto),
-                // so a failed send leaves the undelivered tail eligible to retry
-                // instead of being acked-away by the heartbeat.
-                let to_send: Vec<Outgoing> = {
-                    let inner = state.inner.lock().expect("channel inner lock");
-                    inner
-                        .outbox
-                        .iter()
-                        .filter(|o| o.seq > inner.sent_upto)
-                        .cloned()
-                        .collect()
-                };
-
-                let mut run: Vec<Outgoing> = Vec::new();
-                let mut healthy = true;
-                for item in to_send {
-                    if item.event == "pty_output" {
-                        run.push(item);
-                        continue;
-                    }
-                    // Preserve ordering: flush the pending pty run before a
-                    // non-pty event, then send that event individually. Mark both
-                    // delivered (advance sent_upto) only once they reach the wire.
-                    let seq = item.seq;
-                    if !flush_pty_run(&shared, &state, &mut run).await {
-                        healthy = false;
-                        break;
-                    }
-                    if send_frame(
-                        &shared,
-                        &state.topic,
-                        &item.event,
-                        item.payload.clone(),
-                        Some(&next_ref()),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        healthy = false;
-                        break;
-                    }
-                    advance_sent_upto(&state, seq);
-                }
-                if healthy {
-                    // A failure here just leaves items in the outbox — sent_upto is
-                    // not advanced for them, so the next flush or reconnect resends.
-                    let _ = flush_pty_run(&shared, &state, &mut run).await;
-                }
-            }
+            // Flush first so any backlog present at (re)connect is drained before
+            // we park; then wait for the next push. `Notify` holds one permit, so
+            // an item enqueued during a flush is not lost.
+            flush_channel_once(&shared, &state).await;
+            state.dirty.notified().await;
         }
     })
+}
+
+/// Sends the unacked suffix of a single channel's outbox in order, coalescing
+/// runs of `pty_output` into `pty_output_batch`. On a send failure the
+/// undelivered tail stays queued (its `sent_upto` is not advanced) for the next
+/// flush or reconnect replay.
+async fn flush_channel_once(shared: &Arc<Shared>, state: &Arc<ChannelState>) {
+    // Snapshot the unacked suffix WITHOUT advancing sent_upto here — it is
+    // advanced per item only after delivery (advance_sent_upto), so a failed send
+    // leaves the undelivered tail eligible to retry instead of being acked-away by
+    // the heartbeat.
+    let to_send: Vec<Outgoing> = {
+        let inner = state.inner.lock().expect("channel inner lock");
+        inner
+            .outbox
+            .iter()
+            .filter(|o| o.seq > inner.sent_upto)
+            .cloned()
+            .collect()
+    };
+
+    let mut run: Vec<Outgoing> = Vec::new();
+    for item in to_send {
+        if item.event == "pty_output" {
+            run.push(item);
+            continue;
+        }
+        // Preserve ordering: flush the pending pty run before a non-pty event,
+        // then send that event individually. Mark both delivered (advance
+        // sent_upto) only once they reach the wire.
+        let seq = item.seq;
+        if !flush_pty_run(shared, state, &mut run).await {
+            return;
+        }
+        if send_frame(
+            shared,
+            &state.topic,
+            &item.event,
+            item.payload.clone(),
+            Some(&next_ref()),
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+        advance_sent_upto(state, seq);
+    }
+    // A failure here just leaves items in the outbox — sent_upto is not advanced
+    // for them, so the next flush or reconnect resends.
+    let _ = flush_pty_run(shared, state, &mut run).await;
 }
 
 /// Sends an accumulated `pty_output` run as one `pty_output_batch` request and
@@ -1036,6 +1063,7 @@ mod tests {
             }),
             commands,
             inner: Mutex::new(ChannelInner::default()),
+            dirty: Notify::new(),
         })
     }
 
