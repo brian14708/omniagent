@@ -25,7 +25,7 @@ defmodule Omniagent.Oad.Snapshots do
   """
   def missing_chunks(hashes) when is_list(hashes) do
     present =
-      from(c in Chunk, where: c.hash in ^hashes, select: c.hash)
+      from(c in Chunk, where: c.hash in ^hashes and c.refcount > 0, select: c.hash)
       |> Repo.all()
       |> MapSet.new()
 
@@ -67,7 +67,8 @@ defmodule Omniagent.Oad.Snapshots do
             workspace_name: attrs.workspace_name,
             descriptor_key: attrs.descriptor_key,
             total_bytes: attrs.total_bytes,
-            chunk_count: length(hashes)
+            chunk_count: length(hashes),
+            chunk_hashes: hashes
           })
           |> repo.insert()
 
@@ -106,6 +107,102 @@ defmodule Omniagent.Oad.Snapshots do
       )
 
     count
+  end
+
+  @grace_seconds 86_400
+
+  @doc """
+  Unregisters a snapshot: decrements the refcount of each chunk it referenced and
+  deletes the snapshot row, in one transaction. Chunks that reach refcount 0
+  become collectable (after the grace window). A no-op for an unknown snapshot.
+  """
+  def unregister_snapshot(snapshot_name) do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    Repo.transaction(fn ->
+      case Repo.get_by(Snapshot, snapshot_name: snapshot_name) do
+        nil ->
+          :ok
+
+        %Snapshot{chunk_hashes: hashes} = snapshot ->
+          if hashes != [] do
+            from(c in Chunk, where: c.hash in ^hashes)
+            |> Repo.update_all(inc: [refcount: -1], set: [updated_at: now])
+          end
+
+          Repo.delete!(snapshot)
+          :ok
+      end
+    end)
+    |> case do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Hashes of chunks eligible for garbage collection: refcount has reached 0 and
+  stayed there past the grace window (so a quick rebuild re-referencing them does
+  not race collection).
+  """
+  def collectable_chunks(grace_seconds \\ @grace_seconds) do
+    cutoff = DateTime.utc_now() |> DateTime.add(-grace_seconds, :second)
+
+    from(c in Chunk, where: c.refcount <= 0 and c.updated_at < ^cutoff, select: c.hash)
+    |> Repo.all()
+  end
+
+  @doc """
+  Garbage-collects unreferenced chunks: deletes the collectable objects from the
+  store via `delete_fn`, then removes their index rows (re-checking refcount, so a
+  chunk re-referenced in the meantime is kept). `delete_fn` receives the list of
+  hashes and returns `:ok` or `{:error, reason}`; it defaults to deleting from the
+  configured CAS bucket. Returns `{:ok, deleted_count}`.
+  """
+  def gc(grace_seconds \\ @grace_seconds, delete_fn \\ &delete_from_store/1) do
+    case collectable_chunks(grace_seconds) do
+      [] ->
+        {:ok, 0}
+
+      hashes ->
+        case delete_fn.(hashes) do
+          :ok ->
+            {count, _} =
+              from(c in Chunk, where: c.hash in ^hashes and c.refcount <= 0)
+              |> Repo.delete_all()
+
+            {:ok, count}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  # Deletes chunk objects from the configured CAS bucket (S3-compatible RustFS).
+  defp delete_from_store(hashes) do
+    bucket = Application.get_env(:omniagent, :cas_bucket)
+    prefix = Application.get_env(:omniagent, :cas_prefix, "")
+
+    if is_binary(bucket) and bucket != "" do
+      keys = Enum.map(hashes, &chunk_object_key(prefix, &1))
+
+      case ExAws.S3.delete_all_objects(bucket, keys) |> ExAws.request() do
+        {:ok, _} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      # No CAS bucket configured: nothing to delete from object storage; let the
+      # index rows be removed so accounting stays consistent in dev/test.
+      :ok
+    end
+  end
+
+  defp chunk_object_key(prefix, hash) do
+    fanout = String.slice(hash, 0, 2)
+    base = "chunks/blake3/#{fanout}/#{hash}"
+    prefix = String.trim(prefix, "/")
+    if prefix == "", do: base, else: "#{prefix}/#{base}"
   end
 
   defp normalize(attrs) do

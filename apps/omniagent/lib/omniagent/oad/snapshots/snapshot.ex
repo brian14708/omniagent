@@ -16,6 +16,7 @@ defmodule Omniagent.Oad.Snapshots.Snapshot do
     field :descriptor_key, :string
     field :total_bytes, :integer, default: 0
     field :chunk_count, :integer, default: 0
+    field :chunk_hashes, {:array, :string}, default: []
 
     timestamps(type: :utc_datetime_usec)
   end
@@ -28,7 +29,8 @@ defmodule Omniagent.Oad.Snapshots.Snapshot do
       :workspace_name,
       :descriptor_key,
       :total_bytes,
-      :chunk_count
+      :chunk_count,
+      :chunk_hashes
     ])
     |> validate_required([:snapshot_name, :descriptor_key])
     |> unique_constraint(:snapshot_name)

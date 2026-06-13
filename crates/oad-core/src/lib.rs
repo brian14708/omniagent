@@ -458,6 +458,9 @@ pub struct CasConfig {
     pub chunk_max: u32,
     /// `zstd` compression level for chunk objects.
     pub zstd_level: i32,
+    /// Soft cap on the local CAS cache in bytes; `0` means unbounded. When set,
+    /// the daemon evicts the coldest materialized snapshots to stay under it.
+    pub cache_max_bytes: u64,
 }
 
 impl std::fmt::Debug for CasConfig {
@@ -473,6 +476,7 @@ impl std::fmt::Debug for CasConfig {
             .field("chunk_avg", &self.chunk_avg)
             .field("chunk_max", &self.chunk_max)
             .field("zstd_level", &self.zstd_level)
+            .field("cache_max_bytes", &self.cache_max_bytes)
             .finish()
     }
 }

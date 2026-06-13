@@ -1,4 +1,5 @@
 mod background_exec;
+mod cache;
 mod cas;
 mod config;
 mod network;
@@ -65,9 +66,15 @@ struct AppState {
     /// so they become portable across nodes, and forks can materialize snapshots
     /// this node did not capture.
     cas: Option<Arc<cas::Cas>>,
+    /// Tracks locally-materialized CAS artifacts so the cache can be held under
+    /// `OAD_CACHE_MAX_BYTES` by evicting the coldest, unpinned snapshots.
+    cache: Arc<tokio::sync::Mutex<cache::CacheIndex>>,
 }
 
 const BACKGROUND_EXEC_KILL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How often the bounded-cache sweeper checks whether eviction is needed.
+const CACHE_SWEEP_INTERVAL_SECS: u64 = 30;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -103,12 +110,15 @@ async fn main() -> anyhow::Result<()> {
         network,
         background_execs: BackgroundExecStore::default(),
         cas,
+        cache: Arc::new(tokio::sync::Mutex::new(cache::CacheIndex::new())),
     };
     if let Err(err) = state.network.reconcile_all(&state.paths).await {
         warn!(error = %err, "failed to reconcile managed network state at startup");
     }
 
     let shutdown_state = state.clone();
+    let cache_max_bytes = config.cas.as_ref().map_or(0, |cas| cas.cache_max_bytes);
+    let sweeper_state = (cache_max_bytes > 0).then(|| state.clone());
     let app = router(state);
     let addr: SocketAddr = config
         .http
@@ -131,12 +141,27 @@ async fn main() -> anyhow::Result<()> {
     });
     let registration_task = registration.as_ref().map(|r| Arc::clone(r).spawn());
 
+    // Periodically evict the coldest cached snapshots to keep the local CAS
+    // cache under its byte budget (only when a CAS + budget are configured).
+    let cache_sweeper = sweeper_state.map(|sweeper_state| {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(CACHE_SWEEP_INTERVAL_SECS));
+            loop {
+                ticker.tick().await;
+                sweep_cache(&sweeper_state, cache_max_bytes).await;
+            }
+        })
+    });
+
     info!(%addr, "oad listening");
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("http server failed");
     if let Some(task) = registration_task {
+        task.abort();
+    }
+    if let Some(task) = cache_sweeper {
         task.abort();
     }
     if let Some(registration) = registration {
@@ -606,7 +631,8 @@ async fn fork_from_snapshot(
 ) -> Result<SandboxRecord, AppError> {
     validate_snapshot_name(snapshot_name).map_err(|err| AppError::BadRequest(err.to_string()))?;
     let _snapshot_guard = state.snapshot_locks.acquire(snapshot_name).await;
-    if !snapshots::exists(&state.paths, snapshot_name).await {
+    let existed = snapshots::exists(&state.paths, snapshot_name).await;
+    if !existed {
         // Cold node: the snapshot was captured elsewhere. Materialize it from the
         // content-addressed store (checkpoint images + manifest) before forking.
         // The rootfs is rebuilt from the registry by `prepare_bundles` below.
@@ -627,6 +653,9 @@ async fn fork_from_snapshot(
         }
     }
     let manifest = snapshots::read_manifest(&state.paths, snapshot_name).await?;
+
+    // Bounded-cache accounting for the now-local snapshot.
+    note_snapshot_cached(state, snapshot_name, existed).await;
     let container_names = manifest.container_names();
     let network = effective_fork_network(state, request_network, &manifest.network)?;
 
@@ -682,7 +711,11 @@ async fn fork_from_snapshot(
 
     let image_dir = state.paths.snapshot_checkpoint_dir(snapshot_name);
     cleanup.delete_containers();
-    if let Err(err) = restore_sandbox(
+    // Pin the snapshot across the restore so the cache sweeper can't evict it
+    // mid-restore (the snapshot lock also blocks the sweeper, but pinning keeps
+    // it out of the eviction plan entirely). Unpin as soon as restore returns.
+    state.cache.lock().await.pin(snapshot_name);
+    let restore_result = restore_sandbox(
         &state.paths,
         id,
         &container_names,
@@ -690,8 +723,9 @@ async fn fork_from_snapshot(
         RestoreSpecValidation::Warning,
         runsc_network_mode,
     )
-    .await
-    {
+    .await;
+    state.cache.lock().await.unpin(snapshot_name);
+    if let Err(err) = restore_result {
         cleanup.cleanup_now().await;
         return Err(err.into());
     }
@@ -706,6 +740,95 @@ async fn fork_from_snapshot(
             Err(err)
         }
     }
+}
+
+/// Records a now-local snapshot in the bounded cache so it can be evicted later.
+///
+/// A *cold-materialized* snapshot is CAS-backed and re-materializable, so it is
+/// tracked as eviction-eligible; a snapshot that was already local only has its
+/// recency refreshed if already tracked — an untracked local snapshot may be a
+/// legacy node-local one that must not be evicted. The directory walk runs off
+/// the cache lock.
+async fn note_snapshot_cached(state: &AppState, snapshot_name: &str, existed: bool) {
+    if state.cas.is_none() {
+        return;
+    }
+    if existed {
+        let mut cache = state.cache.lock().await;
+        if cache.contains(snapshot_name) {
+            cache.touch(snapshot_name);
+        }
+    } else {
+        let size = dir_size(&state.paths.snapshot_checkpoint_dir(snapshot_name)).await;
+        state.cache.lock().await.record(
+            snapshot_name.to_string(),
+            cache::EntryKind::Materialized,
+            size,
+        );
+    }
+}
+
+/// Evicts the coldest unpinned materialized snapshots to bring the local CAS
+/// cache under `max_bytes`. Each victim is deleted under its snapshot lock, so a
+/// concurrent fork is never restoring from one being evicted; a victim that
+/// became pinned in the meantime is skipped. A snapshot evicted here is
+/// re-materialized from object storage on its next fork.
+async fn sweep_cache(state: &AppState, max_bytes: u64) {
+    let low_watermark = max_bytes - max_bytes / 8;
+    let (total, plan) = {
+        let cache = state.cache.lock().await;
+        (
+            cache.total_bytes(),
+            cache.evict_plan(max_bytes, low_watermark),
+        )
+    };
+    if plan.is_empty() {
+        return;
+    }
+    info!(
+        cache_bytes = total,
+        max_bytes,
+        evicting = plan.len(),
+        "bounded cache over budget; evicting cold snapshots"
+    );
+    for name in plan {
+        let _guard = state.snapshot_locks.acquire(&name).await;
+        if state.cache.lock().await.is_pinned(&name) {
+            continue;
+        }
+        match snapshots::delete(&state.paths, &name).await {
+            Ok(_) => {
+                state.cache.lock().await.remove(&name);
+                info!(snapshot = %name, "evicted cold snapshot from bounded cache");
+            }
+            Err(err) => {
+                warn!(snapshot = %name, error = %err, "failed to evict cached snapshot");
+            }
+        }
+    }
+}
+
+/// Total size in bytes of all files under `path`, or 0 if it cannot be read.
+async fn dir_size(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            match entry.file_type().await {
+                Ok(file_type) if file_type.is_dir() => stack.push(entry.path()),
+                Ok(_) => {
+                    if let Ok(meta) = entry.metadata().await {
+                        total += meta.len();
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    total
 }
 
 /// Marks a sandbox `Running`, clears its last error, and returns the record.

@@ -42,6 +42,7 @@ struct FileCasConfig {
     chunk_avg: Option<u32>,
     chunk_max: Option<u32>,
     zstd_level: Option<i32>,
+    cache_max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -159,6 +160,7 @@ fn resolve_cas_config(file: &FileCasConfig) -> Result<Option<CasConfig>> {
                 chunk_avg: file.chunk_avg.unwrap_or(DEFAULT_CHUNK_AVG),
                 chunk_max: file.chunk_max.unwrap_or(DEFAULT_CHUNK_MAX),
                 zstd_level: file.zstd_level.unwrap_or(DEFAULT_ZSTD_LEVEL),
+                cache_max_bytes: file.cache_max_bytes.unwrap_or(0),
             }))
         }
         _ => bail!(
@@ -369,7 +371,16 @@ fn apply_env_overrides(config: &mut FileConfig) -> Result<()> {
     if let Ok(value) = std::env::var("OAD_CAS_ZSTD_LEVEL") {
         config.cas.zstd_level = Some(parse_i32_env("OAD_CAS_ZSTD_LEVEL", &value)?);
     }
+    if let Ok(value) = std::env::var("OAD_CACHE_MAX_BYTES") {
+        config.cas.cache_max_bytes = Some(parse_u64_env("OAD_CACHE_MAX_BYTES", &value)?);
+    }
     Ok(())
+}
+
+fn parse_u64_env(name: &str, value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be a non-negative integer, got {value:?}"))
 }
 
 fn parse_u32_env(name: &str, value: &str) -> Result<u32> {
