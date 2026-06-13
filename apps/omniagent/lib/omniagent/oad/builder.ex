@@ -208,12 +208,13 @@ defmodule Omniagent.Oad.Builder do
          :ok <- maybe_clone(instance, sandbox_id, name, repo, git_ref, workspace_folder, env),
          devcontainer = read_devcontainer(instance, sandbox_id, workspace_folder),
          :ok <- run_create_hooks(instance, sandbox_id, name, workspace_folder, devcontainer, env),
-         {:ok, snapshot} <- snapshot(instance, sandbox_id, name, revision) do
+         {:ok, snapshot, descriptor_key} <- snapshot(instance, sandbox_id, name, revision) do
       emit(name, "snapshot #{snapshot} ready")
 
       {:ok,
        %{
          snapshot: snapshot,
+         descriptor_key: descriptor_key,
          agent_versions: agent_versions,
          start_script: devcontainer && Devcontainer.start_script(devcontainer),
          workspace_folder: workspace_folder
@@ -257,8 +258,8 @@ defmodule Omniagent.Oad.Builder do
 
     case Client.snapshot(instance, sandbox_id, %{"name" => snapshot_name}) do
       {:ok, response} ->
-        register_cas_snapshot(name, snapshot_name, response)
-        {:ok, snapshot_name}
+        descriptor_key = register_cas_snapshot(name, snapshot_name, response)
+        {:ok, snapshot_name, descriptor_key}
 
       {:error, reason} ->
         {:error, reason}
@@ -266,9 +267,10 @@ defmodule Omniagent.Oad.Builder do
   end
 
   # Records a CAS-published snapshot in the control-plane index (and refcounts
-  # its chunks) so it becomes discoverable for portability and GC. Non-fatal: a
-  # snapshot with no `cas` block came from a daemon without a CAS configured and
-  # stays node-local; an index failure is logged but does not fail the build.
+  # its chunks) so it becomes discoverable for portability and GC, and returns
+  # its descriptor key (or nil). Non-fatal: a snapshot with no `cas` block came
+  # from a daemon without a CAS configured and stays node-local; an index failure
+  # is logged but does not fail the build.
   defp register_cas_snapshot(workspace_name, snapshot_name, response) do
     case get_in(response, ["snapshot", "cas"]) do
       %{} = cas ->
@@ -286,12 +288,12 @@ defmodule Omniagent.Oad.Builder do
 
           {:error, reason} ->
             Logger.warning("failed to register CAS snapshot #{snapshot_name}: #{inspect(reason)}")
-
-            :ok
         end
 
+        cas["descriptor_key"]
+
       _ ->
-        :ok
+        nil
     end
   end
 

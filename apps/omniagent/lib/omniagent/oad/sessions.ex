@@ -38,7 +38,7 @@ defmodule Omniagent.Oad.Sessions do
     agent = opts[:agent] || "claude"
 
     with {:ok, workspace} <- ready_workspace(workspace_name),
-         {:ok, instance} <- live_instance(workspace.oad_base_url),
+         {:ok, instance} <- place_session(workspace),
          {:ok, server_url} <- server_url(instance),
          {:ok, session} <- pre_create_session(user, workspace, agent, opts[:name]),
          {:ok, fork_id} <- fork(instance, workspace) do
@@ -46,7 +46,7 @@ defmodule Omniagent.Oad.Sessions do
         {:ok, exec_id} ->
           Sessions.merge_metadata(session, %{
             "runner" => "oad",
-            "oad_base_url" => workspace.oad_base_url,
+            "oad_base_url" => instance.base_url,
             "oad_workspace" => workspace.name,
             "fork_sandbox_id" => fork_id,
             "exec_id" => exec_id
@@ -97,6 +97,28 @@ defmodule Omniagent.Oad.Sessions do
       nil -> {:error, {:oad_instance_offline, base_url}}
     end
   end
+
+  # Picks the oad instance to run a session on. A CAS-published workspace (one
+  # with a `descriptor_key`) is portable: prefer the endpoint that built it (warm
+  # cache, known CAS-capable) but fall back to any live instance, which
+  # materializes the snapshot from object storage on demand. A legacy,
+  # node-local workspace must run on the endpoint that holds its snapshot.
+  # Phase 3 replaces "first live" with a capacity- and cache-aware scheduler.
+  defp place_session(%OadWorkspace{descriptor_key: key, oad_base_url: base_url})
+       when is_binary(key) and key != "" do
+    live = OadInstances.list_live()
+
+    case Enum.find(live, &(&1.base_url == base_url)) || List.first(live) do
+      %OadInstance{} = instance -> {:ok, instance}
+      nil -> {:error, :no_live_oad_instance}
+    end
+  end
+
+  defp place_session(%OadWorkspace{oad_base_url: base_url}) when is_binary(base_url) do
+    live_instance(base_url)
+  end
+
+  defp place_session(%OadWorkspace{}), do: {:error, :no_oad_endpoint}
 
   defp find_instance(base_url) do
     Enum.find(OadInstances.list_live(), &(&1.base_url == base_url))

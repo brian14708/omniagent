@@ -18,6 +18,7 @@ defmodule Omniagent.OadWorkspaces.OadWorkspace do
   schema "oad_workspaces" do
     field :name, :string
     field :oad_base_url, :string
+    field :descriptor_key, :string
     field :snapshot, :string
     field :revision, :integer, default: 0
     field :image, :string
@@ -41,6 +42,7 @@ defmodule Omniagent.OadWorkspaces.OadWorkspace do
     |> cast(attrs, [
       :name,
       :oad_base_url,
+      :descriptor_key,
       :snapshot,
       :revision,
       :image,
@@ -56,7 +58,7 @@ defmodule Omniagent.OadWorkspaces.OadWorkspace do
       :last_error,
       :built_at
     ])
-    |> validate_required([:name, :oad_base_url, :image, :workspace_folder])
+    |> validate_required([:name, :image, :workspace_folder])
     |> validate_inclusion(:status, @statuses)
     # The name is used as the snapshot path segment ("<name>-v<rev>"), which oad
     # validates as an id segment — keep it to safe characters.

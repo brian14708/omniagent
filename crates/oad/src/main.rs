@@ -62,8 +62,9 @@ struct AppState {
     network: network::NetworkManager,
     background_execs: BackgroundExecStore,
     /// When set, captured snapshots are published to the content-addressed store
-    /// so they become portable across nodes.
-    cas: Option<Arc<cas::CasPublisher>>,
+    /// so they become portable across nodes, and forks can materialize snapshots
+    /// this node did not capture.
+    cas: Option<Arc<cas::Cas>>,
 }
 
 const BACKGROUND_EXEC_KILL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -89,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     let cas = config
         .cas
         .as_ref()
-        .map(cas::CasPublisher::from_config)
+        .map(cas::Cas::from_config)
         .transpose()
         .context("failed to initialize CAS publisher")?
         .map(Arc::new);
@@ -605,9 +606,24 @@ async fn fork_from_snapshot(
     validate_snapshot_name(snapshot_name).map_err(|err| AppError::BadRequest(err.to_string()))?;
     let _snapshot_guard = state.snapshot_locks.acquire(snapshot_name).await;
     if !snapshots::exists(&state.paths, snapshot_name).await {
-        return Err(AppError::NotFound(format!(
-            "snapshot {snapshot_name} not found"
-        )));
+        // Cold node: the snapshot was captured elsewhere. Materialize it from the
+        // content-addressed store (checkpoint images + manifest) before forking.
+        // The rootfs is rebuilt from the registry by `prepare_bundles` below.
+        match &state.cas {
+            Some(cas) => cas
+                .materialize_snapshot(&state.paths, snapshot_name)
+                .await
+                .map_err(|err| {
+                    AppError::NotFound(format!(
+                        "snapshot {snapshot_name} not found locally or in CAS: {err}"
+                    ))
+                })?,
+            None => {
+                return Err(AppError::NotFound(format!(
+                    "snapshot {snapshot_name} not found"
+                )));
+            }
+        }
     }
     let manifest = snapshots::read_manifest(&state.paths, snapshot_name).await?;
     let container_names = manifest.container_names();
