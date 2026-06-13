@@ -22,6 +22,18 @@ defmodule Omniagent.OadInstances.OadInstance do
     field :version, :string
     field :last_seen_at, :utc_datetime_usec
 
+    # Allocatable capacity reported by the daemon (0 = unknown/unconstrained).
+    field :alloc_cpu_millis, :integer, default: 0
+    field :alloc_memory_bytes, :integer, default: 0
+    field :alloc_disk_bytes, :integer, default: 0
+    # Committed capacity — scheduler-owned, never set from a heartbeat.
+    field :committed_cpu_millis, :integer, default: 0
+    field :committed_memory_bytes, :integer, default: 0
+    field :committed_disk_bytes, :integer, default: 0
+    field :labels, :map, default: %{}
+    field :status, :string, default: "active"
+    field :warm_snapshots, {:array, :string}, default: []
+
     timestamps(type: :utc_datetime_usec)
   end
 
@@ -34,7 +46,13 @@ defmodule Omniagent.OadInstances.OadInstance do
       :api_token,
       :capabilities,
       :version,
-      :last_seen_at
+      :last_seen_at,
+      :alloc_cpu_millis,
+      :alloc_memory_bytes,
+      :alloc_disk_bytes,
+      :labels,
+      :status,
+      :warm_snapshots
     ])
     |> validate_required([:instance_id, :base_url, :api_token, :last_seen_at])
     |> unique_constraint(:instance_id)

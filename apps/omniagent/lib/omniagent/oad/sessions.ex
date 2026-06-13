@@ -18,7 +18,7 @@ defmodule Omniagent.Oad.Sessions do
   require Logger
 
   alias Omniagent.{OadInstances, OadWorkspaces, Sessions}
-  alias Omniagent.Oad.Client
+  alias Omniagent.Oad.{Client, Placement}
   alias Omniagent.OadInstances.OadInstance
   alias Omniagent.OadWorkspaces.OadWorkspace
 
@@ -38,8 +38,21 @@ defmodule Omniagent.Oad.Sessions do
     agent = opts[:agent] || "claude"
 
     with {:ok, workspace} <- ready_workspace(workspace_name),
-         {:ok, instance} <- place_session(workspace),
-         {:ok, server_url} <- server_url(instance),
+         {:ok, instance, lease} <- place_session(workspace) do
+      case start_on(instance, lease, workspace, user, agent, opts) do
+        {:ok, session} ->
+          {:ok, session}
+
+        {:error, reason} ->
+          # Acquired capacity but couldn't start the session: return the lease.
+          Placement.release(lease_id(lease))
+          {:error, reason}
+      end
+    end
+  end
+
+  defp start_on(instance, lease, workspace, user, agent, opts) do
+    with {:ok, server_url} <- server_url(instance),
          {:ok, session} <- pre_create_session(user, workspace, agent, opts[:name]),
          {:ok, fork_id} <- fork(instance, workspace) do
       case launch(instance, fork_id, workspace, session, agent, server_url, opts) do
@@ -49,10 +62,11 @@ defmodule Omniagent.Oad.Sessions do
             "oad_base_url" => instance.base_url,
             "oad_workspace" => workspace.name,
             "fork_sandbox_id" => fork_id,
-            "exec_id" => exec_id
+            "exec_id" => exec_id,
+            "oad_placement_id" => lease_id(lease)
           })
 
-          spawn_reaper(instance, fork_id, exec_id, session.id)
+          spawn_reaper(instance, fork_id, exec_id, session.id, lease_id(lease))
           {:ok, session}
 
         {:error, reason} ->
@@ -63,8 +77,15 @@ defmodule Omniagent.Oad.Sessions do
     end
   end
 
+  defp lease_id(nil), do: nil
+  defp lease_id(%{id: id}), do: id
+
   @doc "Stops a session: kills its exec, deletes the fork. Best-effort."
   def stop_session(%{metadata: metadata}) when is_map(metadata) do
+    # Return the capacity lease first (idempotent, and safe even if the node is
+    # already gone), then best-effort tear down the fork.
+    Placement.release(metadata["oad_placement_id"])
+
     with base_url when is_binary(base_url) <- metadata["oad_base_url"],
          fork_id when is_binary(fork_id) <- metadata["fork_sandbox_id"],
          %OadInstance{} = instance <- find_instance(base_url) do
@@ -91,34 +112,39 @@ defmodule Omniagent.Oad.Sessions do
     end
   end
 
+  # Picks the oad instance (and a capacity lease) to run a session on. A
+  # CAS-published workspace (one with a `descriptor_key`) is portable: the
+  # scheduler places it on the best live instance (cache-affinity on the
+  # snapshot, then spread) and reserves capacity via a lease. A legacy,
+  # node-local workspace stays pinned to the endpoint that holds its snapshot
+  # and takes no lease.
+  defp place_session(%OadWorkspace{descriptor_key: key} = workspace)
+       when is_binary(key) and key != "" do
+    request =
+      Placement.request_from_resources(workspace.resources || %{}, %{
+        snapshot_name: workspace.snapshot,
+        kind: "session",
+        workspace: workspace.name
+      })
+
+    Placement.acquire(request)
+  end
+
+  defp place_session(%OadWorkspace{oad_base_url: base_url}) when is_binary(base_url) do
+    case live_instance(base_url) do
+      {:ok, instance} -> {:ok, instance, nil}
+      error -> error
+    end
+  end
+
+  defp place_session(%OadWorkspace{}), do: {:error, :no_oad_endpoint}
+
   defp live_instance(base_url) do
     case find_instance(base_url) do
       %OadInstance{} = instance -> {:ok, instance}
       nil -> {:error, {:oad_instance_offline, base_url}}
     end
   end
-
-  # Picks the oad instance to run a session on. A CAS-published workspace (one
-  # with a `descriptor_key`) is portable: prefer the endpoint that built it (warm
-  # cache, known CAS-capable) but fall back to any live instance, which
-  # materializes the snapshot from object storage on demand. A legacy,
-  # node-local workspace must run on the endpoint that holds its snapshot.
-  # Phase 3 replaces "first live" with a capacity- and cache-aware scheduler.
-  defp place_session(%OadWorkspace{descriptor_key: key, oad_base_url: base_url})
-       when is_binary(key) and key != "" do
-    live = OadInstances.list_live()
-
-    case Enum.find(live, &(&1.base_url == base_url)) || List.first(live) do
-      %OadInstance{} = instance -> {:ok, instance}
-      nil -> {:error, :no_live_oad_instance}
-    end
-  end
-
-  defp place_session(%OadWorkspace{oad_base_url: base_url}) when is_binary(base_url) do
-    live_instance(base_url)
-  end
-
-  defp place_session(%OadWorkspace{}), do: {:error, :no_oad_endpoint}
 
   defp find_instance(base_url) do
     Enum.find(OadInstances.list_live(), &(&1.base_url == base_url))
@@ -342,7 +368,7 @@ defmodule Omniagent.Oad.Sessions do
     Map.new(map, fn {key, value} -> {to_string(key), to_string(value)} end)
   end
 
-  defp spawn_reaper(instance, fork_id, exec_id, session_id) do
+  defp spawn_reaper(instance, fork_id, exec_id, session_id, lease_id) do
     Task.Supervisor.start_child(Omniagent.TaskSupervisor, fn ->
       watch_until_done(instance, fork_id, exec_id)
       # Capture why serve-session ended before the fork (and its exec log) is
@@ -350,6 +376,8 @@ defmodule Omniagent.Oad.Sessions do
       log_exec_outcome(instance, fork_id, exec_id, session_id)
       Logger.info("oad session #{session_id}: exec finished, deleting fork #{fork_id}")
       Client.delete_sandbox(instance, fork_id)
+      # Return the capacity lease now that the session is done.
+      Placement.release(lease_id)
       # Auth PR: revoke the per-session scoped token here.
     end)
   end

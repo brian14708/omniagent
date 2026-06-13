@@ -126,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
             cp,
             config.http.bearer_token.clone(),
             uuid::Uuid::new_v4().to_string(),
+            OadPaths::new(config.runtime.base_dir.clone()),
         ))
     });
     let registration_task = registration.as_ref().map(|r| Arc::clone(r).spawn());

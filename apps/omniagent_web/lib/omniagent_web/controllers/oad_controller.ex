@@ -15,13 +15,22 @@ defmodule OmniagentWeb.OadController do
 
   def register(conn, params) do
     if authorized?(conn) do
+      node = params["node"] || %{}
+      allocatable = node["allocatable"] || %{}
+
       attrs = %{
         "instance_id" => params["instance_id"],
         "name" => params["name"],
         "base_url" => params["advertise_url"] || params["base_url"],
         "api_token" => params["api_token"],
         "capabilities" => params["capabilities"] || %{},
-        "version" => params["version"]
+        "version" => params["version"],
+        "alloc_cpu_millis" => allocatable["cpu_millis"],
+        "alloc_memory_bytes" => allocatable["memory_bytes"],
+        "alloc_disk_bytes" => allocatable["disk_bytes"],
+        "labels" => node["labels"] || %{},
+        "status" => node["status"] || "active",
+        "warm_snapshots" => params["warm_snapshots"] || []
       }
 
       case OadInstances.register(attrs) do

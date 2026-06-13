@@ -46,7 +46,21 @@ defmodule Omniagent.OadInstances do
       |> Repo.insert(
         on_conflict:
           {:replace,
-           [:name, :base_url, :api_token, :capabilities, :version, :last_seen_at, :updated_at]},
+           [
+             :name,
+             :base_url,
+             :api_token,
+             :capabilities,
+             :version,
+             :last_seen_at,
+             :alloc_cpu_millis,
+             :alloc_memory_bytes,
+             :alloc_disk_bytes,
+             :labels,
+             :status,
+             :warm_snapshots,
+             :updated_at
+           ]},
         conflict_target: :instance_id
       )
       |> case do
@@ -99,7 +113,13 @@ defmodule Omniagent.OadInstances do
       base_url: fetch(attrs, :base_url),
       api_token: fetch(attrs, :api_token),
       capabilities: fetch(attrs, :capabilities) || %{},
-      version: fetch(attrs, :version)
+      version: fetch(attrs, :version),
+      alloc_cpu_millis: fetch(attrs, :alloc_cpu_millis) || 0,
+      alloc_memory_bytes: fetch(attrs, :alloc_memory_bytes) || 0,
+      alloc_disk_bytes: fetch(attrs, :alloc_disk_bytes) || 0,
+      labels: fetch(attrs, :labels) || %{},
+      status: fetch(attrs, :status) || "active",
+      warm_snapshots: fetch(attrs, :warm_snapshots) || []
     }
   end
 

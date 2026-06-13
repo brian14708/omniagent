@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use oad_core::ControlPlaneConfig;
+use oad_core::{ControlPlaneConfig, OadPaths};
 use serde_json::json;
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -26,6 +26,8 @@ pub struct Registration {
     /// This daemon's own `/v1` bearer token, handed to the control plane.
     api_token: String,
     instance_id: String,
+    /// Used to report which snapshots are materialized locally (cache-affinity).
+    paths: OadPaths,
     http: reqwest::Client,
 }
 
@@ -33,7 +35,12 @@ impl Registration {
     /// Builds a registration client. `api_token` is the daemon's `/v1` bearer
     /// token. `instance_id` should be stable for the process lifetime.
     #[must_use]
-    pub fn new(cp: ControlPlaneConfig, api_token: String, instance_id: String) -> Self {
+    pub fn new(
+        cp: ControlPlaneConfig,
+        api_token: String,
+        instance_id: String,
+        paths: OadPaths,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -42,6 +49,7 @@ impl Registration {
             cp,
             api_token,
             instance_id,
+            paths,
             http,
         }
     }
@@ -50,7 +58,14 @@ impl Registration {
         format!("{}/api/oad/register", self.cp.url.trim_end_matches('/'))
     }
 
-    fn payload(&self) -> serde_json::Value {
+    /// Builds the heartbeat payload, including this node's reported capacity and
+    /// the set of snapshots it holds locally (cache-affinity input).
+    async fn payload(&self) -> serde_json::Value {
+        let warm_snapshots: Vec<String> = crate::snapshots::list(&self.paths)
+            .await
+            .into_iter()
+            .map(|manifest| manifest.name)
+            .collect();
         json!({
             "instance_id": self.instance_id,
             "name": self.cp.name,
@@ -62,16 +77,29 @@ impl Registration {
                 "control_plane_url": self.cp.url,
                 "static_mount": true,
             },
+            "node": {
+                "allocatable": {
+                    "cpu_millis": detect_cpu_millis(),
+                    "memory_bytes": detect_memory_bytes(),
+                    // Disk accounting arrives with the bounded cache (Phase 4);
+                    // 0 means "unknown" and the scheduler leaves it unconstrained.
+                    "disk_bytes": 0,
+                },
+                "labels": {},
+                "status": "active",
+            },
+            "warm_snapshots": warm_snapshots,
         })
     }
 
     /// Sends one registration heartbeat.
     async fn beat(&self) {
+        let payload = self.payload().await;
         match self
             .http
             .post(self.register_url())
             .bearer_auth(&self.cp.register_token)
-            .json(&self.payload())
+            .json(&payload)
             .send()
             .await
         {
@@ -104,4 +132,33 @@ impl Registration {
             .send()
             .await;
     }
+}
+
+/// Allocatable CPU in millicores, derived from the host's parallelism. Returns
+/// 0 ("unknown") if it cannot be determined.
+fn detect_cpu_millis() -> u64 {
+    std::thread::available_parallelism()
+        .ok()
+        .and_then(|n| u64::try_from(n.get()).ok())
+        .map_or(0, |cores| cores * 1000)
+}
+
+/// Allocatable memory in bytes, read from `/proc/meminfo` `MemTotal`. Returns 0
+/// ("unknown") if it cannot be read or parsed.
+fn detect_memory_bytes() -> u64 {
+    let Ok(content) = std::fs::read_to_string("/proc/meminfo") else {
+        return 0;
+    };
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            // e.g. "MemTotal:       16307200 kB"
+            let kib = rest
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            return kib * 1024;
+        }
+    }
+    0
 }

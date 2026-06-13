@@ -17,7 +17,7 @@ defmodule Omniagent.Oad.Builder do
   require Logger
 
   alias Omniagent.{OadInstances, OadWorkspaces}
-  alias Omniagent.Oad.{Client, Devcontainer, Snapshots}
+  alias Omniagent.Oad.{Client, Devcontainer, Placement, Snapshots}
   alias Omniagent.OadInstances.OadInstance
 
   @pubsub Omniagent.PubSub
@@ -82,8 +82,23 @@ defmodule Omniagent.Oad.Builder do
     image = require_param(params, :image)
     workspace_folder = param(params, :workspace_folder) || "/workspace"
 
-    with {:ok, instance} <- resolve_instance(params),
-         {:ok, workspace} <-
+    case place_build(params) do
+      {:ok, instance, lease} ->
+        try do
+          do_build(instance, params, name, image, workspace_folder)
+        after
+          # The builder sandbox is short-lived; return its capacity lease once
+          # the build finishes (success, failure, or crash).
+          Placement.release(lease_id(lease))
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp do_build(instance, params, name, image, workspace_folder) do
+    with {:ok, workspace} <-
            OadWorkspaces.upsert(%{
              name: name,
              oad_base_url: instance.base_url,
@@ -116,6 +131,9 @@ defmodule Omniagent.Oad.Builder do
       end
     end
   end
+
+  defp lease_id(nil), do: nil
+  defp lease_id(%{id: id}), do: id
 
   defp run_build(instance, params, name, image, workspace_folder, revision) do
     emit(name, "creating builder sandbox from #{image}")
@@ -388,17 +406,20 @@ defmodule Omniagent.Oad.Builder do
 
   defp stderr_tail(stderr_chunks), do: stderr_chunks |> Enum.reverse() |> Enum.join()
 
-  defp resolve_instance(params) do
+  # Chooses the instance to build on and reserves capacity. Without a pin, the
+  # scheduler places the build on the best live instance and returns a lease;
+  # an explicit `oad_base_url` is an operator pin and takes no lease.
+  defp place_build(params) do
     case param(params, :oad_base_url) do
       nil ->
-        case OadInstances.list_live() do
-          [%OadInstance{} = instance | _] -> {:ok, instance}
-          [] -> {:error, :no_live_oad_instance}
-        end
+        param(params, :resources)
+        |> Kernel.||(%{})
+        |> Placement.request_from_resources(%{kind: "build"})
+        |> Placement.acquire()
 
       base_url ->
         case Enum.find(OadInstances.list_live(), &(&1.base_url == base_url)) do
-          %OadInstance{} = instance -> {:ok, instance}
+          %OadInstance{} = instance -> {:ok, instance, nil}
           nil -> {:error, {:oad_instance_offline, base_url}}
         end
     end
