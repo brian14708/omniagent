@@ -343,9 +343,13 @@
 <% end %>
 
 <%= if @modal == :new_oad_workspace do %>
-  <.modal>
+  <.modal panel_class="flex max-h-[85vh] w-full max-w-lg flex-col p-5">
     <h2 class="oa-display mb-4 text-lg font-bold">New oad workspace</h2>
-    <form phx-submit="create_oad_workspace" class="space-y-3">
+    <form
+      phx-submit="create_oad_workspace"
+      phx-change="oad_ws_changed"
+      class="flex min-h-0 flex-col space-y-3 overflow-y-auto"
+    >
       <label class="block">
         <span class="oa-label mb-1">Name</span>
         <input
@@ -378,10 +382,63 @@
       <label class="block">
         <span class="oa-label mb-1">Ref (optional)</span>
         <input name="git_ref" class="oa-input w-full" placeholder="main" autocomplete="off" />
+      </label>
+
+      <%!-- Agents to install — toggling regenerates the install script below. --%>
+      <div class="block">
+        <span class="oa-label mb-1">Agents to install</span>
+        <div class="flex flex-wrap gap-x-4 gap-y-1.5">
+          <%= for key <- ~w(claude-code codex gemini) do %>
+            <label class="flex items-center gap-1.5 font-mono text-[12px] text-[var(--dim)]">
+              <input type="checkbox" name="agents[]" value={key} checked={key in @oad_ws_agents} />
+              {key}
+            </label>
+          <% end %>
+        </div>
+      </div>
+
+      <label class="block">
+        <span class="oa-label mb-1">Install script</span>
+        <textarea
+          name="agent_install"
+          rows="3"
+          spellcheck="false"
+          class="oa-input w-full font-mono text-[12px]"
+        ><%= @oad_ws_install_script %></textarea>
         <span class="mt-1 block font-mono text-[11px] text-[var(--faint)]">
-          Built on a registered oad instance and snapshotted; sessions fork from the snapshot.
+          Generated from the selected agents — edit freely (toggling an agent regenerates it).
         </span>
       </label>
+
+      <label class="block">
+        <span class="oa-label mb-1">LLM env (optional)</span>
+        <textarea
+          name="env"
+          rows="3"
+          spellcheck="false"
+          class="oa-input w-full font-mono text-[12px]"
+          placeholder="ANTHROPIC_API_KEY=sk-...&#10;OPENAI_BASE_URL=https://..."
+        ></textarea>
+        <span class="mt-1 block font-mono text-[11px] text-[var(--faint)]">
+          One KEY=VALUE per line. Available at build time and to the running agent.
+        </span>
+      </label>
+
+      <div class="grid grid-cols-2 gap-3">
+        <label class="block">
+          <span class="oa-label mb-1">CPU (cores, optional)</span>
+          <input name="cpu" class="oa-input w-full" placeholder="2" autocomplete="off" />
+        </label>
+        <label class="block">
+          <span class="oa-label mb-1">Memory (optional)</span>
+          <input name="memory" class="oa-input w-full" placeholder="4Gi" autocomplete="off" />
+        </label>
+      </div>
+
+      <span class="block font-mono text-[11px] text-[var(--faint)]">
+        Built on a registered oad instance and snapshotted; sessions fork from the snapshot.
+      </span>
+
       <div class="flex justify-end gap-2 pt-2">
         <button type="button" phx-click="close_modal" class="oa-btn">Cancel</button>
         <button type="submit" class="oa-btn primary">Build workspace</button>

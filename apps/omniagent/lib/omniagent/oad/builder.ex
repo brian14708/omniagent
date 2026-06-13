@@ -91,6 +91,9 @@ defmodule Omniagent.Oad.Builder do
              workspace_folder: workspace_folder,
              repo: param(params, :repo),
              git_ref: param(params, :git_ref),
+             agent_install: param(params, :agent_install),
+             env: param(params, :env) || %{},
+             resources: param(params, :resources) || %{},
              status: "building"
            }) do
       revision = (workspace.revision || 0) + 1
@@ -196,12 +199,15 @@ defmodule Omniagent.Oad.Builder do
     agent_install = param(params, :agent_install) || @default_agent_install
     repo = param(params, :repo)
     git_ref = param(params, :git_ref)
+    # LLM env vars are injected into every build-step exec so install commands
+    # and devcontainer hooks can reach provider credentials.
+    env = encode_env(param(params, :env))
 
-    with :ok <- step(instance, sandbox_id, name, "install agents", agent_install),
+    with :ok <- step(instance, sandbox_id, name, "install agents", agent_install, env),
          agent_versions = capture_agent_versions(instance, sandbox_id),
-         :ok <- maybe_clone(instance, sandbox_id, name, repo, git_ref, workspace_folder),
+         :ok <- maybe_clone(instance, sandbox_id, name, repo, git_ref, workspace_folder, env),
          devcontainer = read_devcontainer(instance, sandbox_id, workspace_folder),
-         :ok <- run_create_hooks(instance, sandbox_id, name, workspace_folder, devcontainer),
+         :ok <- run_create_hooks(instance, sandbox_id, name, workspace_folder, devcontainer, env),
          {:ok, snapshot} <- snapshot(instance, sandbox_id, name, revision) do
       emit(name, "snapshot #{snapshot} ready")
 
@@ -217,25 +223,32 @@ defmodule Omniagent.Oad.Builder do
 
   # No repo: still create the workspace folder so it exists in the snapshot —
   # sessions exec with it as cwd, and runsc fails (exit 128) if it's missing.
-  defp maybe_clone(instance, sandbox_id, name, nil, _ref, folder) do
-    step(instance, sandbox_id, name, "create workspace folder", "mkdir -p #{shell_quote(folder)}")
+  defp maybe_clone(instance, sandbox_id, name, nil, _ref, folder, env) do
+    step(
+      instance,
+      sandbox_id,
+      name,
+      "create workspace folder",
+      "mkdir -p #{shell_quote(folder)}",
+      env
+    )
   end
 
-  defp maybe_clone(instance, sandbox_id, name, repo, ref, folder) do
+  defp maybe_clone(instance, sandbox_id, name, repo, ref, folder, env) do
     ref_args = if ref && ref != "", do: "--branch #{shell_quote(ref)} ", else: ""
 
     script =
       "rm -rf #{shell_quote(folder)} && git clone #{ref_args}#{shell_quote(repo)} #{shell_quote(folder)}"
 
-    step(instance, sandbox_id, name, "clone repo", script)
+    step(instance, sandbox_id, name, "clone repo", script, env)
   end
 
-  defp run_create_hooks(_i, _s, _name, _folder, nil), do: :ok
+  defp run_create_hooks(_i, _s, _name, _folder, nil, _env), do: :ok
 
-  defp run_create_hooks(instance, sandbox_id, name, folder, devcontainer) do
+  defp run_create_hooks(instance, sandbox_id, name, folder, devcontainer, env) do
     case Devcontainer.create_script(devcontainer) do
       nil -> :ok
-      script -> step(instance, sandbox_id, name, "devcontainer create hooks", script, folder)
+      script -> step(instance, sandbox_id, name, "devcontainer create hooks", script, env, folder)
     end
   end
 
@@ -283,9 +296,10 @@ defmodule Omniagent.Oad.Builder do
   # the console (over PubSub) as it runs; a non-zero exit aborts the build. Uses
   # a background exec + SSE event stream rather than a one-off exec so a long
   # step (npm install, devcontainer hooks) shows progress instead of one line.
-  defp step(instance, sandbox_id, name, label, script, cwd \\ nil) do
+  defp step(instance, sandbox_id, name, label, script, env, cwd \\ nil) do
     emit(name, label)
     body = %{"command" => ["sh", "-lc", script]}
+    body = if env != [], do: Map.put(body, "env", env), else: body
     body = if cwd, do: Map.put(body, "cwd", cwd), else: body
 
     case Client.start_exec(instance, sandbox_id, body) do
@@ -376,6 +390,14 @@ defmodule Omniagent.Oad.Builder do
       value -> value
     end
   end
+
+  # Encodes the workspace env map (%{"KEY" => "VALUE"}) into the [{name, value}]
+  # list the oad exec API expects. nil/empty -> [] (no env on the exec body).
+  defp encode_env(env) when is_map(env) do
+    for {key, value} <- env, do: %{"name" => to_string(key), "value" => to_string(value)}
+  end
+
+  defp encode_env(_), do: []
 
   defp emit(name, message) do
     Logger.info("oad build #{name}: #{message}")

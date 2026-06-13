@@ -33,6 +33,13 @@ defmodule OmniagentWeb.ConsoleLive do
   @bool_prefs ~w(sidebar_collapsed right_collapsed sessions_collapsed)a
   @num_prefs %{left_w: {180, 520}, right_w: {240, 600}, term_pct: {20, 85}}
 
+  # Agent CLIs offered in the New oad workspace modal: {checkbox key, npm package}.
+  @oad_agents [
+    {"claude-code", "@anthropic-ai/claude-code"},
+    {"codex", "@openai/codex"},
+    {"gemini", "@google/gemini-cli"}
+  ]
+
   @impl true
   def mount(_params, _session, socket) do
     user = Accounts.default_user()
@@ -79,7 +86,9 @@ defmodule OmniagentWeb.ConsoleLive do
        oad_agent_workspace: nil,
        oad_build_name: nil,
        oad_build_status: nil,
-       oad_build_log: []
+       oad_build_log: [],
+       oad_ws_agents: [],
+       oad_ws_install_script: ""
      })
      # Cosmetic UI prefs (later hydrated from the browser by the Prefs hook).
      |> assign(%{
@@ -339,7 +348,35 @@ defmodule OmniagentWeb.ConsoleLive do
   # ── oad workspaces ──────────────────────────────────────────────────────────
 
   def handle_event("open_new_oad_workspace", _params, socket) do
-    {:noreply, assign(socket, :modal, :new_oad_workspace)}
+    agents = Enum.map(@oad_agents, &elem(&1, 0))
+
+    {:noreply,
+     socket
+     |> assign(:modal, :new_oad_workspace)
+     |> assign(:oad_ws_agents, agents)
+     |> assign(:oad_ws_install_script, default_agent_install(agents))}
+  end
+
+  # Live form change: when the selected agent set changes, regenerate the install
+  # script (overwriting prior generation); otherwise preserve the operator's
+  # hand-edited script so typing in other fields doesn't clobber their edits.
+  def handle_event("oad_ws_changed", params, socket) do
+    agents = params["agents"] || []
+
+    socket =
+      if agents == socket.assigns.oad_ws_agents do
+        assign(
+          socket,
+          :oad_ws_install_script,
+          params["agent_install"] || socket.assigns.oad_ws_install_script
+        )
+      else
+        socket
+        |> assign(:oad_ws_agents, agents)
+        |> assign(:oad_ws_install_script, default_agent_install(agents))
+      end
+
+    {:noreply, socket}
   end
 
   def handle_event("create_oad_workspace", params, socket) do
@@ -365,7 +402,10 @@ defmodule OmniagentWeb.ConsoleLive do
              name: name,
              image: image,
              repo: blank_to_nil(params["repo"]),
-             git_ref: blank_to_nil(params["git_ref"])
+             git_ref: blank_to_nil(params["git_ref"]),
+             agent_install: blank_to_nil(params["agent_install"]),
+             env: parse_env_lines(params["env"]),
+             resources: build_resources(params["cpu"], params["memory"])
            },
            "building #{name}…",
            "Building oad workspace #{name}…"
@@ -388,7 +428,10 @@ defmodule OmniagentWeb.ConsoleLive do
              repo: ws.repo,
              git_ref: ws.git_ref,
              workspace_folder: ws.workspace_folder,
-             oad_base_url: ws.oad_base_url
+             oad_base_url: ws.oad_base_url,
+             agent_install: ws.agent_install,
+             env: ws.env || %{},
+             resources: ws.resources || %{}
            },
            "rebuilding #{name}…",
            "Rebuilding #{name}…"
@@ -835,6 +878,52 @@ defmodule OmniagentWeb.ConsoleLive do
       "" -> nil
       trimmed -> trimmed
     end
+  end
+
+  # Builds the `npm install -g` command for the selected agents. Empty when none
+  # are checked (the build then installs nothing).
+  defp default_agent_install(agents) do
+    case for({key, pkg} <- @oad_agents, key in agents, do: pkg) do
+      [] -> ""
+      pkgs -> "npm install -g --loglevel http " <> Enum.join(pkgs, " ")
+    end
+  end
+
+  # Parses a KEY=VALUE-per-line env textarea into a string map. Blank lines and
+  # `#` comments are ignored; keys are trimmed, values kept verbatim.
+  defp parse_env_lines(nil), do: %{}
+
+  defp parse_env_lines(text) do
+    text
+    |> String.split(~r/\r?\n/)
+    |> Enum.reduce(%{}, fn line, acc ->
+      trimmed = String.trim(line)
+
+      cond do
+        trimmed == "" or String.starts_with?(trimmed, "#") ->
+          acc
+
+        true ->
+          case String.split(trimmed, "=", parts: 2) do
+            [key, value] ->
+              case String.trim(key) do
+                "" -> acc
+                k -> Map.put(acc, k, value)
+              end
+
+            _ ->
+              acc
+          end
+      end
+    end)
+  end
+
+  # Collects the optional CPU/memory inputs into a resources map; conversion to
+  # OCI cgroup limits happens at session fork (Omniagent.Oad.Sessions).
+  defp build_resources(cpu, memory) do
+    %{}
+    |> put_present("cpu", blank_to_nil(cpu))
+    |> put_present("memory", blank_to_nil(memory))
   end
 
   # Subscribes to a build's progress topic, kicks off the async build, and opens

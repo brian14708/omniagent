@@ -13,8 +13,8 @@ use bytes::{Bytes, BytesMut};
 use flate2::read::GzDecoder;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use oad_core::{
-    ContainerSpec, EnvVar, MountSpec, OadPaths, PAUSE_CONTAINER, SandboxId, publish_atomic_file,
-    write_atomic_file,
+    ContainerSpec, EnvVar, MountSpec, OadPaths, PAUSE_CONTAINER, ResourceSpec, SandboxId,
+    publish_atomic_file, write_atomic_file,
 };
 use reqwest::header::{ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
 use serde::Deserialize;
@@ -109,6 +109,7 @@ impl GvisorManager {
             network_namespace: network_namespace.map(Path::to_path_buf),
             resolv_conf: resolv_conf.map(Path::to_path_buf),
             mounts: Vec::new(),
+            resources: None,
             annotations: BTreeMap::from([
                 (
                     "io.kubernetes.cri.container-type".to_string(),
@@ -165,6 +166,7 @@ impl GvisorManager {
             network_namespace: network_namespace.map(Path::to_path_buf),
             resolv_conf: resolv_conf.map(Path::to_path_buf),
             mounts: static_mounts.to_vec(),
+            resources: container.resources.clone(),
             annotations: BTreeMap::from([
                 (
                     "io.kubernetes.cri.container-type".to_string(),
@@ -999,7 +1001,44 @@ struct GvisorConfig<'a> {
     resolv_conf: Option<PathBuf>,
     /// Extra host bind mounts (e.g. static assets like the `omniagent` binary).
     mounts: Vec<MountSpec>,
+    /// CPU/memory cgroup limits emitted under `linux.resources`; `None` leaves
+    /// the container unconstrained.
+    resources: Option<ResourceSpec>,
     annotations: BTreeMap<String, String>,
+}
+
+/// Builds the OCI `linux.resources` JSON for a [`ResourceSpec`], emitting only
+/// the cpu/memory fields that were set. Returns `None` when nothing is set.
+fn linux_resources_json(resources: &ResourceSpec) -> Option<serde_json::Value> {
+    let mut out = serde_json::Map::new();
+
+    if let Some(cpu) = &resources.cpu {
+        let mut cpu_json = serde_json::Map::new();
+        if let Some(quota) = cpu.quota {
+            cpu_json.insert("quota".to_string(), json!(quota));
+        }
+        if let Some(period) = cpu.period {
+            cpu_json.insert("period".to_string(), json!(period));
+        }
+        if let Some(shares) = cpu.shares {
+            cpu_json.insert("shares".to_string(), json!(shares));
+        }
+        if !cpu_json.is_empty() {
+            out.insert("cpu".to_string(), json!(cpu_json));
+        }
+    }
+
+    if let Some(memory) = &resources.memory
+        && let Some(limit) = memory.limit
+    {
+        out.insert("memory".to_string(), json!({ "limit": limit }));
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(json!(out))
+    }
 }
 
 async fn write_gvisor_config_json(path: &Path, config: &GvisorConfig<'_>) -> Result<(), OciError> {
@@ -1024,7 +1063,12 @@ async fn write_gvisor_config_json(path: &Path, config: &GvisorConfig<'_>) -> Res
         namespaces.push(json!({"type": "network", "path": netns}));
     }
 
-    let linux = json!({ "namespaces": namespaces });
+    let mut linux = json!({ "namespaces": namespaces });
+
+    // CPU/memory cgroup limits (honored by runsc), emitting only the fields set.
+    if let Some(resources) = config.resources.as_ref().and_then(linux_resources_json) {
+        linux["resources"] = resources;
+    }
 
     let mut annotations = config.annotations.clone();
     annotations.insert(
@@ -2375,6 +2419,7 @@ mod tests {
             network_namespace: None,
             resolv_conf: None,
             mounts: Vec::new(),
+            resources: None,
             annotations: BTreeMap::new(),
         };
         let config_json = write_config_json(&config).await;
@@ -2405,6 +2450,7 @@ mod tests {
             network_namespace: Some(PathBuf::from("/run/netns/oad")),
             resolv_conf: None,
             mounts: Vec::new(),
+            resources: None,
             annotations: BTreeMap::new(),
         };
         let config_json = write_config_json(&config).await;
@@ -2428,6 +2474,7 @@ mod tests {
             network_namespace: None,
             resolv_conf: None,
             mounts: Vec::new(),
+            resources: None,
             annotations: BTreeMap::new(),
         };
         let config_json = write_config_json(&config).await;
@@ -2458,6 +2505,7 @@ mod tests {
             network_namespace: None,
             resolv_conf: Some(PathBuf::from("/run/omniagent/sandboxes/s/resolv.conf")),
             mounts: Vec::new(),
+            resources: None,
             annotations: BTreeMap::new(),
         };
         let config_json = write_config_json(&config).await;
@@ -2487,6 +2535,7 @@ mod tests {
                 destination: "/opt/omniagent".to_string(),
                 read_only: true,
             }],
+            resources: None,
             annotations: BTreeMap::new(),
         };
         let config_json = write_config_json(&config).await;
@@ -2507,5 +2556,61 @@ mod tests {
             .collect();
         assert!(options.contains(&"rbind"));
         assert!(options.contains(&"ro"));
+    }
+
+    #[tokio::test]
+    async fn spec_emits_linux_resources_when_set() {
+        let config = GvisorConfig {
+            container_name: "web",
+            args: vec!["/bin/sh".to_string()],
+            env: vec![],
+            cwd: "/".to_string(),
+            rootfs: PathBuf::from("/tmp/rootfs.erofs"),
+            rootfs_overlay: PathBuf::from("/tmp/rootfs-overlay"),
+            network_namespace: None,
+            resolv_conf: None,
+            mounts: Vec::new(),
+            resources: Some(ResourceSpec {
+                cpu: Some(oad_core::CpuSpec {
+                    quota: Some(200_000),
+                    period: Some(100_000),
+                    shares: None,
+                }),
+                memory: Some(oad_core::MemorySpec {
+                    limit: Some(536_870_912),
+                }),
+            }),
+            annotations: BTreeMap::new(),
+        };
+        let config_json = write_config_json(&config).await;
+
+        assert_eq!(config_json["linux"]["resources"]["cpu"]["quota"], 200_000);
+        assert_eq!(config_json["linux"]["resources"]["cpu"]["period"], 100_000);
+        // Unset fields are omitted rather than emitted as null.
+        assert!(config_json["linux"]["resources"]["cpu"]["shares"].is_null());
+        assert_eq!(
+            config_json["linux"]["resources"]["memory"]["limit"],
+            536_870_912i64
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_omits_linux_resources_when_unset() {
+        let config = GvisorConfig {
+            container_name: "web",
+            args: vec!["/bin/sh".to_string()],
+            env: vec![],
+            cwd: "/".to_string(),
+            rootfs: PathBuf::from("/tmp/rootfs.erofs"),
+            rootfs_overlay: PathBuf::from("/tmp/rootfs-overlay"),
+            network_namespace: None,
+            resolv_conf: None,
+            mounts: Vec::new(),
+            resources: None,
+            annotations: BTreeMap::new(),
+        };
+        let config_json = write_config_json(&config).await;
+
+        assert!(config_json["linux"]["resources"].is_null());
     }
 }

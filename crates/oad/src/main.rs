@@ -449,7 +449,14 @@ async fn create_sandbox(
     // A snapshot fork is comparatively quick (cached rootfs + checkpoint
     // restore), so it stays synchronous and returns the running record.
     if let Some(snapshot) = from_snapshot {
-        let record = fork_from_snapshot(&state, &id, request.network.clone(), &snapshot).await?;
+        let record = fork_from_snapshot(
+            &state,
+            &id,
+            request.network.clone(),
+            request.resources.clone(),
+            &snapshot,
+        )
+        .await?;
         return Ok((
             StatusCode::CREATED,
             Json(SandboxResponse { sandbox: record }),
@@ -579,6 +586,7 @@ async fn fork_from_snapshot(
     state: &AppState,
     id: &SandboxId,
     request_network: Option<SandboxNetworkSpec>,
+    request_resources: Option<oad_core::ResourceSpec>,
     snapshot_name: &str,
 ) -> Result<SandboxRecord, AppError> {
     validate_snapshot_name(snapshot_name).map_err(|err| AppError::BadRequest(err.to_string()))?;
@@ -591,6 +599,16 @@ async fn fork_from_snapshot(
     let manifest = snapshots::read_manifest(&state.paths, snapshot_name).await?;
     let container_names = manifest.container_names();
     let network = effective_fork_network(state, request_network, &manifest.network)?;
+
+    // A request-level resource override replaces the limits on every container
+    // restored from the snapshot, so resources are runtime data set per fork
+    // rather than baked into the immutable snapshot.
+    let mut containers = manifest.containers.clone();
+    if let Some(resources) = &request_resources {
+        for container in &mut containers {
+            container.resources = Some(resources.clone());
+        }
+    }
 
     let mut record = SandboxRecord::new_pending(id.clone(), container_names.clone());
     record.origin_snapshot = Some(snapshot_name.to_string());
@@ -610,7 +628,7 @@ async fn fork_from_snapshot(
     let runsc_network_mode = runsc_network_mode(state, network_namespace.as_deref());
     let spec = SandboxSpec {
         pause_image: manifest.pause_image.clone(),
-        containers: manifest.containers.clone(),
+        containers: containers.clone(),
         network: network.clone(),
         network_mode: Some(runsc_network_mode.into()),
     };
@@ -623,7 +641,7 @@ async fn fork_from_snapshot(
         state,
         id,
         &manifest.pause_image,
-        &manifest.containers,
+        &containers,
         network_namespace.as_deref(),
     )
     .await

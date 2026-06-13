@@ -111,12 +111,95 @@ defmodule Omniagent.Oad.Sessions do
   end
 
   defp fork(instance, workspace) do
-    case Client.create(instance, %{"from_snapshot" => workspace.snapshot}) do
+    body =
+      %{"from_snapshot" => workspace.snapshot}
+      |> maybe_put_resources(workspace.resources)
+
+    case Client.create(instance, body) do
       {:ok, %{"sandbox" => %{"id" => id}}} -> {:ok, id}
       {:ok, other} -> {:error, {:unexpected_fork_response, other}}
       {:error, reason} -> {:error, reason}
     end
   end
+
+  # Translates the workspace's CPU/memory specs into the OCI-shaped `resources`
+  # override the daemon applies to every container restored from the snapshot.
+  # Omits the key entirely when nothing is set, so the fork stays unconstrained.
+  defp maybe_put_resources(body, resources) when is_map(resources) do
+    case oci_resources(resources) do
+      map when map == %{} -> body
+      oci -> Map.put(body, "resources", oci)
+    end
+  end
+
+  defp maybe_put_resources(body, _), do: body
+
+  defp oci_resources(resources) do
+    %{}
+    |> put_cpu(Map.get(resources, "cpu") || Map.get(resources, :cpu))
+    |> put_memory(Map.get(resources, "memory") || Map.get(resources, :memory))
+  end
+
+  # CPU is entered as a (possibly fractional) core count and mapped onto CFS
+  # bandwidth: quota = cores * period, with the conventional 100ms period.
+  @cpu_period 100_000
+  defp put_cpu(map, value) do
+    case parse_cpu(value) do
+      nil -> map
+      quota -> Map.put(map, "cpu", %{"quota" => quota, "period" => @cpu_period})
+    end
+  end
+
+  defp put_memory(map, value) do
+    case parse_memory(value) do
+      nil -> map
+      bytes -> Map.put(map, "memory", %{"limit" => bytes})
+    end
+  end
+
+  defp parse_cpu(value) when is_number(value) and value > 0,
+    do: round(value * @cpu_period)
+
+  defp parse_cpu(value) when is_binary(value) do
+    case Float.parse(String.trim(value)) do
+      {cores, _} when cores > 0 -> round(cores * @cpu_period)
+      _ -> nil
+    end
+  end
+
+  defp parse_cpu(_), do: nil
+
+  # Accepts a plain byte count, a number (interpreted as MB), or a suffixed size
+  # (Ki/Mi/Gi binary or K/M/G decimal). Returns bytes, or nil when unparseable.
+  defp parse_memory(value) when is_integer(value) and value > 0, do: value * 1_048_576
+
+  defp parse_memory(value) when is_binary(value) do
+    trimmed = value |> String.trim() |> String.downcase()
+
+    case Regex.run(~r/^(\d+(?:\.\d+)?)\s*([a-z]*)$/, trimmed) do
+      [_, num, suffix] ->
+        case Float.parse(num) do
+          {n, _} when n > 0 -> round(n * memory_multiplier(suffix))
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp parse_memory(_), do: nil
+
+  defp memory_multiplier("gi"), do: 1024 * 1024 * 1024
+  defp memory_multiplier("mi"), do: 1024 * 1024
+  defp memory_multiplier("ki"), do: 1024
+  defp memory_multiplier("g"), do: 1_000_000_000
+  defp memory_multiplier("m"), do: 1_000_000
+  defp memory_multiplier("k"), do: 1_000
+  defp memory_multiplier("b"), do: 1
+  # A bare number is treated as megabytes (the form the modal hints at).
+  defp memory_multiplier(""), do: 1_048_576
+  defp memory_multiplier(_), do: 1_048_576
 
   defp launch(instance, fork_id, workspace, session, agent, server_url, opts) do
     omniagent_path = omniagent_path(instance)
@@ -144,7 +227,7 @@ defmodule Omniagent.Oad.Sessions do
       "command" => command,
       "cwd" => workspace.workspace_folder,
       "pty" => false,
-      "env" => session_env(session_token(), server_url)
+      "env" => session_env(session_token(), server_url, workspace)
     }
 
     case Client.start_exec(instance, fork_id, body) do
@@ -215,7 +298,7 @@ defmodule Omniagent.Oad.Sessions do
     OPENAI_API_KEY
   )
 
-  defp session_env(token, server_url) do
+  defp session_env(token, server_url, workspace) do
     provider =
       Map.new(@forwarded_provider_env, fn key -> {key, System.get_env(key)} end)
       |> Map.reject(fn {_key, value} -> is_nil(value) end)
@@ -226,8 +309,12 @@ defmodule Omniagent.Oad.Sessions do
       "OMNIAGENT_CONTROL_PLANE_URL" => server_url
     })
     |> Map.merge(stringify_env(Application.get_env(:omniagent, :oad_session_env, %{})))
+    |> Map.merge(stringify_env(workspace_env(workspace)))
     |> Enum.map(fn {key, value} -> %{"name" => key, "value" => value} end)
   end
+
+  defp workspace_env(%OadWorkspace{env: env}) when is_map(env), do: env
+  defp workspace_env(_), do: %{}
 
   defp stringify_env(map) do
     Map.new(map, fn {key, value} -> {to_string(key), to_string(value)} end)

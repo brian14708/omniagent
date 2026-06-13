@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use oad_core::{ContainerSpec, EnvVar, SandboxNetworkSpec, SandboxRecord};
+use oad_core::{ContainerSpec, EnvVar, ResourceSpec, SandboxNetworkSpec, SandboxRecord};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde::{Deserializer, Serializer};
@@ -24,6 +24,12 @@ pub struct CreateSandboxRequest {
     /// for fresh sandboxes and snapshot forks inherit the snapshot policy.
     #[serde(default)]
     pub network: Option<SandboxNetworkSpec>,
+    /// Optional CPU/memory limits. On a snapshot fork this overrides the limits
+    /// on every container restored from the snapshot, so resources can be set
+    /// per session without rebaking the snapshot. When omitted, containers keep
+    /// whatever limits their spec carries (typically none).
+    #[serde(default)]
+    pub resources: Option<ResourceSpec>,
 }
 
 /// Request to capture a snapshot of a running sandbox. The snapshot's

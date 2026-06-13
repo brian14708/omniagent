@@ -155,6 +155,11 @@ pub struct ContainerSpec {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: Vec<EnvVar>,
+    /// Optional CPU/memory limits enforced via the OCI `linux.resources` cgroup
+    /// block. `None` (the default) leaves the container unconstrained, which is
+    /// also how specs persisted before this field existed deserialize.
+    #[serde(default)]
+    pub resources: Option<ResourceSpec>,
 }
 
 impl ContainerSpec {
@@ -211,6 +216,38 @@ pub fn container_names(containers: &[ContainerSpec]) -> Vec<String> {
 pub struct EnvVar {
     pub name: String,
     pub value: String,
+}
+
+/// CPU/memory limits for a container.
+///
+/// Mapped onto the OCI `linux.resources` cgroup block (honored by runsc). Every
+/// field is optional so a partial spec (e.g. memory only) emits only the limits
+/// that were set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ResourceSpec {
+    #[serde(default)]
+    pub cpu: Option<CpuSpec>,
+    #[serde(default)]
+    pub memory: Option<MemorySpec>,
+}
+
+/// CPU cgroup limits. `quota`/`period` (CFS bandwidth, microseconds) cap
+/// throughput — e.g. `quota: 200000, period: 100000` allows two cores' worth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CpuSpec {
+    #[serde(default)]
+    pub quota: Option<i64>,
+    #[serde(default)]
+    pub period: Option<u64>,
+    #[serde(default)]
+    pub shares: Option<u64>,
+}
+
+/// Memory cgroup limits. `limit` is the hard cap in bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MemorySpec {
+    #[serde(default)]
+    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -755,6 +792,40 @@ mod tests {
             validate_container_name(PAUSE_CONTAINER),
             Err(ValidationError::ReservedContainerName(_))
         ));
+    }
+
+    #[test]
+    fn container_spec_without_resources_deserializes_to_none() {
+        // A spec persisted before the `resources` field existed must still load.
+        let json = r#"{"name":"main","image":"busybox","command":["sleep","infinity"]}"#;
+        let spec: ContainerSpec = serde_json::from_str(json).unwrap();
+        assert!(spec.resources.is_none());
+        assert!(spec.env.is_empty());
+    }
+
+    #[test]
+    fn container_spec_resources_round_trip() {
+        let spec = ContainerSpec {
+            name: "main".to_string(),
+            image: "busybox".to_string(),
+            command: vec![],
+            args: vec![],
+            env: vec![],
+            resources: Some(ResourceSpec {
+                cpu: Some(CpuSpec {
+                    quota: Some(200_000),
+                    period: Some(100_000),
+                    shares: None,
+                }),
+                memory: Some(MemorySpec {
+                    limit: Some(536_870_912),
+                }),
+            }),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: ContainerSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        assert_eq!(back.resources, spec.resources);
     }
 
     #[test]

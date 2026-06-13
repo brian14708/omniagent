@@ -25,6 +25,9 @@ defmodule Omniagent.OadWorkspaces.OadWorkspace do
     field :repo, :string
     field :git_ref, :string
     field :start_script, :string
+    field :agent_install, :string
+    field :env, :map, default: %{}
+    field :resources, :map, default: %{}
     field :agent_versions, :map, default: %{}
     field :status, :string, default: "building"
     field :last_error, :string
@@ -45,6 +48,9 @@ defmodule Omniagent.OadWorkspaces.OadWorkspace do
       :repo,
       :git_ref,
       :start_script,
+      :agent_install,
+      :env,
+      :resources,
       :agent_versions,
       :status,
       :last_error,
