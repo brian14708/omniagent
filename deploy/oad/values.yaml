@@ -1,0 +1,119 @@
+# oad runs as a privileged, node-level daemon that hosts gVisor sandboxes, so it
+# is deployed as a DaemonSet by default (one instance per eligible node). Each
+# instance self-registers with the control plane and advertises its own pod IP,
+# which the control plane calls directly.
+
+# DaemonSet (one per node, the natural fit for a node-level sandbox host) or
+# Deployment (a fixed pool of sandbox hosts). Either way each pod is independent.
+kind: DaemonSet
+# replicaCount applies only when kind=Deployment.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/brian14708/omniagent/oad
+  pullPolicy: IfNotPresent
+  tag: nightly
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+
+# oad manages mounts, network namespaces and nested gVisor sandboxes, all of
+# which require a privileged container running as root. Relaxing this will break
+# sandbox creation.
+securityContext:
+  privileged: true
+  runAsUser: 0
+
+# The HTTP API the control plane calls. Reached directly by pod IP (advertised
+# via OAD_ADVERTISE_URL); the Service below is optional.
+http:
+  port: 8080
+
+service:
+  enabled: false
+  type: ClusterIP
+  annotations: {}
+
+# Persistent daemon state (sandbox records, OCI layer cache, snapshots). On a
+# DaemonSet a hostPath keeps the cache warm across pod restarts and reboots;
+# switch to emptyDir for ephemeral nodes.
+persistence:
+  type: hostPath # hostPath | emptyDir
+  hostPath: /var/lib/omniagent
+  baseDir: /var/lib/omniagent
+
+controlPlane:
+  # Base URL of the OmniAgent control plane this daemon registers with, e.g.
+  # http://omniagent.omniagent.svc.cluster.local:4000 . Leave empty to run the
+  # daemon without auto-registration.
+  url: ""
+  # Display name reported to the control plane. Defaults to the node name when
+  # left empty (see configmap.yaml / OAD_INSTANCE_NAME).
+  instanceName: ""
+  # Path to the omniagent CLI bind-mounted into sandboxes. The image ships it at
+  # the default location, so this normally needs no change.
+  omniagentPath: /opt/omniagent/bin/omniagent
+
+# Sandbox networking. Defaults mirror the daemon's built-ins; set values to
+# override. backend is hostinet or netstack.
+network:
+  enabled: true
+  backend: ""
+  sandboxCidr: ""
+  envoyListener: ""
+  dnsListener: ""
+  dnsUpstream: ""
+
+secrets:
+  create: true
+  existingSecret: ""
+  # Bearer token the control plane must present on the daemon's /v1 API.
+  # REQUIRED — the daemon refuses to start without it. A random token is
+  # generated when left empty.
+  bearerToken: ""
+  # Token the daemon presents when registering with the control plane.
+  # Required whenever controlPlane.url is set.
+  registerToken: ""
+
+extraEnv: []
+
+resources: {}
+
+probes:
+  liveness:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 6
+  readiness:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 6
+
+updateStrategy: {}
+
+# DaemonSets commonly need to tolerate control-plane / tainted nodes; left empty
+# by default so only eligible worker nodes are targeted.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+volumes: []
+volumeMounts: []

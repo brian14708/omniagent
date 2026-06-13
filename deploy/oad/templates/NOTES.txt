@@ -1,0 +1,31 @@
+OmniAgent daemon (oad) has been installed as a {{ .Values.kind }}.
+
+oad runs PRIVILEGED, as root — it hosts nested gVisor sandboxes and programs
+host networking. Ensure the target nodes permit privileged pods (PodSecurity
+"privileged", or an equivalent policy).
+
+Auth / registration:
+  - OAD_BEARER_TOKEN is {{ if .Values.secrets.bearerToken }}set from values{{ else }}auto-generated into the chart Secret{{ end }}.
+{{- if .Values.controlPlane.url }}
+  - Registering with control plane at: {{ .Values.controlPlane.url }}
+  {{- if not .Values.secrets.registerToken }}
+  - WARNING: controlPlane.url is set but secrets.registerToken is empty.
+    The daemon will start but cannot register. Set secrets.registerToken.
+  {{- end }}
+{{- else }}
+  - No control plane configured (controlPlane.url is empty); the daemon runs
+    without auto-registration. Set controlPlane.url and secrets.registerToken
+    to have it self-register.
+{{- end }}
+
+Each pod advertises http://<pod-ip>:{{ .Values.http.port }} to the control plane,
+which calls its /v1 API directly.
+
+Read the generated bearer token:
+  kubectl get secret {{ include "oad.secretName" . }} \
+    -o jsonpath='{.data.OAD_BEARER_TOKEN}' | base64 -d; echo
+
+Example install:
+  helm upgrade --install {{ .Release.Name }} ./deploy/oad \
+    --set controlPlane.url='http://omniagent.{{ .Release.Namespace }}.svc.cluster.local:4000' \
+    --set secrets.registerToken='<control-plane register token>'

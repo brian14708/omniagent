@@ -1,0 +1,29 @@
+{{- if .Values.service.enabled }}
+{{- /*
+The control plane reaches each daemon directly by advertised pod IP, so a
+Service is optional. When enabled it is headless (clusterIP: None) so it
+resolves to the individual pod endpoints rather than load-balancing across
+independent sandbox hosts.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "oad.fullname" . }}
+  labels:
+    {{- include "oad.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: http
+      port: {{ .Values.http.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "oad.selectorLabels" . | nindent 4 }}
+{{- end }}

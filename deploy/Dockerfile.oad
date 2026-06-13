@@ -1,0 +1,106 @@
+# syntax=docker/dockerfile:1.7
+#
+# OmniAgent daemon (oad) image.
+#
+# oad is a privileged, node-level daemon: it runs gVisor-isolated container
+# sandboxes via `runsc`, programs per-sandbox networking (`envoy`, `iptables`/
+# `nft`, `ip`, `tc`) and builds erofs rootfs images (`mkfs.erofs`). Those
+# tools are installed into the runtime layer below. The daemon itself must run
+# as root and the container must be privileged (see deploy/oad Helm chart).
+#
+# A statically-linked `omniagent` CLI is also bundled at
+# /opt/omniagent/bin/omniagent (the daemon's default control_plane.omniagent_path);
+# it is bind-mounted, read-only, into user sandboxes which may use any libc, so
+# it is built against musl with no dynamic loader dependency.
+
+ARG RUST_IMAGE=rust:1-bookworm
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+
+# Versions of the out-of-tree runtime dependencies. Override at build time with
+# --build-arg to pin to a known-good combination.
+ARG GVISOR_VERSION=latest
+ARG ENVOY_VERSION=1.31.5
+
+FROM --platform=$TARGETPLATFORM ${RUST_IMAGE} AS builder
+
+RUN apt-get update -y \
+  && apt-get install -y --no-install-recommends musl-tools \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Build the daemon (glibc) and a static musl CLI for the *native* target arch so
+# the same Dockerfile cross-builds under buildx/QEMU for linux/amd64 and
+# linux/arm64 without per-arch branching.
+RUN rustup target add "$(uname -m)-unknown-linux-musl"
+
+COPY . .
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build -p oad --release --locked \
+  && cp target/release/oad /usr/local/bin/oad
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    MUSL_TARGET="$(uname -m)-unknown-linux-musl" \
+  && cargo build -p omniagent-cli --release --locked --target "$MUSL_TARGET" \
+  && cp "target/${MUSL_TARGET}/release/omniagent" /usr/local/bin/omniagent
+
+FROM --platform=$TARGETPLATFORM ${DEBIAN_IMAGE} AS runtime
+
+ARG GVISOR_VERSION
+ARG ENVOY_VERSION
+
+# Runtime tooling oad shells out to: networking (iproute2/iptables/nftables),
+# erofs image creation (erofs-utils) and TLS roots. curl is used below to fetch
+# runsc and envoy and is kept for operator debugging.
+RUN apt-get update -y \
+  && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       curl \
+       erofs-utils \
+       iproute2 \
+       iptables \
+       nftables \
+  && rm -rf /var/lib/apt/lists/*
+
+# Prefer the nft-based iptables backend (matches nftables ruleset oad programs).
+RUN update-alternatives --set iptables /usr/sbin/iptables-nft || true \
+  && update-alternatives --set ip6tables /usr/sbin/ip6tables-nft || true
+
+# gVisor (runsc). Release assets are published per-arch (x86_64 / aarch64),
+# which is exactly what `uname -m` reports.
+RUN set -eux; \
+  arch="$(uname -m)"; \
+  base="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_VERSION}/${arch}"; \
+  curl -fsSL "${base}/runsc" -o /usr/local/bin/runsc; \
+  curl -fsSL "${base}/runsc.sha512" -o /tmp/runsc.sha512; \
+  ( cd /tmp && sed "s|runsc|/usr/local/bin/runsc|" runsc.sha512 | sha512sum -c - ); \
+  chmod 0755 /usr/local/bin/runsc; \
+  rm -f /tmp/runsc.sha512
+
+# Envoy, fetched via func-e (the upstream multi-arch binary distributor).
+RUN set -eux; \
+  curl -fsSL https://func-e.io/install.sh | bash -s -- -b /usr/local/bin; \
+  func-e use "${ENVOY_VERSION}"; \
+  cp "$(func-e which)" /usr/local/bin/envoy; \
+  chmod 0755 /usr/local/bin/envoy; \
+  rm -rf /root/.func-e /usr/local/bin/func-e
+
+COPY --from=builder /usr/local/bin/oad /usr/local/bin/oad
+COPY --from=builder /usr/local/bin/omniagent /opt/omniagent/bin/omniagent
+
+# Persistent daemon state (sandbox records, OCI layer cache, snapshots). Mount a
+# volume here in production so the cache survives restarts.
+RUN mkdir -p /var/lib/omniagent
+
+# Run from / so the daemon does not pick up a stray ./oad.toml; all config is
+# supplied via OAD_* environment variables (see the Helm chart) or --config.
+WORKDIR /
+
+# oad enforces root at startup (it manages mounts, netns and gVisor); the
+# container must additionally be run privileged.
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/oad"]

@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "oad.configMapName" . }}
+  labels:
+    {{- include "oad.labels" . | nindent 4 }}
+data:
+  OAD_HTTP_BIND: {{ printf "0.0.0.0:%d" (.Values.http.port | int) | quote }}
+  OAD_BASE_DIR: {{ .Values.persistence.baseDir | quote }}
+  OAD_OMNIAGENT_PATH: {{ .Values.controlPlane.omniagentPath | quote }}
+  OAD_NETWORK_ENABLED: {{ ternary "true" "false" .Values.network.enabled | quote }}
+  {{- with .Values.network.backend }}
+  OAD_NETWORK_BACKEND: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.network.sandboxCidr }}
+  OAD_NETWORK_SANDBOX_CIDR: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.network.envoyListener }}
+  OAD_ENVOY_LISTENER: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.network.dnsListener }}
+  OAD_DNS_LISTENER: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.network.dnsUpstream }}
+  OAD_DNS_UPSTREAM: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.controlPlane.url }}
+  OAD_CONTROL_PLANE_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.controlPlane.instanceName }}
+  OAD_INSTANCE_NAME: {{ . | quote }}
+  {{- end }}
