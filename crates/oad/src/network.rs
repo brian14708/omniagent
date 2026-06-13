@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 const NETNS_DIR: &str = "/run/netns";
@@ -65,48 +65,15 @@ pub enum NetworkError {
     Io(#[from] std::io::Error),
 }
 
-/// Shared, in-memory index from a sandbox's IP to its id, maintained by the
-/// `NetworkManager` as sandboxes are reconciled and deleted. The egress
-/// access-log server consults it to label spans without re-reading every
-/// sandbox's `network.json` on each connection. Cheap to clone (an `Arc`).
-#[derive(Clone, Default)]
-pub struct SandboxIpMap {
-    inner: Arc<RwLock<HashMap<Ipv4Addr, SandboxId>>>,
-}
-
-impl SandboxIpMap {
-    pub(crate) async fn insert(&self, ip: Ipv4Addr, id: SandboxId) {
-        self.inner.write().await.insert(ip, id);
-    }
-
-    async fn remove(&self, ip: &Ipv4Addr) {
-        self.inner.write().await.remove(ip);
-    }
-
-    /// Replaces the entire map, e.g. when rebuilding from on-disk state at
-    /// startup so the index survives a daemon restart without a disk format.
-    async fn replace_all(&self, entries: impl IntoIterator<Item = (Ipv4Addr, SandboxId)>) {
-        *self.inner.write().await = entries.into_iter().collect();
-    }
-
-    /// Looks up the sandbox id for a source IP. Returns `None` for an unknown
-    /// IP so the caller can fall back to a raw-IP label.
-    pub async fn get(&self, ip: &Ipv4Addr) -> Option<SandboxId> {
-        self.inner.read().await.get(ip).cloned()
-    }
-}
-
+/// Manages the daemon's egress networking: per-sandbox veth/netns setup, the
+/// shared Envoy egress proxy, DNS forwarding, and host firewall rules. Cheap to
+/// clone (shared state lives behind `Arc`).
 #[derive(Clone)]
 pub struct NetworkManager {
     config: NetworkRuntimeConfig,
-    /// Whether egress audit (Envoy access-log → OTLP spans) is enabled. Drives
-    /// the audit fragments in the rendered Envoy config. Sourced from the
-    /// daemon-level `observability` flag, not `NetworkRuntimeConfig`.
-    audit_enabled: bool,
     lock: Arc<Mutex<()>>,
     dns_started: Arc<Mutex<bool>>,
     envoy_child: Arc<Mutex<Option<Child>>>,
-    ip_map: SandboxIpMap,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,7 +211,7 @@ struct Ipv4Cidr {
 }
 
 impl NetworkManager {
-    pub fn new(config: NetworkRuntimeConfig, audit_enabled: bool) -> Result<Self, NetworkError> {
+    pub fn new(config: NetworkRuntimeConfig) -> Result<Self, NetworkError> {
         if config.enabled {
             parse_ipv4_cidr(&config.sandbox_cidr)?;
             config.envoy_listener.parse::<SocketAddr>()?;
@@ -253,19 +220,10 @@ impl NetworkManager {
         }
         Ok(Self {
             config,
-            audit_enabled,
             lock: Arc::new(Mutex::new(())),
             dns_started: Arc::new(Mutex::new(false)),
             envoy_child: Arc::new(Mutex::new(None)),
-            ip_map: SandboxIpMap::default(),
         })
-    }
-
-    /// Returns a cheap clone of the shared IP→sandbox index, for handing to the
-    /// egress access-log server.
-    #[must_use]
-    pub fn ip_map(&self) -> SandboxIpMap {
-        self.ip_map.clone()
     }
 
     pub const fn enabled(&self) -> bool {
@@ -313,9 +271,6 @@ impl NetworkManager {
         };
         state.spec.clone_from(spec);
         write_state(paths, &state).await?;
-        self.ip_map
-            .insert(state.sandbox_ip, state.sandbox_id.clone())
-            .await;
         write_resolv_conf(paths, &state).await?;
         self.ensure_namespace(&state).await?;
         self.apply_shaping(&state).await?;
@@ -331,9 +286,6 @@ impl NetworkManager {
         let _guard = self.lock.lock().await;
         self.ensure_services(paths).await?;
         let states = read_states(paths).await?;
-        self.ip_map
-            .replace_all(states.iter().map(|s| (s.sandbox_ip, s.sandbox_id.clone())))
-            .await;
         for state in &states {
             if fs::try_exists(netns_path(state)).await.unwrap_or(false)
                 && let Err(err) = self.apply_shaping(state).await
@@ -367,7 +319,6 @@ impl NetworkManager {
         let _ = self.delete_qdisc_sandbox(&state).await;
         let _ = run(IP, cmd_args!["link", "delete", state.host_veth.as_str()]).await;
         let _ = run(IP, cmd_args!["netns", "delete", state.netns_name.as_str()]).await;
-        self.ip_map.remove(&state.sandbox_ip).await;
         match fs::remove_file(paths.sandbox_network_state(id)).await {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1026,7 +977,7 @@ impl NetworkManager {
         }
 
         fs::create_dir_all(paths.network_dir()).await?;
-        let config = self.render_envoy_config(paths)?;
+        let config = self.render_envoy_config()?;
         write_atomic_file(&paths.envoy_config(), config.as_bytes()).await?;
         let stdout = std::fs::OpenOptions::new()
             .create(true)
@@ -1044,25 +995,25 @@ impl NetworkManager {
         Ok(())
     }
 
-    fn render_envoy_config(&self, paths: &OadPaths) -> Result<String, NetworkError> {
+    fn render_envoy_config(&self) -> Result<String, NetworkError> {
         let listener_addr = self.config.envoy_listener.parse::<SocketAddr>()?;
 
-        let mut listener_filters = vec![json!({
+        let listener_filters = vec![json!({
             "name": "envoy.filters.listener.original_dst",
             "typed_config": {
                 "@type": "type.googleapis.com/envoy.extensions.filters.listener.original_dst.v3.OriginalDst"
             }
         })];
 
-        // The catch-all L4 chain (no `filter_chain_match`); when audit is on it
-        // also streams a TCP gRPC access log.
-        let mut tcp_proxy = json!({
+        // The catch-all L4 chain (no `filter_chain_match`) transparently proxies
+        // every connection to its original destination.
+        let tcp_proxy = json!({
             "@type": "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy",
             "stat_prefix": "oad_tcp",
             "cluster": "original_dst"
         });
 
-        let mut clusters = vec![json!({
+        let clusters = vec![json!({
             "name": "original_dst",
             "type": "ORIGINAL_DST",
             "connect_timeout": "5s",
@@ -1079,43 +1030,12 @@ impl NetworkManager {
             }
         });
 
-        // HTTP filter chains precede the catch-all so HTTP/h2c is matched first.
-        let mut filter_chains: Vec<Value> = Vec::new();
-
-        if self.audit_enabled {
-            // The TLS/HTTP inspectors classify a connection by peeking the
-            // client's first bytes. Server-speaks-first protocols (SSH, SMTP,
-            // MySQL, ...) send nothing first, so the inspectors stall until the
-            // listener-filter timeout; with the default
-            // `continue_on_listener_filters_timeout: false` Envoy would then
-            // *drop* the socket. Continue past the timeout so such connections
-            // fall through to the raw TCP chain, with a short wait so the added
-            // passthrough latency is small.
-            listener["continue_on_listener_filters_timeout"] = json!(true);
-            listener["listener_filters_timeout"] = json!("1s");
-            listener_filters.push(listener_inspector("tls_inspector", "TlsInspector"));
-            listener_filters.push(listener_inspector("http_inspector", "HttpInspector"));
-
-            filter_chains.push(envoy_http_filter_chain(grpc_access_log(
-                "envoy.access_loggers.http_grpc",
-                "type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.HttpGrpcAccessLogConfig",
-                "oad_http",
-            )));
-            tcp_proxy["access_log"] = grpc_access_log(
-                "envoy.access_loggers.tcp_grpc",
-                "type.googleapis.com/envoy.extensions.access_loggers.grpc.v3.TcpGrpcAccessLogConfig",
-                "oad_tcp",
-            );
-            let socket_path = paths.envoy_access_log_socket().display().to_string();
-            clusters.push(accesslog_cluster(&socket_path));
-        }
-
-        filter_chains.push(json!({
+        let filter_chains: Vec<Value> = vec![json!({
             "filters": [{
                 "name": "envoy.filters.network.tcp_proxy",
                 "typed_config": tcp_proxy
             }]
-        }));
+        })];
 
         listener["listener_filters"] = Value::Array(listener_filters);
         listener["filter_chains"] = Value::Array(filter_chains);
@@ -1131,106 +1051,6 @@ impl NetworkManager {
         });
         Ok(serde_json::to_string_pretty(&config)?)
     }
-}
-
-/// A listener filter (`tls_inspector` / `http_inspector`): the `snake_case`
-/// `name` segment and the `PascalCase` extension message name fully determine
-/// both the filter name and its `@type` URL.
-fn listener_inspector(name: &str, message: &str) -> Value {
-    json!({
-        "name": format!("envoy.filters.listener.{name}"),
-        "typed_config": {
-            "@type": format!("type.googleapis.com/envoy.extensions.filters.listener.{name}.v3.{message}")
-        }
-    })
-}
-
-/// A gRPC access-log logger array (one logger). TCP and HTTP differ only by the
-/// logger name, the access-logger extension `@type`, and the `log_name`.
-fn grpc_access_log(logger_name: &str, type_url: &str, log_name: &str) -> Value {
-    json!([{
-        "name": logger_name,
-        "typed_config": {
-            "@type": type_url,
-            "common_config": {
-                "log_name": log_name,
-                "grpc_service": {
-                    "envoy_grpc": { "cluster_name": "oad_accesslog" },
-                    "timeout": "5s"
-                }
-            }
-        }
-    }])
-}
-
-/// The STATIC h2c cluster that streams access logs to the daemon over the
-/// daemon's Unix pipe.
-fn accesslog_cluster(socket_path: &str) -> Value {
-    json!({
-        "name": "oad_accesslog",
-        "type": "STATIC",
-        "connect_timeout": "1s",
-        "lb_policy": "ROUND_ROBIN",
-        "typed_extension_protocol_options": {
-            "envoy.extensions.upstreams.http.v3.HttpProtocolOptions": {
-                "@type": "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
-                "explicit_http_config": { "http2_protocol_options": {} }
-            }
-        },
-        "load_assignment": {
-            "cluster_name": "oad_accesslog",
-            "endpoints": [{
-                "lb_endpoints": [{
-                    "endpoint": { "address": { "pipe": { "path": socket_path } } }
-                }]
-            }]
-        }
-    })
-}
-
-/// The HTTP filter chain: matches cleartext HTTP/1.1 + h2c and runs an
-/// `HttpConnectionManager` so HTTP-level fields are captured in the access log.
-/// `stream_idle_timeout: 0s` and the websocket/CONNECT upgrades preserve the raw
-/// L4 chain's "stays open / tunnels" behavior for long-lived/upgraded streams.
-fn envoy_http_filter_chain(access_log: Value) -> Value {
-    let mut hcm = json!({
-        "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
-        "stat_prefix": "oad_http",
-        "codec_type": "AUTO",
-        "stream_idle_timeout": "0s",
-        "upgrade_configs": [
-            { "upgrade_type": "websocket" },
-            { "upgrade_type": "CONNECT" }
-        ],
-        "route_config": {
-            "name": "oad_http_routes",
-            "virtual_hosts": [{
-                "name": "all",
-                "domains": ["*"],
-                "routes": [{
-                    "match": { "prefix": "/" },
-                    "route": { "cluster": "original_dst", "timeout": "0s" }
-                }]
-            }]
-        },
-        "http_filters": [{
-            "name": "envoy.filters.http.router",
-            "typed_config": {
-                "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
-            }
-        }]
-    });
-    hcm["access_log"] = access_log;
-    json!({
-        "filter_chain_match": {
-            "transport_protocol": "raw_buffer",
-            "application_protocols": ["http/1.1", "h2c"]
-        },
-        "filters": [{
-            "name": "envoy.filters.network.http_connection_manager",
-            "typed_config": hcm
-        }]
-    })
 }
 
 pub fn validate_spec(spec: &SandboxNetworkSpec) -> Result<(), NetworkError> {
@@ -1639,7 +1459,7 @@ mod tests {
 
     #[test]
     fn renders_transparent_tcp_redirect_for_allow_all() {
-        let manager = NetworkManager::new(NetworkRuntimeConfig::default(), true).unwrap();
+        let manager = NetworkManager::new(NetworkRuntimeConfig::default()).unwrap();
         let state = test_state();
 
         let ruleset = manager.render_nft_ruleset(&[state]).unwrap();
@@ -1656,7 +1476,7 @@ mod tests {
 
     #[test]
     fn builds_host_firewall_rules_for_gateway_and_forwarding() {
-        let manager = NetworkManager::new(NetworkRuntimeConfig::default(), true).unwrap();
+        let manager = NetworkManager::new(NetworkRuntimeConfig::default()).unwrap();
         let rules = manager.host_firewall_rules(&test_state()).unwrap();
 
         assert_eq!(rules.len(), 5);
@@ -1692,127 +1512,15 @@ mod tests {
     }
 
     #[test]
-    fn renders_envoy_audit_config_with_http_and_tcp_grpc_access_logs() {
-        let manager = NetworkManager::new(NetworkRuntimeConfig::default(), true).unwrap();
-        let paths = OadPaths::new("/tmp/oad-test");
+    fn renders_envoy_passthrough_config() {
+        let manager = NetworkManager::new(NetworkRuntimeConfig::default()).unwrap();
 
-        let rendered = manager.render_envoy_config(&paths).unwrap();
+        let rendered = manager.render_envoy_config().unwrap();
         let config: Value = serde_json::from_str(&rendered).expect("rendered config is valid JSON");
 
         let listener = &config["static_resources"]["listeners"][0];
-        // Server-first protocols must fall through to the TCP chain rather than
-        // being dropped when the inspectors time out.
-        assert_eq!(
-            listener["continue_on_listener_filters_timeout"],
-            json!(true)
-        );
-        assert_eq!(listener["listener_filters_timeout"], json!("1s"));
-
-        let listener_filter_types: Vec<&str> = listener["listener_filters"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["typed_config"]["@type"].as_str().unwrap())
-            .collect();
-        assert!(
-            listener_filter_types
-                .iter()
-                .any(|t| t.contains("OriginalDst"))
-        );
-        assert!(
-            listener_filter_types
-                .iter()
-                .any(|t| t.contains("TlsInspector"))
-        );
-        assert!(
-            listener_filter_types
-                .iter()
-                .any(|t| t.contains("HttpInspector"))
-        );
-
-        // First chain matches cleartext HTTP/h2c via an HCM; the second is the
-        // catch-all TCP proxy.
-        let chains = listener["filter_chains"].as_array().unwrap();
-        assert_eq!(chains.len(), 2);
-        let hcm = &chains[0]["filters"][0]["typed_config"];
-        assert_eq!(
-            chains[0]["filter_chain_match"]["application_protocols"],
-            json!(["http/1.1", "h2c"])
-        );
-        assert!(
-            hcm["@type"]
-                .as_str()
-                .unwrap()
-                .contains("HttpConnectionManager")
-        );
-        // Long-lived idle / upgraded cleartext egress must not be reset by the
-        // HCM's default stream idle timeout.
-        assert_eq!(hcm["stream_idle_timeout"], json!("0s"));
-        let upgrades: Vec<&str> = hcm["upgrade_configs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|u| u["upgrade_type"].as_str().unwrap())
-            .collect();
-        assert_eq!(upgrades, vec!["websocket", "CONNECT"]);
-        assert_eq!(
-            hcm["route_config"]["virtual_hosts"][0]["routes"][0]["route"]["timeout"],
-            json!("0s")
-        );
-        assert!(
-            hcm["access_log"][0]["typed_config"]["@type"]
-                .as_str()
-                .unwrap()
-                .contains("HttpGrpcAccessLogConfig")
-        );
-        assert_eq!(
-            hcm["access_log"][0]["typed_config"]["common_config"]["log_name"],
-            json!("oad_http")
-        );
-
-        // The catch-all TCP chain streams a TCP gRPC access log.
-        let tcp = &chains[1]["filters"][0]["typed_config"];
-        assert!(tcp["@type"].as_str().unwrap().contains("TcpProxy"));
-        assert!(
-            tcp["access_log"][0]["typed_config"]["@type"]
-                .as_str()
-                .unwrap()
-                .contains("TcpGrpcAccessLogConfig")
-        );
-        assert_eq!(
-            tcp["access_log"][0]["typed_config"]["common_config"]["log_name"],
-            json!("oad_tcp")
-        );
-
-        // The access-log cluster points at the daemon's Unix pipe over h2c.
-        let clusters = config["static_resources"]["clusters"].as_array().unwrap();
-        let accesslog = clusters
-            .iter()
-            .find(|c| c["name"] == json!("oad_accesslog"))
-            .expect("oad_accesslog cluster present");
-        assert_eq!(
-            accesslog["load_assignment"]["endpoints"][0]["lb_endpoints"][0]["endpoint"]["address"]
-                ["pipe"]["path"],
-            json!("/tmp/oad-test/network/envoy-access.sock")
-        );
-        assert!(
-            accesslog["typed_extension_protocol_options"]
-                .as_object()
-                .unwrap()
-                .contains_key("envoy.extensions.upstreams.http.v3.HttpProtocolOptions")
-        );
-    }
-
-    #[test]
-    fn renders_envoy_passthrough_config_without_audit() {
-        let manager = NetworkManager::new(NetworkRuntimeConfig::default(), false).unwrap();
-        let paths = OadPaths::new("/tmp/oad-test");
-
-        let rendered = manager.render_envoy_config(&paths).unwrap();
-        let config: Value = serde_json::from_str(&rendered).expect("rendered config is valid JSON");
-
-        let listener = &config["static_resources"]["listeners"][0];
-        // No inspectors and no listener-filter timeout override when audit is off.
+        // No inspectors and no listener-filter timeout override: the proxy is a
+        // pure transparent passthrough.
         assert!(
             listener
                 .get("continue_on_listener_filters_timeout")

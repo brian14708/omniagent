@@ -1368,7 +1368,7 @@ struct TempPathGuard {
 }
 
 impl TempPathGuard {
-    fn new(path: PathBuf) -> Self {
+    const fn new(path: PathBuf) -> Self {
         Self { path: Some(path) }
     }
 

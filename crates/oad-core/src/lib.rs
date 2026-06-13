@@ -323,7 +323,6 @@ pub struct RuntimeConfig {
     pub pause_image: String,
     pub network_namespace: Option<PathBuf>,
     pub network: NetworkRuntimeConfig,
-    pub observability: ObservabilityConfig,
     /// Host directories/files bind-mounted (read-only by default) into every user
     /// container the daemon creates — fresh or forked. Used to supply static
     /// assets such as the `omniagent` binary without baking them into images or
@@ -345,23 +344,6 @@ pub struct MountSpec {
 
 const fn mount_read_only_default() -> bool {
     true
-}
-
-/// Daemon-level toggle for egress observability.
-///
-/// The OTLP exporter itself is configured through the canonical
-/// `OTEL_EXPORTER_OTLP_*` environment variables (endpoint, protocol, headers,
-/// timeout) read by the OpenTelemetry SDK; this only controls whether the
-/// daemon emits spans at all.
-#[derive(Debug, Clone)]
-pub struct ObservabilityConfig {
-    pub enabled: bool,
-}
-
-impl Default for ObservabilityConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -540,11 +522,6 @@ impl OadPaths {
     #[must_use]
     pub fn envoy_log(&self) -> PathBuf {
         self.network_dir().join("envoy.log")
-    }
-
-    #[must_use]
-    pub fn envoy_access_log_socket(&self) -> PathBuf {
-        self.network_dir().join("envoy-access.sock")
     }
 
     /// Root of the immutable, sandbox-independent snapshot store. Lives under

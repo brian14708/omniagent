@@ -7,11 +7,10 @@
 
 use anyhow::{Context, Result, anyhow};
 use oad_api::{
-    BackgroundExecEvent, BackgroundExecResizeRequest, BackgroundExecResizeResponse,
-    BackgroundExecResponse, BackgroundExecStdinRequest, BackgroundExecStdinResponse,
-    CreateSandboxRequest, CreateSnapshotRequest, ErrorResponse, ExecRequest, ExecResponse,
-    ListBackgroundExecsResponse, ListSandboxesResponse, ListSnapshotsResponse, LogsResponse,
-    SandboxNetworkResponse, SandboxResponse, SnapshotResponse, StartBackgroundExecRequest,
+    BackgroundExecEvent, BackgroundExecResponse, BackgroundExecStdinRequest,
+    BackgroundExecStdinResponse, CreateSandboxRequest, CreateSnapshotRequest, ErrorResponse,
+    ExecRequest, ExecResponse, ListSnapshotsResponse, SandboxNetworkResponse, SandboxResponse,
+    SnapshotResponse, StartBackgroundExecRequest,
 };
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
@@ -113,17 +112,6 @@ impl OadClient {
         Self::read_json(resp).await
     }
 
-    /// `GET /v1/sandboxes` — list all known sandboxes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the request fails, the daemon rejects it, or the
-    /// response body cannot be decoded.
-    pub async fn list(&self) -> Result<ListSandboxesResponse> {
-        let resp = self.send(self.http.get(self.url("/v1/sandboxes"))).await?;
-        Self::read_json(resp).await
-    }
-
     /// `GET /v1/sandboxes/{id}` — fetch a single sandbox.
     ///
     /// # Errors
@@ -146,35 +134,6 @@ impl OadClient {
     pub async fn delete(&self, id: &str) -> Result<SandboxResponse> {
         let resp = self
             .send(self.http.delete(self.url(&format!("/v1/sandboxes/{id}"))))
-            .await?;
-        Self::read_json(resp).await
-    }
-
-    /// `GET /v1/sandboxes/{id}/logs` — read recent container log lines.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the request fails, the daemon rejects it, or the
-    /// response body cannot be decoded.
-    pub async fn logs(
-        &self,
-        id: &str,
-        container: Option<&str>,
-        tail: Option<usize>,
-    ) -> Result<LogsResponse> {
-        let mut query: Vec<(&str, String)> = Vec::new();
-        if let Some(container) = container {
-            query.push(("container", container.to_string()));
-        }
-        if let Some(tail) = tail {
-            query.push(("tail", tail.to_string()));
-        }
-        let resp = self
-            .send(
-                self.http
-                    .get(self.url(&format!("/v1/sandboxes/{id}/logs")))
-                    .query(&query),
-            )
             .await?;
         Self::read_json(resp).await
     }
@@ -233,22 +192,6 @@ impl OadClient {
         Self::read_json(resp).await
     }
 
-    /// `GET /v1/sandboxes/{id}/execs` — list background exec sessions.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the request fails, the daemon rejects it, or the
-    /// response body cannot be decoded.
-    pub async fn list_execs(&self, id: &str) -> Result<ListBackgroundExecsResponse> {
-        let resp = self
-            .send(
-                self.http
-                    .get(self.url(&format!("/v1/sandboxes/{id}/execs"))),
-            )
-            .await?;
-        Self::read_json(resp).await
-    }
-
     /// `GET /v1/sandboxes/{id}/execs/{exec_id}` — get session metadata.
     ///
     /// # Errors
@@ -297,28 +240,6 @@ impl OadClient {
             .send(
                 self.http
                     .post(self.url(&format!("/v1/sandboxes/{id}/execs/{exec_id}/stdin")))
-                    .json(request),
-            )
-            .await?;
-        Self::read_json(resp).await
-    }
-
-    /// `POST /v1/sandboxes/{id}/execs/{exec_id}/resize` — resize a PTY exec.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the request fails, the exec is not PTY-backed, the
-    /// daemon rejects the request, or the response body cannot be decoded.
-    pub async fn resize_exec(
-        &self,
-        id: &str,
-        exec_id: &str,
-        request: &BackgroundExecResizeRequest,
-    ) -> Result<BackgroundExecResizeResponse> {
-        let resp = self
-            .send(
-                self.http
-                    .post(self.url(&format!("/v1/sandboxes/{id}/execs/{exec_id}/resize")))
                     .json(request),
             )
             .await?;

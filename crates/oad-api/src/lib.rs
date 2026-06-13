@@ -4,7 +4,7 @@ use oad_core::{ContainerSpec, EnvVar, SandboxNetworkSpec, SandboxRecord};
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde::{Deserializer, Serializer};
-use utoipa::{IntoParams, ToSchema};
+use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateSandboxRequest {
@@ -59,18 +59,6 @@ pub struct ListSnapshotsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SandboxResponse {
     pub sandbox: SandboxRecord,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListSandboxesResponse {
-    pub sandboxes: Vec<SandboxRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct LogsResponse {
-    pub sandbox_id: String,
-    pub container: String,
-    pub lines: Vec<String>,
 }
 
 /// Managed-network addresses assigned to a sandbox.
@@ -182,11 +170,6 @@ pub struct BackgroundExecResponse {
     pub exec: BackgroundExecInfo,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ListBackgroundExecsResponse {
-    pub execs: Vec<BackgroundExecInfo>,
-}
-
 /// Request to write bytes to a background exec session's stdin.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BackgroundExecStdinRequest {
@@ -203,18 +186,6 @@ pub struct BackgroundExecStdinRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BackgroundExecStdinResponse {
-    pub accepted: bool,
-}
-
-/// Request to resize a PTY-backed background exec session.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct BackgroundExecResizeRequest {
-    pub rows: u16,
-    pub cols: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct BackgroundExecResizeResponse {
     pub accepted: bool,
 }
 
@@ -272,15 +243,6 @@ where
 {
     let encoded = String::deserialize(deserializer)?;
     STANDARD.decode(encoded).map_err(D::Error::custom)
-}
-
-#[derive(Debug, Clone, Deserialize, IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct LogsQuery {
-    /// Container to read logs from. Defaults to the first non-pause container.
-    pub container: Option<String>,
-    /// Maximum number of trailing log lines to return (capped at 5000, default 200).
-    pub tail: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

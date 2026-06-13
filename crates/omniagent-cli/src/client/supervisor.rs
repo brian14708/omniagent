@@ -22,7 +22,6 @@ use tokio::task::JoinHandle;
 
 use crate::agent::AgentHandle;
 use crate::agent_log;
-use crate::atif;
 use crate::cast::CastRecorder;
 use crate::codex::client::{Notification, ServerRequest};
 use crate::codex::{self, CodexWorkerHandle};
@@ -454,7 +453,7 @@ impl DaemonSupervisor {
     /// uploads the session's artifacts. If we returned as soon as the workers
     /// were signaled, the daemon's runtime would be dropped mid-upload and
     /// cancel those tasks (surfacing as "task NNN was cancelled" /
-    /// "background task failed"), losing the trajectory and raw-request
+    /// "background task failed"), losing the session-log and raw-request
     /// artifacts. So we wait for the session map to drain — each reaper removes
     /// its session and notifies `idle` once finalize completes — bounded by
     /// [`SHUTDOWN_DRAIN_TIMEOUT`] so a single stuck upload can't hang shutdown.
@@ -522,7 +521,7 @@ async fn prepare_and_spawn(
     let cwd_string = spec.cwd.display().to_string();
 
     // The user's explicit selection resolves to an executor that drives the
-    // backend choice, argv transforms, ATIF capability, and the console's
+    // backend choice, argv transforms, native-log capability, and the console's
     // renderer label.
     let executor = executor::resolve_executor(&spec.agent);
     let agent_info = executor.info();
@@ -747,12 +746,11 @@ async fn finalize_session(ctx: FinalizeCtx, exit_code: i32) {
 
     let spans = ctx.traces.snapshot();
 
-    // Locate the agent's native session log once: it feeds both the ATIF
-    // trajectory (parsed below) and the raw `session_log` artifact (uploaded
-    // verbatim), so we don't scan the log directory twice.
+    // Locate the agent's native session log so it can be uploaded verbatim as
+    // the raw `session_log` artifact.
     let native_log = ctx
         .agent
-        .filter(|info| info.supports_atif)
+        .filter(|info| info.has_native_log)
         .and_then(|agent| {
             agent_log::locate_native_log(
                 agent,
@@ -763,27 +761,8 @@ async fn finalize_session(ctx: FinalizeCtx, exit_code: i32) {
             .map(|path| (agent, path))
         });
 
-    // 2. ATIF trajectory — only for agents that support it. Prefer the agent's
-    // native session log; fall back to reconstructing from the recorded spans.
-    if let Some(agent) = ctx.agent.filter(|info| info.supports_atif) {
-        let trajectory = native_log
-            .as_ref()
-            .and_then(|(agent, path)| agent_log::parse_native_log(*agent, path))
-            .or_else(|| atif::build_trajectory(agent, &ctx.session_id, &spans));
-        if let Some(mut trajectory) = trajectory {
-            // Link each agent step to its raw request span (by provider response
-            // id) so the trajectory joins to the `raw_requests` artifact.
-            atif::link_raw_requests(&mut trajectory, &spans);
-            match serde_json::to_vec_pretty(&trajectory) {
-                Ok(bytes) => pending.push(("trajectory", bytes)),
-                Err(err) => tracing::warn!(error = %err, "failed to serialize trajectory"),
-            }
-        }
-    }
-
-    // 3. Raw native session log — uploaded verbatim. Lossless and higher fidelity
-    // than the parsed trajectory; for claude it also preserves subagent (`Task`)
-    // sidechains that the flat ATIF model flattens away.
+    // 2. Raw native session log — uploaded verbatim. Lossless; for claude it
+    // preserves subagent (`Task`) sidechains.
     if let Some((_, path)) = &native_log {
         match tokio::fs::read(path).await {
             Ok(bytes) if !bytes.is_empty() => pending.push(("session_log", bytes)),
@@ -792,7 +771,7 @@ async fn finalize_session(ctx: FinalizeCtx, exit_code: i32) {
         }
     }
 
-    // 4. Raw requests — the exact intercepted spans as JSONL, for any session
+    // 3. Raw requests — the exact intercepted spans as JSONL, for any session
     // that made LLM calls (independent of agent support).
     if let Some(bytes) = spans_to_jsonl(&spans) {
         pending.push(("raw_requests", bytes));
@@ -1074,7 +1053,7 @@ async fn await_initial_pty_size(channel: &ChannelHandle, fallback: (u16, u16)) -
                 Ok(ServerCommand::PtyResize { rows, cols }) if rows > 0 && cols > 0 => {
                     return (rows, cols);
                 }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => return fallback,
             }
         }

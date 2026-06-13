@@ -1,7 +1,6 @@
 mod background_exec;
 mod config;
 mod network;
-mod observability;
 mod registration;
 mod registry;
 mod snapshots;
@@ -10,7 +9,6 @@ use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::error::Error as StdError;
-use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,13 +24,11 @@ use axum::{Json, Router};
 use background_exec::BackgroundExecStore;
 use futures_util::{StreamExt, stream};
 use oad_api::{
-    BackgroundExecEvent, BackgroundExecEventKind, BackgroundExecInfo, BackgroundExecResizeRequest,
-    BackgroundExecResizeResponse, BackgroundExecResponse, BackgroundExecStatus,
-    BackgroundExecStdinRequest, BackgroundExecStdinResponse, CreateSandboxRequest,
-    CreateSnapshotRequest, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, ErrorBody, ErrorResponse,
-    ExecRequest, ExecResponse, ListBackgroundExecsResponse, ListSandboxesResponse,
-    ListSnapshotsResponse, LogsQuery, LogsResponse, SandboxNetworkResponse, SandboxResponse,
-    SnapshotInfo, SnapshotResponse, StartBackgroundExecRequest,
+    BackgroundExecEvent, BackgroundExecEventKind, BackgroundExecInfo, BackgroundExecResponse,
+    BackgroundExecStatus, BackgroundExecStdinRequest, BackgroundExecStdinResponse,
+    CreateSandboxRequest, CreateSnapshotRequest, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, ErrorBody,
+    ErrorResponse, ExecRequest, ExecResponse, ListSnapshotsResponse, SandboxNetworkResponse,
+    SandboxResponse, SnapshotInfo, SnapshotResponse, StartBackgroundExecRequest,
 };
 use oad_core::{
     ContainerSpec, EgressDestination, EgressPolicy, EgressRule, EnvVar, L7EgressPolicy,
@@ -48,7 +44,6 @@ use oad_runtime::{
 };
 use registry::{NamedLocks, SandboxRegistry};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
@@ -64,11 +59,9 @@ struct AppState {
     snapshot_locks: NamedLocks,
     gvisor: GvisorManager,
     network: network::NetworkManager,
-    telemetry: observability::EgressTelemetry,
     background_execs: BackgroundExecStore,
 }
 
-const LOG_TAIL_READ_BYTES: u64 = 8 * 1024 * 1024;
 const BACKGROUND_EXEC_KILL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[tokio::main]
@@ -87,20 +80,8 @@ async fn main() -> anyhow::Result<()> {
     let registry = SandboxRegistry::recover(&paths).await;
     reconcile_sandboxes(&registry, &paths).await;
     let gvisor = GvisorManager::new();
-    let network = network::NetworkManager::new(
-        config.runtime.network.clone(),
-        config.runtime.observability.enabled,
-    )
-    .context("failed to initialize network manager")?;
-    let telemetry = observability::EgressTelemetry::new(&config.runtime.observability)
-        .context("failed to initialize egress telemetry")?;
-    // Only run the access-log sink when managed networking is actually enabled:
-    // with networking off, Envoy is never started (reconcile early-returns) and
-    // emits no access logs, so binding the socket would falsely report
-    // `audit_active = true` while nothing is being audited.
-    if config.runtime.network.enabled && config.runtime.observability.enabled {
-        telemetry.spawn_envoy_access_log_server(paths.clone(), network.ip_map());
-    }
+    let network = network::NetworkManager::new(config.runtime.network.clone())
+        .context("failed to initialize network manager")?;
     let state = AppState {
         config: config.clone(),
         paths,
@@ -108,7 +89,6 @@ async fn main() -> anyhow::Result<()> {
         snapshot_locks: NamedLocks::default(),
         gvisor,
         network,
-        telemetry,
         background_execs: BackgroundExecStore::default(),
     };
     if let Err(err) = state.network.reconcile_all(&state.paths).await {
@@ -149,7 +129,6 @@ async fn main() -> anyhow::Result<()> {
         registration.deregister().await;
     }
     checkpoint_running_sandboxes_for_shutdown(&shutdown_state).await;
-    shutdown_state.telemetry.shutdown().await;
     result
 }
 
@@ -271,18 +250,14 @@ fn router(state: AppState) -> Router {
     // new handler is covered by auth automatically rather than relying on every
     // handler remembering to call `require_auth`.
     let protected = Router::new()
-        .route("/v1/sandboxes", post(create_sandbox).get(list_sandboxes))
+        .route("/v1/sandboxes", post(create_sandbox))
         .route(
             "/v1/sandboxes/{id}",
             get(get_sandbox).delete(delete_sandbox),
         )
-        .route("/v1/sandboxes/{id}/logs", get(get_logs))
         .route("/v1/sandboxes/{id}/network", get(get_sandbox_network))
         .route("/v1/sandboxes/{id}/exec", post(exec_in_sandbox))
-        .route(
-            "/v1/sandboxes/{id}/execs",
-            post(start_background_exec).get(list_background_execs),
-        )
+        .route("/v1/sandboxes/{id}/execs", post(start_background_exec))
         .route(
             "/v1/sandboxes/{id}/execs/{exec_id}",
             get(get_background_exec).delete(kill_background_exec),
@@ -290,10 +265,6 @@ fn router(state: AppState) -> Router {
         .route(
             "/v1/sandboxes/{id}/execs/{exec_id}/stdin",
             post(write_background_exec_stdin),
-        )
-        .route(
-            "/v1/sandboxes/{id}/execs/{exec_id}/resize",
-            post(resize_background_exec),
         )
         .route(
             "/v1/sandboxes/{id}/execs/{exec_id}/events",
@@ -334,18 +305,14 @@ fn router(state: AppState) -> Router {
         healthz,
         openapi_spec,
         create_sandbox,
-        list_sandboxes,
         get_sandbox,
         delete_sandbox,
-        get_logs,
         get_sandbox_network,
         exec_in_sandbox,
         start_background_exec,
-        list_background_execs,
         get_background_exec,
         kill_background_exec,
         write_background_exec_stdin,
-        resize_background_exec,
         stream_background_exec_events,
         suspend_sandbox,
         resume_sandbox,
@@ -356,8 +323,6 @@ fn router(state: AppState) -> Router {
     components(schemas(
         CreateSandboxRequest,
         SandboxResponse,
-        ListSandboxesResponse,
-        LogsResponse,
         SandboxNetworkResponse,
         ExecRequest,
         ExecResponse,
@@ -365,11 +330,8 @@ fn router(state: AppState) -> Router {
         BackgroundExecStatus,
         BackgroundExecInfo,
         BackgroundExecResponse,
-        ListBackgroundExecsResponse,
         BackgroundExecStdinRequest,
         BackgroundExecStdinResponse,
-        BackgroundExecResizeRequest,
-        BackgroundExecResizeResponse,
         BackgroundExecEvent,
         BackgroundExecEventKind,
         ErrorResponse,
@@ -962,25 +924,6 @@ impl Drop for SandboxCreateGuard {
     }
 }
 
-/// List all known sandboxes.
-#[utoipa::path(
-    get,
-    path = "/v1/sandboxes",
-    responses(
-        (status = 200, description = "Known sandboxes", body = ListSandboxesResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-    ),
-    security(("bearer_token" = [])),
-    tag = "sandboxes",
-)]
-async fn list_sandboxes(
-    State(state): State<AppState>,
-) -> Result<Json<ListSandboxesResponse>, AppError> {
-    Ok(Json(ListSandboxesResponse {
-        sandboxes: state.registry.list().await,
-    }))
-}
-
 /// Fetch a single sandbox by id.
 #[utoipa::path(
     get,
@@ -1099,49 +1042,6 @@ async fn delete_sandbox(
     Ok(Json(SandboxResponse { sandbox: record }))
 }
 
-/// Read recent log lines from a container in a sandbox.
-#[utoipa::path(
-    get,
-    path = "/v1/sandboxes/{id}/logs",
-    params(
-        ("id" = String, Path, description = "Sandbox id"),
-        LogsQuery,
-    ),
-    responses(
-        (status = 200, description = "Container log lines", body = LogsResponse),
-        (status = 400, description = "Invalid sandbox id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 404, description = "Sandbox or container not found", body = ErrorResponse),
-        (status = 500, description = "Failed to read logs", body = ErrorResponse),
-    ),
-    security(("bearer_token" = [])),
-    tag = "sandboxes",
-)]
-async fn get_logs(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-    Query(query): Query<LogsQuery>,
-) -> Result<Json<LogsResponse>, AppError> {
-    let id = parse_sandbox_id(id)?;
-    let _guard = state.registry.acquire_lifecycle(&id).await;
-    let record = state
-        .registry
-        .get(&id)
-        .await
-        .ok_or_else(|| AppError::NotFound(format!("sandbox {id} not found")))?;
-    let container = resolve_running_container(&state, &record, &id, query.container).await?;
-
-    let log_path = state.paths.container_log(&id, &container);
-    let tail = query.tail.unwrap_or(200).min(5000);
-    let lines = read_log_tail(&log_path, tail).await?;
-
-    Ok(Json(LogsResponse {
-        sandbox_id: id.to_string(),
-        container,
-        lines,
-    }))
-}
-
 /// Return managed-network addresses for a sandbox.
 #[utoipa::path(
     get,
@@ -1187,6 +1087,8 @@ fn parse_sandbox_id(id: String) -> Result<SandboxId, AppError> {
     SandboxId::new(id).map_err(|err| AppError::BadRequest(err.to_string()))
 }
 
+/// Picks the default container to act on: the first non-pause container, falling
+/// back to the first container overall.
 fn default_log_container(record: &SandboxRecord) -> Option<String> {
     record
         .containers
@@ -1194,39 +1096,6 @@ fn default_log_container(record: &SandboxRecord) -> Option<String> {
         .find(|name| name.as_str() != PAUSE_CONTAINER)
         .or_else(|| record.containers.first())
         .cloned()
-}
-
-async fn read_log_tail(path: &std::path::Path, tail: usize) -> Result<Vec<String>, AppError> {
-    if tail == 0 {
-        return Ok(Vec::new());
-    }
-    let mut file = match tokio::fs::File::open(path).await {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err.into()),
-    };
-    let len = file.metadata().await?.len();
-    let start = len.saturating_sub(LOG_TAIL_READ_BYTES);
-    file.seek(SeekFrom::Start(start)).await?;
-    let mut buf = Vec::with_capacity((len - start).min(1024 * 1024) as usize);
-    file.read_to_end(&mut buf).await?;
-    if start > 0
-        && let Some(newline) = buf.iter().position(|byte| *byte == b'\n')
-    {
-        buf.drain(..=newline);
-    }
-
-    let mut lines = VecDeque::with_capacity(tail.min(512));
-    for line in buf.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        if lines.len() == tail {
-            lines.pop_front();
-        }
-        lines.push_back(String::from_utf8_lossy(line).into_owned());
-    }
-    Ok(lines.into_iter().collect())
 }
 
 async fn resolve_running_container(
@@ -1423,33 +1292,6 @@ async fn start_background_exec(
     ))
 }
 
-/// List background exec sessions for a sandbox.
-#[utoipa::path(
-    get,
-    path = "/v1/sandboxes/{id}/execs",
-    params(("id" = String, Path, description = "Sandbox id")),
-    responses(
-        (status = 200, description = "Known background exec sessions", body = ListBackgroundExecsResponse),
-        (status = 400, description = "Invalid sandbox id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 404, description = "Sandbox not found", body = ErrorResponse),
-    ),
-    security(("bearer_token" = [])),
-    tag = "sandboxes",
-)]
-async fn list_background_execs(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Json<ListBackgroundExecsResponse>, AppError> {
-    let id = parse_sandbox_id(id)?;
-    if !state.registry.contains(&id).await {
-        return Err(AppError::NotFound(format!("sandbox {id} not found")));
-    }
-    Ok(Json(ListBackgroundExecsResponse {
-        execs: state.background_execs.list_for_sandbox(id.as_str()).await,
-    }))
-}
-
 /// Fetch a single background exec session.
 #[utoipa::path(
     get,
@@ -1555,45 +1397,6 @@ async fn write_background_exec_stdin(
         )));
     }
     Ok(Json(BackgroundExecStdinResponse { accepted }))
-}
-
-/// Resize a PTY-backed background exec session.
-#[utoipa::path(
-    post,
-    path = "/v1/sandboxes/{id}/execs/{exec_id}/resize",
-    params(
-        ("id" = String, Path, description = "Sandbox id"),
-        ("exec_id" = String, Path, description = "Background exec session id"),
-    ),
-    request_body = BackgroundExecResizeRequest,
-    responses(
-        (status = 200, description = "Resize accepted", body = BackgroundExecResizeResponse),
-        (status = 400, description = "Invalid sandbox id or size", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 404, description = "Sandbox or background exec not found", body = ErrorResponse),
-        (status = 409, description = "Background exec is not PTY-backed", body = ErrorResponse),
-    ),
-    security(("bearer_token" = [])),
-    tag = "sandboxes",
-)]
-async fn resize_background_exec(
-    State(state): State<AppState>,
-    AxumPath((id, exec_id)): AxumPath<(String, String)>,
-    Json(request): Json<BackgroundExecResizeRequest>,
-) -> Result<Json<BackgroundExecResizeResponse>, AppError> {
-    let id = parse_sandbox_id(id)?;
-    if request.rows == 0 || request.cols == 0 {
-        return Err(AppError::BadRequest(
-            "PTY rows and cols must be greater than zero".to_string(),
-        ));
-    }
-    let session = background_exec_session(&state, &id, &exec_id).await?;
-    if !session.resize(request.rows, request.cols).await {
-        return Err(AppError::Conflict(format!(
-            "background exec {exec_id} is not PTY-backed"
-        )));
-    }
-    Ok(Json(BackgroundExecResizeResponse { accepted: true }))
 }
 
 /// Stream background exec session events as Server-Sent Events.
@@ -2427,32 +2230,6 @@ async fn checkpoint_running_sandboxes_for_shutdown(state: &AppState) {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn read_log_tail_bounds_large_logs_and_decodes_lossy() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("container.jsonl");
-        let prefix = vec![b'x'; usize::try_from(LOG_TAIL_READ_BYTES).unwrap() + 128];
-        let mut body = prefix;
-        body.extend_from_slice(b"\nfirst\nsecond\nbad-\xff\n");
-        tokio::fs::write(&path, body).await.unwrap();
-
-        let lines = read_log_tail(&path, 2).await.unwrap();
-
-        assert_eq!(
-            lines,
-            vec!["second".to_string(), "bad-\u{fffd}".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn read_log_tail_honors_zero_tail() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("container.jsonl");
-        tokio::fs::write(&path, b"line\n").await.unwrap();
-
-        assert!(read_log_tail(&path, 0).await.unwrap().is_empty());
-    }
-
     #[test]
     fn openapi_spec_includes_all_routes() {
         let spec = ApiDoc::openapi();
@@ -2461,7 +2238,6 @@ mod tests {
             "/openapi.json",
             "/v1/sandboxes",
             "/v1/sandboxes/{id}",
-            "/v1/sandboxes/{id}/logs",
             "/v1/sandboxes/{id}/exec",
             "/v1/sandboxes/{id}/execs",
             "/v1/sandboxes/{id}/execs/{exec_id}",

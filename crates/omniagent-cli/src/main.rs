@@ -9,7 +9,6 @@
 
 mod agent;
 mod agent_log;
-mod atif;
 mod cast;
 mod client;
 mod codex;

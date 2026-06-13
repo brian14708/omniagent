@@ -608,7 +608,8 @@ impl TraceStore {
 
     /// Returns a snapshot of every recorded span, in `sequence` order.
     ///
-    /// Used at session close to build an ATIF trajectory from the run's traffic.
+    /// Used at session close to upload the raw intercepted spans as the
+    /// `raw_requests` artifact.
     #[must_use]
     pub fn snapshot(&self) -> Vec<LlmSpan> {
         self.spans.read().map(|s| s.clone()).unwrap_or_default()

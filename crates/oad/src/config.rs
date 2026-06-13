@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use oad_core::{
     ControlPlaneConfig, DaemonConfig, HttpConfig, ManagedNetworkBackend, MountSpec,
-    NetworkRuntimeConfig, ObservabilityConfig, RuntimeConfig,
+    NetworkRuntimeConfig, RuntimeConfig,
 };
 use serde::Deserialize;
 
@@ -45,8 +45,6 @@ struct FileRuntimeConfig {
     #[serde(default)]
     network: FileNetworkRuntimeConfig,
     #[serde(default)]
-    observability: FileObservabilityConfig,
-    #[serde(default)]
     static_mounts: Vec<MountSpec>,
 }
 
@@ -58,11 +56,6 @@ struct FileNetworkRuntimeConfig {
     envoy_listener: Option<String>,
     dns_listener: Option<String>,
     dns_upstream: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct FileObservabilityConfig {
-    enabled: Option<bool>,
 }
 
 pub async fn load_config(path: Option<PathBuf>) -> Result<DaemonConfig> {
@@ -83,7 +76,6 @@ pub async fn load_config(path: Option<PathBuf>) -> Result<DaemonConfig> {
 
     apply_env_overrides(&mut file_config)?;
 
-    let observability = resolve_observability_config(&file_config);
     let network = resolve_network_config(&file_config)?;
 
     let bearer_token = file_config.http.bearer_token.unwrap_or_default();
@@ -110,7 +102,6 @@ pub async fn load_config(path: Option<PathBuf>) -> Result<DaemonConfig> {
                 .unwrap_or_else(|| DEFAULT_PAUSE_IMAGE.to_string()),
             network_namespace: file_config.runtime.network_namespace,
             network,
-            observability,
             static_mounts: file_config.runtime.static_mounts,
         },
         control_plane,
@@ -184,17 +175,6 @@ fn resolve_network_config(config: &FileConfig) -> Result<NetworkRuntimeConfig> {
             .or_else(host_dns_upstream)
             .unwrap_or(defaults.dns_upstream),
     })
-}
-
-fn resolve_observability_config(config: &FileConfig) -> ObservabilityConfig {
-    let defaults = ObservabilityConfig::default();
-    ObservabilityConfig {
-        enabled: config
-            .runtime
-            .observability
-            .enabled
-            .unwrap_or(defaults.enabled),
-    }
 }
 
 fn host_dns_upstream() -> Option<String> {
@@ -277,10 +257,6 @@ fn apply_env_overrides(config: &mut FileConfig) -> Result<()> {
     }
     if let Ok(value) = std::env::var("OAD_DNS_UPSTREAM") {
         config.runtime.network.dns_upstream = Some(value);
-    }
-    if let Ok(value) = std::env::var("OAD_OBSERVABILITY_ENABLED") {
-        config.runtime.observability.enabled =
-            Some(parse_bool_env("OAD_OBSERVABILITY_ENABLED", &value)?);
     }
     if let Ok(value) = std::env::var("OAD_STATIC_MOUNT") {
         config

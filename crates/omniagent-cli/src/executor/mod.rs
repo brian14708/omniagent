@@ -2,8 +2,8 @@
 //!
 //! Each supervised session is launched through an [`Executor`]: the trait
 //! captures everything agent-specific about *launching and identifying* an agent
-//! — its canonical name and ATIF capability ([`AgentInfo`]), which backend it
-//! runs on ([`Backend`]), and how its launch argv is transformed for the proxy
+//! — its canonical name and native-log capability ([`AgentInfo`]), which backend
+//! it runs on ([`Backend`]), and how its launch argv is transformed for the proxy
 //! (claude's `--session-id` injection, codex's provider overrides). This keeps
 //! the supervisor free of `agent == "codex"` string checks and makes adding an
 //! agent a single [`Executor`] impl plus a [`resolve_executor`] arm.
@@ -23,8 +23,9 @@ pub mod action;
 pub struct AgentInfo {
     /// Canonical, harbor-compatible agent name (e.g. `"claude-code"`).
     pub name: &'static str,
-    /// Whether an ATIF trajectory can be produced for this agent.
-    pub supports_atif: bool,
+    /// Whether this agent writes a native on-disk session log we know how to
+    /// locate (and therefore upload as the `session_log` artifact).
+    pub has_native_log: bool,
 }
 
 /// Which backend drives a session's agent process.
@@ -43,8 +44,8 @@ pub enum Backend {
 
 /// Launch-time behavior for one coding agent.
 pub trait Executor: Send + Sync {
-    /// Capability handle (canonical name + ATIF flag), or `None` for an
-    /// unrecognized/custom command (recorded, but no ATIF trajectory).
+    /// Capability handle (canonical name + native-log flag), or `None` for an
+    /// unrecognized/custom command (recorded, but no native session log).
     fn info(&self) -> Option<AgentInfo>;
 
     /// Backend selection. `app_server` is the user's opt-in to the native codex
@@ -68,7 +69,7 @@ pub trait Executor: Send + Sync {
 }
 
 /// Resolves the user's selector (`claude`/`codex`/`gemini`) to an executor; any
-/// other selector is a custom command run in a bare PTY with no ATIF.
+/// other selector is a custom command run in a bare PTY with no native log.
 #[must_use]
 pub fn resolve_executor(agent: &str) -> Box<dyn Executor> {
     match agent {
@@ -139,7 +140,7 @@ impl Executor for ClaudeExecutor {
     fn info(&self) -> Option<AgentInfo> {
         Some(AgentInfo {
             name: "claude-code",
-            supports_atif: true,
+            has_native_log: true,
         })
     }
 
@@ -176,7 +177,7 @@ impl Executor for CodexExecutor {
     fn info(&self) -> Option<AgentInfo> {
         Some(AgentInfo {
             name: "codex",
-            supports_atif: true,
+            has_native_log: true,
         })
     }
 
@@ -214,7 +215,7 @@ impl Executor for GeminiExecutor {
     fn info(&self) -> Option<AgentInfo> {
         Some(AgentInfo {
             name: "gemini-cli",
-            supports_atif: true,
+            has_native_log: true,
         })
     }
 
@@ -274,9 +275,9 @@ mod tests {
             resolve_executor("gemini").info().unwrap().name,
             "gemini-cli"
         );
-        assert!(resolve_executor("claude").info().unwrap().supports_atif);
-        assert!(resolve_executor("codex").info().unwrap().supports_atif);
-        assert!(resolve_executor("gemini").info().unwrap().supports_atif);
+        assert!(resolve_executor("claude").info().unwrap().has_native_log);
+        assert!(resolve_executor("codex").info().unwrap().has_native_log);
+        assert!(resolve_executor("gemini").info().unwrap().has_native_log);
     }
 
     #[test]

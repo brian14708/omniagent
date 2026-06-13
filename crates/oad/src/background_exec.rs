@@ -8,7 +8,6 @@ use oad_api::{
     BackgroundExecEvent, BackgroundExecEventKind, BackgroundExecInfo, BackgroundExecStatus,
 };
 use oad_runtime::{ExecProcess, PtyExecProcess};
-use portable_pty::PtySize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::sync::{Mutex, Notify, broadcast, oneshot};
@@ -91,23 +90,6 @@ impl BackgroundExecStore {
         self.sessions.lock().await.get(exec_id).cloned()
     }
 
-    pub async fn list_for_sandbox(&self, sandbox_id: &str) -> Vec<BackgroundExecInfo> {
-        let sessions = {
-            let sessions = self.sessions.lock().await;
-            sessions.values().cloned().collect::<Vec<_>>()
-        };
-
-        let mut infos = Vec::new();
-        for session in sessions {
-            let info = session.info().await;
-            if info.sandbox_id == sandbox_id {
-                infos.push(info);
-            }
-        }
-        infos.sort_by(|left, right| left.id.cmp(&right.id));
-        infos
-    }
-
     pub async fn kill_for_sandbox(&self, sandbox_id: &str) {
         let sessions = {
             let sessions = self.sessions.lock().await;
@@ -168,6 +150,13 @@ enum SessionControl {
     },
     Pty {
         writer: Option<Box<dyn Write + Send>>,
+        // Retained to hold the PTY master open for the session's lifetime. No
+        // longer read since the resize endpoint was removed, but dropping it
+        // early would close the master fd.
+        #[expect(
+            dead_code,
+            reason = "held to keep the PTY master fd open for the session lifetime"
+        )]
         master: Box<dyn portable_pty::MasterPty + Send>,
         killer: Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
         kill_tx: Option<oneshot::Sender<()>>,
@@ -267,25 +256,6 @@ impl BackgroundExecSession {
         }
         drop(control);
         Ok(true)
-    }
-
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "the PTY master lock must be held while calling resize"
-    )]
-    pub async fn resize(&self, rows: u16, cols: u16) -> bool {
-        let control = self.control.lock().await;
-        let SessionControl::Pty { master, .. } = &*control else {
-            return false;
-        };
-        master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .is_ok()
     }
 
     pub async fn kill(&self) -> bool {

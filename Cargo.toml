@@ -2,7 +2,6 @@
 members = [
     "crates/oad",
     "crates/oad-api",
-    "crates/oad-cli",
     "crates/oad-client",
     "crates/oad-core",
     "crates/oad-oci",
@@ -30,7 +29,6 @@ hex = "0.4"
 http = "1.1"
 libc = "0.2"
 oad-api = { path = "crates/oad-api" }
-oad-cli = { path = "crates/oad-cli" }
 oad-client = { path = "crates/oad-client" }
 oad-core = { path = "crates/oad-core" }
 oad-oci = { path = "crates/oad-oci" }
