@@ -5,278 +5,16 @@
   class="oa-console flex h-screen overflow-hidden text-[var(--text)]"
 >
   <%!-- ── Left: sessions sidebar ───────────────────────────────────────── --%>
-  <aside class={[
-    "flex flex-none flex-col border-r border-[var(--line)] bg-[var(--panel)]",
-    @sidebar_collapsed && "w-12",
-    !@sidebar_collapsed && "w-[var(--left-w)]"
-  ]}>
-    <%= if @sidebar_collapsed do %>
-      <button
-        type="button"
-        phx-click="toggle_sidebar"
-        title="Expand sidebar"
-        class="flex h-[49px] w-full flex-none items-center justify-center border-b border-[var(--line)] text-[var(--faint)] hover:text-[var(--text)]"
-      >
-        »
-      </button>
-      <div class="flex flex-1 flex-col items-center gap-2 overflow-y-auto py-3">
-        <%= for session <- Enum.filter(@sessions, &active?/1) do %>
-          <.link
-            patch={~p"/sessions/#{session.id}"}
-            title={session.name || session.id}
-            class={[
-              "relative flex h-9 w-9 flex-none items-center justify-center rounded-full border text-xs font-bold uppercase transition-colors",
-              @session && @session.id == session.id &&
-                "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]",
-              !(@session && @session.id == session.id) &&
-                "border-[var(--line)] text-[var(--dim)] hover:bg-[var(--panel-2)]"
-            ]}
-          >
-            {session_initial(session)}
-          </.link>
-        <% end %>
-        <button
-          type="button"
-          phx-click="toggle_sidebar"
-          title="Expand to launch an agent"
-          class="flex h-9 w-9 flex-none items-center justify-center rounded-full border border-[var(--line)] text-[var(--faint)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
-        >
-          +
-        </button>
-      </div>
-    <% else %>
-      <div class="flex items-center justify-between border-b border-[var(--line)] px-3 py-2.5">
-        <.link href={~p"/"} class="flex min-w-0 items-center gap-3">
-          <img src={~p"/logo.svg"} alt="" class="oa-logo" />
-          <Layouts.wordmark />
-        </.link>
-        <button
-          type="button"
-          phx-click="toggle_sidebar"
-          title="Collapse sidebar"
-          class="flex-none rounded-md px-1.5 py-1 text-sm text-[var(--faint)] hover:bg-[var(--panel-2)] hover:text-[var(--text)]"
-        >
-          «
-        </button>
-      </div>
-
-      <div class="flex-1 space-y-6 overflow-y-auto px-2 py-3">
-        <%= if @daemons == [] do %>
-          <div class="px-2 py-10 text-center">
-            <p class="text-sm text-[var(--dim)]">No daemon connected</p>
-            <p class="mt-1 font-mono text-[12px] text-[var(--faint)]">
-              run <code>omniagent daemon</code>
-            </p>
-          </div>
-        <% else %>
-          <%= for daemon <- @daemons do %>
-            <% workspaces = daemon_workspaces(daemon) %>
-            <section class="space-y-1">
-              <div class="group/daemon flex items-center gap-2 px-1 pt-1">
-                <span class="flex-none text-[11px] font-semibold uppercase tracking-wide text-[var(--faint)]">
-                  {daemon_label(daemon)}
-                </span>
-                <span class="h-px flex-1 bg-[var(--line)]"></span>
-                <button
-                  type="button"
-                  phx-click="open_new_workspace"
-                  phx-value-daemon_id={daemon.id}
-                  title="Create a new workspace on this daemon"
-                  class="flex-none rounded px-1 text-[11px] uppercase tracking-wide text-[var(--faint)] opacity-0 hover:text-[var(--accent)] focus:opacity-100 group-hover/daemon:opacity-100"
-                >
-                  + ws
-                </button>
-              </div>
-
-              <%= if workspaces == [] do %>
-                <button
-                  type="button"
-                  phx-click="open_new_workspace"
-                  phx-value-daemon_id={daemon.id}
-                  class="block px-2 py-1 text-left font-mono text-[12px] text-[var(--faint)] hover:text-[var(--accent)]"
-                >
-                  no workspaces — <span class="text-[var(--accent)]">create one</span>
-                </button>
-              <% else %>
-                <ul class="space-y-0.5">
-                  <%= for ws <- workspaces do %>
-                    <% ws_sessions = workspace_sessions(@sessions, ws["path"]) %>
-                    <li>
-                      <button
-                        type="button"
-                        phx-click="launch_workspace"
-                        phx-value-daemon_id={daemon.id}
-                        phx-value-path={ws["path"]}
-                        title={"Run an agent on #{ws["path"]}"}
-                        class="group/ws flex w-full items-center gap-2 rounded-md py-1.5 pl-2 pr-2 text-left hover:bg-[var(--panel-2)]"
-                      >
-                        <.icon
-                          name="hero-folder-micro"
-                          class="size-3.5 flex-none text-[var(--faint)]"
-                        />
-                        <span class="min-w-0 flex-1 truncate text-sm text-[var(--dim)] group-hover/ws:text-[var(--text)]">
-                          {workspace_label(ws["path"])}
-                        </span>
-                        <span class="flex-none text-[11px] uppercase tracking-wide text-[var(--faint)] opacity-0 group-hover/ws:text-[var(--accent)] group-hover/ws:opacity-100">
-                          + agent
-                        </span>
-                      </button>
-                      <%= if ws_sessions != [] do %>
-                        <div class="mt-px space-y-px pl-5">
-                          <%= for session <- ws_sessions do %>
-                            <.session_row
-                              session={session}
-                              active_id={@session && @session.id}
-                              compact
-                            />
-                          <% end %>
-                        </div>
-                      <% end %>
-                    </li>
-                  <% end %>
-                </ul>
-              <% end %>
-            </section>
-          <% end %>
-        <% end %>
-
-        <section class="space-y-1">
-          <div class="flex items-center gap-2 px-1 pt-1">
-            <span class="flex-none text-[11px] font-semibold uppercase tracking-wide text-[var(--faint)]">
-              oad
-            </span>
-            <span class="h-px flex-1 bg-[var(--line)]"></span>
-            <%= if @oad_instances != [] do %>
-              <button
-                type="button"
-                phx-click="open_new_oad_workspace"
-                title="Build a new oad workspace"
-                class="flex-none rounded px-1 text-[11px] uppercase tracking-wide text-[var(--faint)] hover:text-[var(--accent)]"
-              >
-                + ws
-              </button>
-            <% end %>
-          </div>
-
-          <%= if @oad_instances == [] do %>
-            <p class="px-2 py-1 font-mono text-[12px] text-[var(--faint)]">
-              no oad instance registered
-            </p>
-          <% else %>
-            <%= if @oad_workspaces == [] do %>
-              <button
-                type="button"
-                phx-click="open_new_oad_workspace"
-                class="block px-2 py-1 text-left font-mono text-[12px] text-[var(--faint)] hover:text-[var(--accent)]"
-              >
-                no workspaces — <span class="text-[var(--accent)]">build one</span>
-              </button>
-            <% else %>
-              <ul class="space-y-0.5">
-                <%= for ws <- @oad_workspaces do %>
-                  <% oad_sessions = oad_workspace_sessions(@sessions, ws.name) %>
-                  <li class="group/oadws">
-                    <div class="flex items-center gap-2 rounded-md py-1.5 pl-2 pr-2 hover:bg-[var(--panel-2)]">
-                      <.icon
-                        name="hero-folder-micro"
-                        class="size-3.5 flex-none text-[var(--faint)]"
-                      />
-                      <span class="min-w-0 flex-1 truncate text-sm text-[var(--dim)]">
-                        {ws.name}
-                        <span class="text-[11px] text-[var(--faint)]">· {ws.status}</span>
-                      </span>
-                      <%= if ws.status == "ready" do %>
-                        <button
-                          type="button"
-                          phx-click="open_oad_agent"
-                          phx-value-workspace={ws.name}
-                          title={"Run an agent on #{ws.name}"}
-                          class="flex-none text-[11px] uppercase tracking-wide text-[var(--faint)] opacity-0 hover:text-[var(--accent)] group-hover/oadws:opacity-100"
-                        >
-                          + agent
-                        </button>
-                      <% end %>
-                      <button
-                        type="button"
-                        phx-click="rebuild_oad_workspace"
-                        phx-value-name={ws.name}
-                        title="Rebuild this workspace"
-                        class="flex-none text-[11px] uppercase tracking-wide text-[var(--faint)] opacity-0 hover:text-[var(--accent)] group-hover/oadws:opacity-100"
-                      >
-                        rebuild
-                      </button>
-                    </div>
-                    <%= if oad_sessions != [] do %>
-                      <div class="mt-px space-y-px pl-5">
-                        <%= for session <- oad_sessions do %>
-                          <.session_row
-                            session={session}
-                            active_id={@session && @session.id}
-                            compact
-                          />
-                        <% end %>
-                      </div>
-                    <% end %>
-                  </li>
-                <% end %>
-              </ul>
-            <% end %>
-          <% end %>
-        </section>
-
-        <% panel = panel_sessions(@sessions, @daemons, @oad_workspaces) %>
-        <%= if panel != [] do %>
-          <section class="space-y-1">
-            <button
-              type="button"
-              phx-click="toggle_sessions"
-              class="group/sessions flex w-full items-center gap-1 pr-1 py-0.5 text-left"
-            >
-              <span class={[
-                "inline-block w-2 flex-none text-center text-[9px] text-[var(--faint)] transition-transform",
-                !@sessions_collapsed && "rotate-90"
-              ]}>
-                ›
-              </span>
-              <span class="flex-1 text-[12px] font-semibold uppercase tracking-wide text-[var(--faint)] group-hover/sessions:text-[var(--dim)]">
-                Inactive
-              </span>
-              <span class="flex-none font-mono text-[11px] text-[var(--faint)]">
-                {length(panel)}
-              </span>
-            </button>
-            <%= unless @sessions_collapsed do %>
-              <div class="space-y-px">
-                <%= for session <- panel do %>
-                  <.session_row session={session} active_id={@session && @session.id} compact />
-                <% end %>
-              </div>
-            <% end %>
-          </section>
-        <% end %>
-      </div>
-
-      <div class="flex items-center gap-2 border-t border-[var(--line)] px-3 py-2.5">
-        <span class="flex h-7 w-7 flex-none items-center justify-center rounded-full border border-[var(--line)] bg-[var(--panel-2)] text-[11px] font-bold uppercase text-[var(--dim)]">
-          {user_initial(@current_user)}
-        </span>
-        <span
-          class="min-w-0 flex-1 truncate text-[12px] text-[var(--dim)]"
-          title={user_label(@current_user)}
-        >
-          {user_label(@current_user)}
-        </span>
-        <.link
-          href={~p"/logout"}
-          method="delete"
-          title="Sign out"
-          class="flex-none rounded-md px-1.5 py-1 text-[12px] text-[var(--faint)] hover:bg-[var(--panel-2)] hover:text-[var(--text)]"
-        >
-          Sign out
-        </.link>
-      </div>
-    <% end %>
-  </aside>
+  <.sidebar
+    sessions={@sessions}
+    session={@session}
+    daemons={@daemons}
+    oad_instances={@oad_instances}
+    oad_workspaces={@oad_workspaces}
+    sidebar_collapsed={@sidebar_collapsed}
+    sessions_collapsed={@sessions_collapsed}
+    current_user={@current_user}
+  />
 
   <%= unless @sidebar_collapsed do %>
     <div
@@ -296,93 +34,7 @@
   <%!-- ── Middle: terminal + traces ────────────────────────────────────── --%>
   <main class="flex min-w-0 flex-1 flex-col bg-[var(--bg)]">
     <%= if @session do %>
-      <header class="flex flex-none items-center justify-between gap-3 border-b border-[var(--line)] px-4 py-3">
-        <div class="flex min-w-0 items-center gap-3">
-          <h1 class="oa-display truncate text-lg font-bold">{@session.name || @session.id}</h1>
-          <span class={"oa-status #{status_class(@session.status)}"}>{@session.status}</span>
-          <code class="hidden truncate font-mono text-[11px] text-[var(--faint)] md:block">
-            {@session.cwd}
-          </code>
-          <%= if branch = @session.metadata["branch"] do %>
-            <span class="oa-label hidden shrink-0 md:inline-flex" title="git branch">
-              ⎇ {branch}
-            </span>
-          <% end %>
-        </div>
-        <%= if @session.status != "online" do %>
-          <button
-            type="button"
-            phx-click="delete_session"
-            data-confirm="Delete this session and all its recorded data?"
-            class="oa-btn danger text-xs"
-          >
-            Delete
-          </button>
-        <% end %>
-      </header>
-
-      <div
-        class="flex min-h-0 flex-col border-b border-[var(--line)] p-2"
-        style="flex: 0 0 var(--term-basis)"
-      >
-        <%= cond do %>
-          <% Sessions.codex_native?(@session) -> %>
-            <%!-- Native codex conversation: the Codex hook owns the whole pane
-                  (transcript + composer + interrupt), driven by push_event. --%>
-            <div
-              id={"codex-#{@session.id}"}
-              phx-hook="Codex"
-              phx-update="ignore"
-              data-status={@session.status}
-              class="oa-codex flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border border-[var(--line)] bg-[var(--panel)]"
-            >
-            </div>
-          <% @session.status == "online" -> %>
-            <div
-              id={"terminal-#{@session.id}"}
-              phx-hook="Terminal"
-              phx-update="ignore"
-              class="oa-terminal min-h-0 flex-1 overflow-hidden rounded-md border border-[var(--line)] bg-black p-2"
-            >
-            </div>
-          <% true -> %>
-            <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-md border border-[var(--line)] bg-black text-center">
-              <p class="oa-display text-sm font-bold text-[var(--dim)]">Session ended</p>
-              <p class="font-mono text-[11px] text-[var(--faint)]">
-                open the <span class="text-[var(--accent)]">Artifacts</span>
-                tab to replay or download the recording
-              </p>
-            </div>
-        <% end %>
-      </div>
-
-      <div
-        id="gutter-term"
-        phx-hook="Resize"
-        data-axis="y"
-        data-var="--term-basis"
-        data-prop="term_pct"
-        data-unit="%"
-        data-min="20"
-        data-max="85"
-        class="oa-gutter oa-gutter-y"
-        title="Drag to resize"
-      >
-      </div>
-
-      <div class="flex min-h-0 flex-1 flex-col p-2">
-        <div class="oa-label mb-1 px-1">Traces</div>
-        <div
-          id={"traces-#{@session.id}"}
-          phx-hook="Traces"
-          phx-update="ignore"
-          class="oa-traces min-h-0 flex-1 overflow-y-auto"
-        >
-          <div class="oa-trace-empty" data-trace-empty>
-            no LLM calls yet — requests appear as the agent talks to the model
-          </div>
-        </div>
-      </div>
+      <.session_pane session={@session} />
     <% else %>
       <div class="flex flex-1 flex-col items-center justify-center gap-4 text-center">
         <img src={~p"/logo.svg"} alt="" class="oa-logo" style="width:48px;height:48px" />
@@ -459,165 +111,15 @@
           <% is_nil(@session) -> %>
             <p class="font-mono text-xs text-[var(--faint)]">select a session</p>
           <% @right_tab == "files" -> %>
-            <%!-- Header: Changes label, count, refresh --%>
-            <div class="mb-3 flex items-center gap-1">
-              <span class="font-mono text-[11px] text-[var(--dim)]">Changes</span>
-              <span class="ml-auto font-mono text-[10px] text-[var(--faint)]">
-                <%= if @changes != [] do %>
-                  {length(@changes)} changed
-                <% end %>
-              </span>
-              <button
-                type="button"
-                phx-click="refresh_changes"
-                title="Refresh changes"
-                class="flex-none px-1.5 text-[var(--faint)] hover:text-[var(--text)]"
-              >
-                ⟳
-              </button>
-            </div>
-
-            <%!-- Changed-files list (git status vs HEAD); a click opens the
-                 diff in a modal --%>
-            <%= cond do %>
-              <% @changes == [] and @changes_error -> %>
-                <p class="font-mono text-xs text-[var(--prov-red)]">{@changes_error}</p>
-              <% @changes == [] and @changes_loading -> %>
-                <p class="font-mono text-xs text-[var(--faint)]">loading…</p>
-              <% @changes == [] -> %>
-                <p class="font-mono text-xs text-[var(--faint)]">no changes</p>
-              <% true -> %>
-                <%= if @changes_error do %>
-                  <p class="mb-2 font-mono text-xs text-[var(--prov-red)]">{@changes_error}</p>
-                <% end %>
-                <div class="overflow-hidden">
-                  <%= for file <- @changes do %>
-                    <% badge = status_badge(file["status"]) %>
-                    <button
-                      type="button"
-                      phx-click="open_diff"
-                      phx-value-path={file["path"]}
-                      class="flex w-full items-center gap-2 py-1 pl-2 pr-2 text-left font-mono text-[11px] hover:bg-[var(--panel-2)]"
-                    >
-                      <span
-                        class="w-4 flex-none text-center font-semibold"
-                        style={"color: #{badge.color}"}
-                      >
-                        {badge.label}
-                      </span>
-                      <span class="truncate text-[var(--dim)]">{file["path"]}</span>
-                    </button>
-                  <% end %>
-                </div>
-            <% end %>
+            <.files_tab
+              changes={@changes}
+              changes_error={@changes_error}
+              changes_loading={@changes_loading}
+            />
           <% @right_tab == "reviews" -> %>
-            <div class="mb-3 flex items-center justify-between">
-              <span class="oa-label">Review gate</span>
-              <button
-                type="button"
-                phx-click="toggle_auto_approve"
-                aria-pressed={@auto_approve}
-                class={"oa-btn text-xs #{if @auto_approve, do: "ok", else: ""}"}
-              >
-                <span class={"oa-dot #{if @auto_approve, do: "on", else: ""}"}></span>
-                Auto {if @auto_approve, do: "on", else: "off"}
-              </button>
-            </div>
-            <div class="space-y-2">
-              <%= for item <- @reviews do %>
-                <div class="oa-panel p-3">
-                  <div class="font-mono text-[11px] text-[var(--dim)]">
-                    {item.external_id} · {item.phase} · {item.path}
-                  </div>
-                  <%= if item.decision do %>
-                    <div class="mt-2 flex items-center gap-2 font-mono text-[11px]">
-                      <span class={"oa-status #{review_decision_class(item.decision)}"}>
-                        {review_decision_label(item.decision)}
-                      </span>
-                      <%= if item.decided_at do %>
-                        <span class="text-[var(--faint)]">
-                          {Calendar.strftime(item.decided_at, "%Y-%m-%d %H:%M")}
-                        </span>
-                      <% end %>
-                    </div>
-                  <% else %>
-                    <div class="mt-2 flex flex-wrap gap-2">
-                      <button
-                        phx-click="review_decision"
-                        phx-value-id={item.external_id}
-                        phx-value-action="approve"
-                        class="oa-btn ok text-xs"
-                      >
-                        Approve
-                      </button>
-                      <button
-                        phx-click="review_decision"
-                        phx-value-id={item.external_id}
-                        phx-value-action="retry"
-                        class="oa-btn primary text-xs"
-                      >
-                        Retry
-                      </button>
-                      <button
-                        phx-click="review_decision"
-                        phx-value-id={item.external_id}
-                        phx-value-action="reject"
-                        class="oa-btn danger text-xs"
-                      >
-                        Reject
-                      </button>
-                    </div>
-                  <% end %>
-                </div>
-              <% end %>
-              <%= if @reviews == [] do %>
-                <p class="font-mono text-xs text-[var(--faint)]">no pending reviews</p>
-              <% end %>
-            </div>
+            <.reviews_tab reviews={@reviews} auto_approve={@auto_approve} />
           <% @right_tab == "artifacts" -> %>
-            <div class="mb-2 oa-label">Captured artifacts</div>
-            <%= if @artifacts == [] do %>
-              <p class="font-mono text-xs text-[var(--faint)]">
-                no artifacts yet — recording, traces, and logs upload when the session ends
-              </p>
-            <% else %>
-              <ul class="space-y-2">
-                <%= for artifact <- @artifacts do %>
-                  <li class="oa-panel flex items-center justify-between gap-3 p-3">
-                    <div class="min-w-0">
-                      <div class="truncate text-sm text-[var(--text)]">
-                        {artifact_label(artifact.kind)}
-                      </div>
-                      <div class="mt-0.5 font-mono text-[11px] text-[var(--faint)]">
-                        {format_bytes(artifact.size)} · {Calendar.strftime(
-                          artifact.inserted_at,
-                          "%Y-%m-%d %H:%M"
-                        )}
-                      </div>
-                    </div>
-                    <div class="flex flex-none items-center gap-2">
-                      <%= if artifact.kind == "recording" do %>
-                        <button
-                          type="button"
-                          phx-click="play_recording"
-                          phx-value-id={artifact.id}
-                          class="oa-btn primary text-xs"
-                        >
-                          Play
-                        </button>
-                      <% end %>
-                      <a
-                        href={~p"/sessions/#{@session.id}/artifacts/#{artifact.id}/download"}
-                        class="oa-btn text-xs"
-                        download
-                      >
-                        Download
-                      </a>
-                    </div>
-                  </li>
-                <% end %>
-              </ul>
-            <% end %>
+            <.artifacts_tab artifacts={@artifacts} session={@session} />
           <% true -> %>
         <% end %>
       </div>
@@ -627,251 +129,199 @@
 
 <%!-- ── Diff modal (a changed file's unified diff) ───────────────────── --%>
 <%= if @diff_result do %>
-  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-    <div
-      class="oa-panel flex max-h-[85vh] w-full max-w-4xl flex-col p-0"
-      phx-click-away="close_diff"
-    >
-      <div class="flex flex-none items-center justify-between gap-2 border-b border-[var(--line)] px-4 py-2.5">
-        <span class="truncate font-mono text-xs text-[var(--dim)]" title={@diff_result["path"]}>
-          {@diff_result["path"]}
-        </span>
-        <button
-          type="button"
-          phx-click="close_diff"
-          title="Close"
-          class="flex-none px-1.5 text-[var(--faint)] hover:text-[var(--text)]"
-        >
-          ✕
-        </button>
-      </div>
-      <div class="min-h-0 flex-1 overflow-auto p-4">
-        <%= cond do %>
-          <% @diff_result["loading"] -> %>
-            <p class="font-mono text-xs text-[var(--faint)]">loading diff…</p>
-          <% @diff_result["empty"] -> %>
-            <p class="font-mono text-xs text-[var(--faint)]">no changes for this file</p>
-          <% @diff_result["ok"] -> %>
-            <%!-- Key the id by a hash of the diff text so an in-place refresh
-                 (same file, new content) forces a remount — phx-update="ignore"
-                 would otherwise leave the DiffHighlight hook showing stale text. --%>
-            <div
-              id={"diff-view-#{@diff_result["path"]}-#{:erlang.phash2(@diff_result["diff"])}"}
-              phx-hook="DiffHighlight"
-              phx-update="ignore"
-              data-diff={@diff_result["diff"]}
-              data-path={@diff_result["path"]}
-              class="font-mono text-[11px] leading-[1.5]"
-            >
-            </div>
-          <% true -> %>
-            <p class="font-mono text-xs text-[var(--prov-red)]">{@diff_result["error"]}</p>
-        <% end %>
-      </div>
+  <.modal
+    on_close="close_diff"
+    overlay_class="bg-black/70"
+    panel_class="flex max-h-[85vh] w-full max-w-4xl flex-col p-0"
+  >
+    <div class="flex flex-none items-center justify-between gap-2 border-b border-[var(--line)] px-4 py-2.5">
+      <span class="truncate font-mono text-xs text-[var(--dim)]" title={@diff_result["path"]}>
+        {@diff_result["path"]}
+      </span>
+      <button
+        type="button"
+        phx-click="close_diff"
+        title="Close"
+        class="flex-none px-1.5 text-[var(--faint)] hover:text-[var(--text)]"
+      >
+        ✕
+      </button>
     </div>
-  </div>
+    <div class="min-h-0 flex-1 overflow-auto p-4">
+      <%= cond do %>
+        <% @diff_result["loading"] -> %>
+          <p class="font-mono text-xs text-[var(--faint)]">loading diff…</p>
+        <% @diff_result["empty"] -> %>
+          <p class="font-mono text-xs text-[var(--faint)]">no changes for this file</p>
+        <% @diff_result["ok"] -> %>
+          <%!-- Key the id by a hash of the diff text so an in-place refresh
+               (same file, new content) forces a remount — phx-update="ignore"
+               would otherwise leave the DiffHighlight hook showing stale text. --%>
+          <div
+            id={"diff-view-#{@diff_result["path"]}-#{:erlang.phash2(@diff_result["diff"])}"}
+            phx-hook="DiffHighlight"
+            phx-update="ignore"
+            data-diff={@diff_result["diff"]}
+            data-path={@diff_result["path"]}
+            class="font-mono text-[11px] leading-[1.5]"
+          >
+          </div>
+        <% true -> %>
+          <p class="font-mono text-xs text-[var(--prov-red)]">{@diff_result["error"]}</p>
+      <% end %>
+    </div>
+  </.modal>
 <% end %>
 
 <%!-- ── New-agent modal ──────────────────────────────────────────────── --%>
-<%= if @show_new_agent do %>
-  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-    <div class="oa-panel w-full max-w-md p-5" phx-click-away="close_new_agent">
-      <h2 class="oa-display mb-4 text-lg font-bold">New agent</h2>
-      <%= if @daemons == [] do %>
-        <p class="font-mono text-sm text-[var(--dim)]">
-          No daemon is connected. Start one with <code class="text-[var(--accent)]">omniagent daemon</code>, then try again.
-        </p>
-        <div class="mt-4 flex justify-end">
-          <button type="button" phx-click="close_new_agent" class="oa-btn">Close</button>
+<%= if @modal == :new_agent do %>
+  <.modal>
+    <h2 class="oa-display mb-4 text-lg font-bold">New agent</h2>
+    <%= if @daemons == [] do %>
+      <p class="font-mono text-sm text-[var(--dim)]">
+        No daemon is connected. Start one with <code class="text-[var(--accent)]">omniagent daemon</code>, then try again.
+      </p>
+      <div class="mt-4 flex justify-end">
+        <button type="button" phx-click="close_modal" class="oa-btn">Close</button>
+      </div>
+    <% else %>
+      <% sel_daemon = daemon_by_id(@daemons, @new_agent_daemon) || List.first(@daemons) %>
+      <% workspaces = daemon_workspaces(sel_daemon) %>
+      <% sel_ws = workspace_by_path(sel_daemon, @new_agent_workspace) || List.first(workspaces) %>
+      <% git = workspace_git(sel_ws) %>
+      <form phx-submit="create_agent" phx-change="new_agent_change" class="space-y-3">
+        <input type="hidden" name="daemon_id" value={@new_agent_daemon} />
+        <div class="rounded-md border border-[var(--line)] bg-[var(--panel-2)] px-3 py-2 font-mono text-[11px]">
+          <div class="oa-label mb-0.5">Daemon</div>
+          <div class="truncate text-[var(--dim)]">
+            {sel_daemon && daemon_label(sel_daemon)}
+            <span class="text-[var(--faint)]">· {sel_daemon && sel_daemon.metadata["cwd"]}</span>
+          </div>
         </div>
-      <% else %>
-        <% sel_daemon = daemon_by_id(@daemons, @new_agent_daemon) || List.first(@daemons) %>
-        <% workspaces = daemon_workspaces(sel_daemon) %>
-        <% sel_ws =
-          workspace_by_path(sel_daemon, @new_agent_workspace) || List.first(workspaces) %>
-        <% git = workspace_git(sel_ws) %>
-        <form phx-submit="create_agent" phx-change="new_agent_change" class="space-y-3">
-          <input type="hidden" name="daemon_id" value={@new_agent_daemon} />
-          <div class="rounded-md border border-[var(--line)] bg-[var(--panel-2)] px-3 py-2 font-mono text-[11px]">
-            <div class="oa-label mb-0.5">Daemon</div>
-            <div class="truncate text-[var(--dim)]">
-              {sel_daemon && daemon_label(sel_daemon)}
-              <span class="text-[var(--faint)]">· {sel_daemon && sel_daemon.metadata["cwd"]}</span>
-            </div>
+        <input type="hidden" name="workspace" value={@new_agent_workspace} />
+        <div class="rounded-md border border-[var(--line)] bg-[var(--panel-2)] px-3 py-2 font-mono text-[11px]">
+          <div class="oa-label mb-0.5">Workspace</div>
+          <div class="truncate text-[var(--dim)]" title={sel_ws && sel_ws["path"]}>
+            {sel_ws && sel_ws["path"]}
+            <%= if sel_ws do %>
+              <span class="text-[var(--faint)]">· {sel_ws["kind"]}</span>
+            <% end %>
           </div>
-          <input type="hidden" name="workspace" value={@new_agent_workspace} />
-          <div class="rounded-md border border-[var(--line)] bg-[var(--panel-2)] px-3 py-2 font-mono text-[11px]">
-            <div class="oa-label mb-0.5">Workspace</div>
-            <div class="truncate text-[var(--dim)]" title={sel_ws && sel_ws["path"]}>
-              {sel_ws && sel_ws["path"]}
-              <%= if sel_ws do %>
-                <span class="text-[var(--faint)]">· {sel_ws["kind"]}</span>
-              <% end %>
-            </div>
-          </div>
+        </div>
 
-          <%= if git do %>
-            <fieldset class="space-y-2">
-              <span class="oa-label">Worktree</span>
-              <label class="flex items-center gap-2 font-mono text-[12px]">
+        <%= if git do %>
+          <fieldset class="space-y-2">
+            <span class="oa-label">Worktree</span>
+            <label class="flex items-center gap-2 font-mono text-[12px]">
+              <input
+                type="radio"
+                name="worktree_mode"
+                value="in_place"
+                checked={@new_agent_mode not in ["existing", "create"]}
+              />
+              <span>
+                In place
+                <%= if git["current_branch"] do %>
+                  <span class="text-[var(--faint)]">(on {git["current_branch"]})</span>
+                <% end %>
+              </span>
+            </label>
+            <label class="flex items-center gap-2 font-mono text-[12px]">
+              <input
+                type="radio"
+                name="worktree_mode"
+                value="create"
+                checked={@new_agent_mode == "create"}
+              />
+              <span>New isolated worktree</span>
+            </label>
+            <%= if @new_agent_mode == "create" do %>
+              <div class="ml-6 space-y-2">
                 <input
-                  type="radio"
-                  name="worktree_mode"
-                  value="in_place"
-                  checked={@new_agent_mode not in ["existing", "create"]}
+                  name="branch"
+                  class="oa-input w-full"
+                  placeholder="new branch name (blank = auto)"
                 />
-                <span>
-                  In place
-                  <%= if git["current_branch"] do %>
-                    <span class="text-[var(--faint)]">(on {git["current_branch"]})</span>
+                <select name="base_branch" class="oa-input w-full">
+                  <option value="">base: {git["current_branch"] || "current HEAD"}</option>
+                  <%= for b <- git["branches"] || [] do %>
+                    <option value={b}>base: {b}</option>
                   <% end %>
-                </span>
-              </label>
+                </select>
+              </div>
+            <% end %>
+            <%= if (git["worktrees"] || []) != [] do %>
               <label class="flex items-center gap-2 font-mono text-[12px]">
                 <input
                   type="radio"
                   name="worktree_mode"
-                  value="create"
-                  checked={@new_agent_mode == "create"}
+                  value="existing"
+                  checked={@new_agent_mode == "existing"}
                 />
-                <span>New isolated worktree</span>
+                <span>Use existing worktree</span>
               </label>
-              <%= if @new_agent_mode == "create" do %>
-                <div class="ml-6 space-y-2">
-                  <input
-                    name="branch"
-                    class="oa-input w-full"
-                    placeholder="new branch name (blank = auto)"
-                  />
-                  <select name="base_branch" class="oa-input w-full">
-                    <option value="">base: {git["current_branch"] || "current HEAD"}</option>
-                    <%= for b <- git["branches"] || [] do %>
-                      <option value={b}>base: {b}</option>
+              <%= if @new_agent_mode == "existing" do %>
+                <div class="ml-6">
+                  <select name="worktree" class="oa-input w-full">
+                    <%= for wt <- git["worktrees"] || [] do %>
+                      <option value={wt["path"]}>
+                        {wt["path"]}
+                        <%= if wt["branch"] do %>
+                          · {wt["branch"]}
+                        <% end %>
+                      </option>
                     <% end %>
                   </select>
                 </div>
               <% end %>
-              <%= if (git["worktrees"] || []) != [] do %>
-                <label class="flex items-center gap-2 font-mono text-[12px]">
-                  <input
-                    type="radio"
-                    name="worktree_mode"
-                    value="existing"
-                    checked={@new_agent_mode == "existing"}
-                  />
-                  <span>Use existing worktree</span>
-                </label>
-                <%= if @new_agent_mode == "existing" do %>
-                  <div class="ml-6">
-                    <select name="worktree" class="oa-input w-full">
-                      <%= for wt <- git["worktrees"] || [] do %>
-                        <option value={wt["path"]}>
-                          {wt["path"]}
-                          <%= if wt["branch"] do %>
-                            · {wt["branch"]}
-                          <% end %>
-                        </option>
-                      <% end %>
-                    </select>
-                  </div>
-                <% end %>
-              <% end %>
-            </fieldset>
-          <% end %>
+            <% end %>
+          </fieldset>
+        <% end %>
 
-          <label class="block">
-            <span class="oa-label mb-1">Agent</span>
-            <select name="agent" class="oa-input w-full">
-              <option value="claude">claude</option>
-              <option value="codex">codex (terminal)</option>
-              <option value="codex-app-server">codex (app-server · native)</option>
-              <option value="gemini">gemini</option>
-            </select>
-          </label>
+        <label class="block">
+          <span class="oa-label mb-1">Agent</span>
+          <select name="agent" class="oa-input w-full">
+            <option value="claude">claude</option>
+            <option value="codex">codex (terminal)</option>
+            <option value="codex-app-server">codex (app-server · native)</option>
+            <option value="gemini">gemini</option>
+          </select>
+        </label>
 
-          <label class="block">
-            <span class="oa-label mb-1">Extra args (optional)</span>
-            <input
-              name="custom_command"
-              class="oa-input w-full"
-              placeholder="appended to the agent command, e.g. --model gpt-5"
-            />
-          </label>
-          <label class="block">
-            <span class="oa-label mb-1">Name (optional)</span>
-            <input name="name" class="oa-input w-full" placeholder="my session" />
-          </label>
-          <label class="block">
-            <span class="oa-label mb-1">Model (optional)</span>
-            <input
-              name="model"
-              class="oa-input w-full"
-              placeholder="defaults to the agent's model"
-            />
-          </label>
-          <div class="flex justify-end gap-2 pt-2">
-            <button type="button" phx-click="close_new_agent" class="oa-btn">Cancel</button>
-            <button type="submit" class="oa-btn primary">Start agent</button>
-          </div>
-        </form>
-      <% end %>
-    </div>
-  </div>
+        <.agent_meta_fields extra_placeholder="appended to the agent command, e.g. --model gpt-5" />
+        <div class="flex justify-end gap-2 pt-2">
+          <button type="button" phx-click="close_modal" class="oa-btn">Cancel</button>
+          <button type="submit" class="oa-btn primary">Start agent</button>
+        </div>
+      </form>
+    <% end %>
+  </.modal>
 <% end %>
 
 <%!-- ── New-workspace modal ──────────────────────────────────────────── --%>
-<%= if @show_new_workspace do %>
-  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-    <div class="oa-panel w-full max-w-md p-5" phx-click-away="close_new_workspace">
-      <h2 class="oa-display mb-4 text-lg font-bold">New workspace</h2>
-      <%= if @daemons == [] do %>
-        <p class="font-mono text-sm text-[var(--dim)]">
-          No daemon is connected. Start one with <code class="text-[var(--accent)]">omniagent daemon</code>, then try again.
-        </p>
-        <div class="mt-4 flex justify-end">
-          <button type="button" phx-click="close_new_workspace" class="oa-btn">Close</button>
+<%= if @modal == :new_workspace do %>
+  <.modal>
+    <h2 class="oa-display mb-4 text-lg font-bold">New workspace</h2>
+    <%= if @daemons == [] do %>
+      <p class="font-mono text-sm text-[var(--dim)]">
+        No daemon is connected. Start one with <code class="text-[var(--accent)]">omniagent daemon</code>, then try again.
+      </p>
+      <div class="mt-4 flex justify-end">
+        <button type="button" phx-click="close_modal" class="oa-btn">Close</button>
+      </div>
+    <% else %>
+      <% ws_daemon = daemon_by_id(@daemons, @new_workspace_daemon) || List.first(@daemons) %>
+      <form phx-submit="create_workspace" class="space-y-3">
+        <input type="hidden" name="daemon_id" value={ws_daemon && ws_daemon.id} />
+        <div class="rounded-md border border-[var(--line)] bg-[var(--panel-2)] px-3 py-2 font-mono text-[11px]">
+          <div class="oa-label mb-0.5">Daemon</div>
+          <div class="truncate text-[var(--dim)]">
+            {ws_daemon && daemon_label(ws_daemon)}
+            <span class="text-[var(--faint)]">· {ws_daemon && ws_daemon.metadata["cwd"]}</span>
+          </div>
         </div>
-      <% else %>
-        <% ws_daemon = daemon_by_id(@daemons, @new_workspace_daemon) || List.first(@daemons) %>
-        <form phx-submit="create_workspace" class="space-y-3">
-          <input type="hidden" name="daemon_id" value={ws_daemon && ws_daemon.id} />
-          <div class="rounded-md border border-[var(--line)] bg-[var(--panel-2)] px-3 py-2 font-mono text-[11px]">
-            <div class="oa-label mb-0.5">Daemon</div>
-            <div class="truncate text-[var(--dim)]">
-              {ws_daemon && daemon_label(ws_daemon)}
-              <span class="text-[var(--faint)]">· {ws_daemon && ws_daemon.metadata["cwd"]}</span>
-            </div>
-          </div>
-          <label class="block">
-            <span class="oa-label mb-1">Workspace name</span>
-            <input
-              name="name"
-              class="oa-input w-full"
-              placeholder="my-project"
-              autocomplete="off"
-              required
-            />
-            <span class="mt-1 block font-mono text-[11px] text-[var(--faint)]">
-              Created as a git repo under the daemon's local data dir and added to its allowed workspaces.
-            </span>
-          </label>
-          <div class="flex justify-end gap-2 pt-2">
-            <button type="button" phx-click="close_new_workspace" class="oa-btn">Cancel</button>
-            <button type="submit" class="oa-btn primary">Create workspace</button>
-          </div>
-        </form>
-      <% end %>
-    </div>
-  </div>
-<% end %>
-
-<%= if @show_new_oad_workspace do %>
-  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-    <div class="oa-panel w-full max-w-md p-5" phx-click-away="close_new_oad_workspace">
-      <h2 class="oa-display mb-4 text-lg font-bold">New oad workspace</h2>
-      <form phx-submit="create_oad_workspace" class="space-y-3">
         <label class="block">
-          <span class="oa-label mb-1">Name</span>
+          <span class="oa-label mb-1">Workspace name</span>
           <input
             name="name"
             class="oa-input w-full"
@@ -879,157 +329,156 @@
             autocomplete="off"
             required
           />
-        </label>
-        <label class="block">
-          <span class="oa-label mb-1">Image</span>
-          <input
-            name="image"
-            class="oa-input w-full"
-            placeholder="ghcr.io/org/devcontainer:latest"
-            autocomplete="off"
-            required
-          />
-        </label>
-        <label class="block">
-          <span class="oa-label mb-1">Repository (optional)</span>
-          <input
-            name="repo"
-            class="oa-input w-full"
-            placeholder="https://github.com/org/repo.git"
-            autocomplete="off"
-          />
-        </label>
-        <label class="block">
-          <span class="oa-label mb-1">Ref (optional)</span>
-          <input name="git_ref" class="oa-input w-full" placeholder="main" autocomplete="off" />
           <span class="mt-1 block font-mono text-[11px] text-[var(--faint)]">
-            Built on a registered oad instance and snapshotted; sessions fork from the snapshot.
+            Created as a git repo under the daemon's local data dir and added to its allowed workspaces.
           </span>
         </label>
         <div class="flex justify-end gap-2 pt-2">
-          <button type="button" phx-click="close_new_oad_workspace" class="oa-btn">Cancel</button>
-          <button type="submit" class="oa-btn primary">Build workspace</button>
+          <button type="button" phx-click="close_modal" class="oa-btn">Cancel</button>
+          <button type="submit" class="oa-btn primary">Create workspace</button>
         </div>
       </form>
-    </div>
-  </div>
+    <% end %>
+  </.modal>
+<% end %>
+
+<%= if @modal == :new_oad_workspace do %>
+  <.modal>
+    <h2 class="oa-display mb-4 text-lg font-bold">New oad workspace</h2>
+    <form phx-submit="create_oad_workspace" class="space-y-3">
+      <label class="block">
+        <span class="oa-label mb-1">Name</span>
+        <input
+          name="name"
+          class="oa-input w-full"
+          placeholder="my-project"
+          autocomplete="off"
+          required
+        />
+      </label>
+      <label class="block">
+        <span class="oa-label mb-1">Image</span>
+        <input
+          name="image"
+          class="oa-input w-full"
+          placeholder="ghcr.io/org/devcontainer:latest"
+          autocomplete="off"
+          required
+        />
+      </label>
+      <label class="block">
+        <span class="oa-label mb-1">Repository (optional)</span>
+        <input
+          name="repo"
+          class="oa-input w-full"
+          placeholder="https://github.com/org/repo.git"
+          autocomplete="off"
+        />
+      </label>
+      <label class="block">
+        <span class="oa-label mb-1">Ref (optional)</span>
+        <input name="git_ref" class="oa-input w-full" placeholder="main" autocomplete="off" />
+        <span class="mt-1 block font-mono text-[11px] text-[var(--faint)]">
+          Built on a registered oad instance and snapshotted; sessions fork from the snapshot.
+        </span>
+      </label>
+      <div class="flex justify-end gap-2 pt-2">
+        <button type="button" phx-click="close_modal" class="oa-btn">Cancel</button>
+        <button type="submit" class="oa-btn primary">Build workspace</button>
+      </div>
+    </form>
+  </.modal>
 <% end %>
 
 <%!-- ── oad build progress ───────────────────────────────────────────── --%>
-<%= if @show_oad_build do %>
-  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-    <div
-      class="oa-panel flex max-h-[80vh] w-full max-w-lg flex-col p-5"
-      phx-click-away="close_oad_build"
-    >
-      <div class="mb-3 flex items-center gap-2">
-        <%= cond do %>
-          <% @oad_build_status == "ready" -> %>
-            <.icon name="hero-check-circle" class="size-5 flex-none text-[var(--prov-green)]" />
-          <% @oad_build_status == "error" -> %>
-            <.icon name="hero-x-circle" class="size-5 flex-none text-[var(--prov-red)]" />
-          <% true -> %>
-            <.icon
-              name="hero-arrow-path"
-              class="size-5 flex-none animate-spin text-[var(--accent)]"
-            />
-        <% end %>
-        <h2 class="oa-display flex-1 truncate text-lg font-bold">
-          Building {@oad_build_name}
-        </h2>
-        <span class="flex-none font-mono text-[11px] uppercase tracking-wide text-[var(--faint)]">
-          {@oad_build_status}
-        </span>
-      </div>
-
-      <%!-- flex-col-reverse + newest-first log keeps the view pinned to the
-            latest line without a scroll hook. --%>
-      <div class="flex min-h-0 flex-1 flex-col-reverse overflow-y-auto rounded bg-[var(--panel-2)] px-3 py-2 font-mono text-[12px] leading-relaxed text-[var(--dim)]">
-        <%= for line <- @oad_build_log do %>
-          <div class="whitespace-pre-wrap break-words">{line}</div>
-        <% end %>
-      </div>
-
-      <%= if @oad_build_status == "error" do %>
-        <p class="mt-3 font-mono text-[11px] text-[var(--prov-red)]">
-          Build failed — see the log above.
-        </p>
+<%= if @modal == :oad_build do %>
+  <.modal panel_class="flex max-h-[80vh] w-full max-w-lg flex-col p-5">
+    <div class="mb-3 flex items-center gap-2">
+      <%= cond do %>
+        <% @oad_build_status == "ready" -> %>
+          <.icon name="hero-check-circle" class="size-5 flex-none text-[var(--prov-green)]" />
+        <% @oad_build_status == "error" -> %>
+          <.icon name="hero-x-circle" class="size-5 flex-none text-[var(--prov-red)]" />
+        <% true -> %>
+          <.icon
+            name="hero-arrow-path"
+            class="size-5 flex-none animate-spin text-[var(--accent)]"
+          />
       <% end %>
-
-      <div class="mt-4 flex justify-end gap-2">
-        <button type="button" phx-click="close_oad_build" class="oa-btn">
-          {if @oad_build_status == "building", do: "Hide", else: "Close"}
-        </button>
-      </div>
+      <h2 class="oa-display flex-1 truncate text-lg font-bold">
+        Building {@oad_build_name}
+      </h2>
+      <span class="flex-none font-mono text-[11px] uppercase tracking-wide text-[var(--faint)]">
+        {@oad_build_status}
+      </span>
     </div>
-  </div>
+
+    <%!-- flex-col-reverse + newest-first log keeps the view pinned to the
+          latest line without a scroll hook. --%>
+    <div class="flex min-h-0 flex-1 flex-col-reverse overflow-y-auto rounded bg-[var(--panel-2)] px-3 py-2 font-mono text-[12px] leading-relaxed text-[var(--dim)]">
+      <%= for line <- @oad_build_log do %>
+        <div class="whitespace-pre-wrap break-words">{line}</div>
+      <% end %>
+    </div>
+
+    <%= if @oad_build_status == "error" do %>
+      <p class="mt-3 font-mono text-[11px] text-[var(--prov-red)]">
+        Build failed — see the log above.
+      </p>
+    <% end %>
+
+    <div class="mt-4 flex justify-end gap-2">
+      <button type="button" phx-click="close_modal" class="oa-btn">
+        {if @oad_build_status == "building", do: "Hide", else: "Close"}
+      </button>
+    </div>
+  </.modal>
 <% end %>
 
 <%!-- ── oad agent picker ─────────────────────────────────────────────── --%>
-<%= if @show_oad_agent do %>
-  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-    <div class="oa-panel w-full max-w-md p-5" phx-click-away="close_oad_agent">
-      <h2 class="oa-display mb-4 text-lg font-bold">
-        Run agent on {@oad_agent_workspace}
-      </h2>
-      <form phx-submit="start_oad_session" class="space-y-3">
-        <input type="hidden" name="workspace" value={@oad_agent_workspace} />
-        <label class="block">
-          <span class="oa-label mb-1">Agent</span>
-          <select name="agent" class="oa-input w-full">
-            <option value="claude">claude</option>
-            <option value="codex">codex</option>
-            <option value="gemini">gemini</option>
-          </select>
-        </label>
-        <label class="block">
-          <span class="oa-label mb-1">Name (optional)</span>
-          <input name="name" class="oa-input w-full" placeholder="my session" autocomplete="off" />
-        </label>
-        <label class="block">
-          <span class="oa-label mb-1">Model (optional)</span>
-          <input
-            name="model"
-            class="oa-input w-full"
-            placeholder="defaults to the agent's model"
-            autocomplete="off"
-          />
-        </label>
-        <label class="block">
-          <span class="oa-label mb-1">Extra args (optional)</span>
-          <input
-            name="custom_command"
-            class="oa-input w-full"
-            placeholder="appended to the agent command"
-            autocomplete="off"
-          />
-        </label>
-        <div class="flex justify-end gap-2 pt-2">
-          <button type="button" phx-click="close_oad_agent" class="oa-btn">Cancel</button>
-          <button type="submit" class="oa-btn primary">Start agent</button>
-        </div>
-      </form>
-    </div>
-  </div>
+<%= if @modal == :oad_agent do %>
+  <.modal>
+    <h2 class="oa-display mb-4 text-lg font-bold">
+      Run agent on {@oad_agent_workspace}
+    </h2>
+    <form phx-submit="start_oad_session" class="space-y-3">
+      <input type="hidden" name="workspace" value={@oad_agent_workspace} />
+      <label class="block">
+        <span class="oa-label mb-1">Agent</span>
+        <select name="agent" class="oa-input w-full">
+          <option value="claude">claude</option>
+          <option value="codex">codex</option>
+          <option value="gemini">gemini</option>
+        </select>
+      </label>
+      <.agent_meta_fields />
+      <div class="flex justify-end gap-2 pt-2">
+        <button type="button" phx-click="close_modal" class="oa-btn">Cancel</button>
+        <button type="submit" class="oa-btn primary">Start agent</button>
+      </div>
+    </form>
+  </.modal>
 <% end %>
 
 <%!-- ── Recording player ─────────────────────────────────────────────── --%>
 <%= if @playing_artifact do %>
-  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-    <div class="oa-panel w-full max-w-4xl p-4" phx-click-away="close_recording">
-      <div class="mb-3 flex items-center justify-between">
-        <h2 class="oa-display text-lg font-bold">Terminal recording</h2>
-        <button type="button" phx-click="close_recording" class="oa-btn text-xs">Close</button>
-      </div>
-      <div
-        id={"recording-#{@playing_artifact.id}"}
-        phx-hook="Recording"
-        phx-update="ignore"
-        data-src={~p"/sessions/#{@session.id}/artifacts/#{@playing_artifact.id}/download"}
-      >
-      </div>
+  <.modal
+    on_close="close_recording"
+    overlay_class="bg-black/70"
+    panel_class="w-full max-w-4xl p-4"
+  >
+    <div class="mb-3 flex items-center justify-between">
+      <h2 class="oa-display text-lg font-bold">Terminal recording</h2>
+      <button type="button" phx-click="close_recording" class="oa-btn text-xs">Close</button>
     </div>
-  </div>
+    <div
+      id={"recording-#{@playing_artifact.id}"}
+      phx-hook="Recording"
+      phx-update="ignore"
+      data-src={~p"/sessions/#{@session.id}/artifacts/#{@playing_artifact.id}/download"}
+    >
+    </div>
+  </.modal>
 <% end %>
 
 <Layouts.flash_group flash={@flash} />

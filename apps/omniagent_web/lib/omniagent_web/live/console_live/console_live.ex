@@ -23,6 +23,16 @@ defmodule OmniagentWeb.ConsoleLive do
 
   alias Omniagent.Oad
 
+  # Codex app-server conversation events relayed verbatim to the Codex hook.
+  @codex_events ~w(codex_item codex_delta codex_turn codex_token_usage codex_error)a
+
+  # Cosmetic UI prefs persisted client-side by the Prefs hook. These specs drive
+  # both save_prefs (push current values) and prefs_restore (clamp/validate
+  # incoming values); `right_tab` is handled separately as it needs validation
+  # against the known tabs plus a lazy data load.
+  @bool_prefs ~w(sidebar_collapsed right_collapsed sessions_collapsed)a
+  @num_prefs %{left_w: {180, 520}, right_w: {240, 600}, term_pct: {20, 85}}
+
   @impl true
   def mount(_params, _session, socket) do
     user = Accounts.default_user()
@@ -37,41 +47,49 @@ defmodule OmniagentWeb.ConsoleLive do
 
     {:ok,
      socket
-     |> assign(:current_user, user)
-     |> assign(:sessions, list_sessions(user))
-     |> assign(:daemons, Daemons.list())
-     |> assign(:oad_instances, OadInstances.list_live())
-     |> assign(:oad_workspaces, OadWorkspaces.list())
-     |> assign(:oad_build_log, [])
-     |> assign(:show_oad_build, false)
-     |> assign(:oad_build_name, nil)
-     |> assign(:oad_build_status, nil)
-     |> assign(:show_oad_agent, false)
-     |> assign(:oad_agent_workspace, nil)
-     |> assign(:term_size, nil)
-     |> assign(:show_new_oad_workspace, false)
-     |> assign(:session, nil)
-     |> assign(:subscribed_id, nil)
-     |> assign(:reviews, [])
-     |> assign(:artifacts, [])
-     |> assign(:playing_artifact, nil)
-     |> assign(:auto_approve, true)
-     |> assign(:right_tab, "files")
+     |> assign(%{
+       current_user: user,
+       sessions: list_sessions(user),
+       daemons: Daemons.list(),
+       oad_instances: OadInstances.list_live(),
+       oad_workspaces: OadWorkspaces.list(),
+       term_size: nil,
+       page_title: "Console"
+     })
+     # Selected-session state (also reset by select_session/deselect_session).
+     |> assign(%{
+       session: nil,
+       subscribed_id: nil,
+       reviews: [],
+       artifacts: [],
+       playing_artifact: nil,
+       auto_approve: true,
+       right_tab: "files",
+       pending_focus: false
+     })
      |> reset_changes()
-     |> assign(:show_new_agent, false)
-     |> assign(:new_agent_daemon, nil)
-     |> assign(:new_agent_workspace, nil)
-     |> assign(:new_agent_mode, "in_place")
-     |> assign(:show_new_workspace, false)
-     |> assign(:new_workspace_daemon, nil)
-     |> assign(:sessions_collapsed, true)
-     |> assign(:sidebar_collapsed, false)
-     |> assign(:right_collapsed, false)
-     |> assign(:left_w, 312)
-     |> assign(:right_w, 384)
-     |> assign(:term_pct, 62)
-     |> assign(:pending_focus, false)
-     |> assign(:page_title, "Console")}
+     # Modal state: `:modal` names the open dialog (nil = none); the rest is the
+     # data each dialog reads. Build progress lives here too, updated while open.
+     |> assign(%{
+       modal: nil,
+       new_agent_daemon: nil,
+       new_agent_workspace: nil,
+       new_agent_mode: "in_place",
+       new_workspace_daemon: nil,
+       oad_agent_workspace: nil,
+       oad_build_name: nil,
+       oad_build_status: nil,
+       oad_build_log: []
+     })
+     # Cosmetic UI prefs (later hydrated from the browser by the Prefs hook).
+     |> assign(%{
+       sessions_collapsed: true,
+       sidebar_collapsed: false,
+       right_collapsed: false,
+       left_w: 312,
+       right_w: 384,
+       term_pct: 62
+     })}
   end
 
   @impl true
@@ -156,12 +174,8 @@ defmodule OmniagentWeb.ConsoleLive do
   def handle_event("prefs_restore", prefs, socket) when is_map(prefs) do
     socket =
       socket
-      |> assign_bool_pref(:sidebar_collapsed, prefs["sidebar_collapsed"])
-      |> assign_bool_pref(:right_collapsed, prefs["right_collapsed"])
-      |> assign_bool_pref(:sessions_collapsed, prefs["sessions_collapsed"])
-      |> assign_num_pref(:left_w, prefs["left_w"], 180, 520)
-      |> assign_num_pref(:right_w, prefs["right_w"], 240, 600)
-      |> assign_num_pref(:term_pct, prefs["term_pct"], 20, 85)
+      |> restore_bool_prefs(prefs)
+      |> restore_num_prefs(prefs)
       |> restore_tab(prefs["right_tab"])
 
     {:noreply, socket}
@@ -250,14 +264,16 @@ defmodule OmniagentWeb.ConsoleLive do
     {:noreply,
      socket
      |> assign(:daemons, Daemons.list())
-     |> assign(:show_new_agent, true)
+     |> assign(:modal, :new_agent)
      |> assign(:new_agent_daemon, daemon_id)
      |> assign(:new_agent_workspace, path)
      |> assign(:new_agent_mode, "in_place")}
   end
 
-  def handle_event("close_new_agent", _params, socket) do
-    {:noreply, assign(socket, :show_new_agent, false)}
+  # Closes whichever simple show/hide modal is open. The diff and recording
+  # modals are data-driven (close_diff / close_recording clear their data).
+  def handle_event("close_modal", _params, socket) do
+    {:noreply, assign(socket, :modal, nil)}
   end
 
   # Keeps the modal's worktree sub-pickers in sync as the user changes the
@@ -297,7 +313,7 @@ defmodule OmniagentWeb.ConsoleLive do
           :ok ->
             {:noreply,
              socket
-             |> assign(:show_new_agent, false)
+             |> assign(:modal, nil)
              |> assign(:pending_focus, true)
              |> put_flash(:info, "Starting #{Enum.join([agent | extra], " ")}…")}
 
@@ -311,33 +327,19 @@ defmodule OmniagentWeb.ConsoleLive do
 
   def handle_event("open_new_workspace", params, socket) do
     daemons = Daemons.list()
-    daemon_id = params["daemon_id"] || (List.first(daemons) || %{}) |> Map.get(:id)
+    daemon_id = params["daemon_id"] || first_daemon_id(daemons)
 
     {:noreply,
      socket
      |> assign(:daemons, daemons)
-     |> assign(:show_new_workspace, true)
+     |> assign(:modal, :new_workspace)
      |> assign(:new_workspace_daemon, daemon_id)}
-  end
-
-  def handle_event("close_new_workspace", _params, socket) do
-    {:noreply, assign(socket, :show_new_workspace, false)}
   end
 
   # ── oad workspaces ──────────────────────────────────────────────────────────
 
   def handle_event("open_new_oad_workspace", _params, socket) do
-    {:noreply, assign(socket, :show_new_oad_workspace, true)}
-  end
-
-  def handle_event("close_new_oad_workspace", _params, socket) do
-    {:noreply, assign(socket, :show_new_oad_workspace, false)}
-  end
-
-  # Dismisses the build-progress modal. The build keeps running in the
-  # background (it's a supervised task); progress still updates the log.
-  def handle_event("close_oad_build", _params, socket) do
-    {:noreply, assign(socket, :show_oad_build, false)}
+    {:noreply, assign(socket, :modal, :new_oad_workspace)}
   end
 
   def handle_event("create_oad_workspace", params, socket) do
@@ -356,20 +358,18 @@ defmodule OmniagentWeb.ConsoleLive do
          put_flash(socket, :error, "Name may contain only letters, digits, '.', '_', or '-'.")}
 
       true ->
-        if connected?(socket), do: Phoenix.PubSub.subscribe(Omniagent.PubSub, "oad_build:#{name}")
-
-        Oad.Builder.build_async(%{
-          name: name,
-          image: image,
-          repo: blank_to_nil(params["repo"]),
-          git_ref: blank_to_nil(params["git_ref"])
-        })
-
         {:noreply,
-         socket
-         |> assign(:show_new_oad_workspace, false)
-         |> open_build_modal(name, ["building #{name}…"])
-         |> put_flash(:info, "Building oad workspace #{name}…")}
+         start_build(
+           socket,
+           %{
+             name: name,
+             image: image,
+             repo: blank_to_nil(params["repo"]),
+             git_ref: blank_to_nil(params["git_ref"])
+           },
+           "building #{name}…",
+           "Building oad workspace #{name}…"
+         )}
     end
   end
 
@@ -379,21 +379,20 @@ defmodule OmniagentWeb.ConsoleLive do
         {:noreply, put_flash(socket, :error, "Workspace not found.")}
 
       ws ->
-        if connected?(socket), do: Phoenix.PubSub.subscribe(Omniagent.PubSub, "oad_build:#{name}")
-
-        Oad.Builder.build_async(%{
-          name: ws.name,
-          image: ws.image,
-          repo: ws.repo,
-          git_ref: ws.git_ref,
-          workspace_folder: ws.workspace_folder,
-          oad_base_url: ws.oad_base_url
-        })
-
         {:noreply,
-         socket
-         |> open_build_modal(name, ["rebuilding #{name}…"])
-         |> put_flash(:info, "Rebuilding #{name}…")}
+         start_build(
+           socket,
+           %{
+             name: ws.name,
+             image: ws.image,
+             repo: ws.repo,
+             git_ref: ws.git_ref,
+             workspace_folder: ws.workspace_folder,
+             oad_base_url: ws.oad_base_url
+           },
+           "rebuilding #{name}…",
+           "Rebuilding #{name}…"
+         )}
     end
   end
 
@@ -401,12 +400,8 @@ defmodule OmniagentWeb.ConsoleLive do
   def handle_event("open_oad_agent", %{"workspace" => name}, socket) do
     {:noreply,
      socket
-     |> assign(:show_oad_agent, true)
+     |> assign(:modal, :oad_agent)
      |> assign(:oad_agent_workspace, name)}
-  end
-
-  def handle_event("close_oad_agent", _params, socket) do
-    {:noreply, assign(socket, :show_oad_agent, false)}
   end
 
   def handle_event("start_oad_session", params, socket) do
@@ -424,7 +419,7 @@ defmodule OmniagentWeb.ConsoleLive do
       {:ok, _session} ->
         {:noreply,
          socket
-         |> assign(:show_oad_agent, false)
+         |> assign(:modal, nil)
          |> assign(:pending_focus, true)
          |> put_flash(:info, "Starting #{agent} on #{name}…")}
 
@@ -451,7 +446,7 @@ defmodule OmniagentWeb.ConsoleLive do
           :ok ->
             {:noreply,
              socket
-             |> assign(:show_new_workspace, false)
+             |> assign(:modal, nil)
              |> put_flash(:info, "Creating workspace #{name}…")}
 
           {:error, :offline} ->
@@ -477,24 +472,8 @@ defmodule OmniagentWeb.ConsoleLive do
 
   # Codex app-server conversation events → the Codex hook, which owns the
   # conversation DOM (mirrors how the Terminal/Traces hooks consume push_event).
-  def handle_info({:codex_item, payload}, socket) do
-    {:noreply, push_event(socket, "codex_item", payload)}
-  end
-
-  def handle_info({:codex_delta, payload}, socket) do
-    {:noreply, push_event(socket, "codex_delta", payload)}
-  end
-
-  def handle_info({:codex_turn, payload}, socket) do
-    {:noreply, push_event(socket, "codex_turn", payload)}
-  end
-
-  def handle_info({:codex_token_usage, payload}, socket) do
-    {:noreply, push_event(socket, "codex_token_usage", payload)}
-  end
-
-  def handle_info({:codex_error, payload}, socket) do
-    {:noreply, push_event(socket, "codex_error", payload)}
+  def handle_info({type, payload}, socket) when type in @codex_events do
+    {:noreply, push_event(socket, Atom.to_string(type), payload)}
   end
 
   def handle_info({:review_item, item}, socket) do
@@ -791,15 +770,20 @@ defmodule OmniagentWeb.ConsoleLive do
   # ── UI preferences (persisted client-side by the Prefs hook) ─────────────────
 
   defp save_prefs(socket) do
-    push_event(socket, "prefs_save", %{
-      sidebar_collapsed: socket.assigns.sidebar_collapsed,
-      right_collapsed: socket.assigns.right_collapsed,
-      right_tab: socket.assigns.right_tab,
-      left_w: socket.assigns.left_w,
-      right_w: socket.assigns.right_w,
-      term_pct: socket.assigns.term_pct,
-      sessions_collapsed: socket.assigns.sessions_collapsed
-    })
+    keys = [:right_tab | @bool_prefs ++ Map.keys(@num_prefs)]
+    push_event(socket, "prefs_save", Map.new(keys, &{&1, socket.assigns[&1]}))
+  end
+
+  defp restore_bool_prefs(socket, prefs) do
+    Enum.reduce(@bool_prefs, socket, fn key, acc ->
+      assign_bool_pref(acc, key, prefs[Atom.to_string(key)])
+    end)
+  end
+
+  defp restore_num_prefs(socket, prefs) do
+    Enum.reduce(@num_prefs, socket, fn {key, {min, max}}, acc ->
+      assign_num_pref(acc, key, prefs[Atom.to_string(key)], min, max)
+    end)
   end
 
   defp assign_bool_pref(socket, key, value) when is_boolean(value), do: assign(socket, key, value)
@@ -853,11 +837,23 @@ defmodule OmniagentWeb.ConsoleLive do
     end
   end
 
+  # Subscribes to a build's progress topic, kicks off the async build, and opens
+  # the progress modal seeded with `log_line`. Shared by create + rebuild.
+  defp start_build(socket, attrs, log_line, flash) do
+    name = attrs.name
+    if connected?(socket), do: Phoenix.PubSub.subscribe(Omniagent.PubSub, "oad_build:#{name}")
+    Oad.Builder.build_async(attrs)
+
+    socket
+    |> open_build_modal(name, [log_line])
+    |> put_flash(:info, flash)
+  end
+
   # Opens the build-progress modal for `name`, seeding its log and resetting it
   # to the building state.
   defp open_build_modal(socket, name, log) do
     socket
-    |> assign(:show_oad_build, true)
+    |> assign(:modal, :oad_build)
     |> assign(:oad_build_name, name)
     |> assign(:oad_build_status, "building")
     |> assign(:oad_build_log, log)
@@ -934,6 +930,9 @@ defmodule OmniagentWeb.ConsoleLive do
   @doc false
   def daemon_by_id(_daemons, nil), do: nil
   def daemon_by_id(daemons, id), do: Enum.find(daemons, &(&1.id == id))
+
+  defp first_daemon_id([daemon | _]), do: daemon.id
+  defp first_daemon_id(_), do: nil
 
   # "hostname:pid" label for a daemon (just the hostname when no pid advertised).
   @doc false
@@ -1054,6 +1053,617 @@ defmodule OmniagentWeb.ConsoleLive do
         </div>
       <% end %>
     </.link>
+    """
+  end
+
+  # A centered overlay dialog. `on_close` is the click-away/escape target;
+  # `panel_class`/`overlay_class` tune size + backdrop per modal.
+  attr :on_close, :string, default: "close_modal"
+  attr :panel_class, :string, default: "w-full max-w-md p-5"
+  attr :overlay_class, :string, default: "bg-black/60"
+  slot :inner_block, required: true
+
+  def modal(assigns) do
+    ~H"""
+    <div class={["fixed inset-0 z-50 flex items-center justify-center p-4", @overlay_class]}>
+      <div class={["oa-panel", @panel_class]} phx-click-away={@on_close}>
+        {render_slot(@inner_block)}
+      </div>
+    </div>
+    """
+  end
+
+  # The Name / Model / Extra-args trio shared by the new-agent and oad-agent
+  # forms. The agent dropdown differs between them, so it stays inline.
+  attr :extra_placeholder, :string, default: "appended to the agent command"
+
+  def agent_meta_fields(assigns) do
+    ~H"""
+    <label class="block">
+      <span class="oa-label mb-1">Name (optional)</span>
+      <input name="name" class="oa-input w-full" placeholder="my session" autocomplete="off" />
+    </label>
+    <label class="block">
+      <span class="oa-label mb-1">Model (optional)</span>
+      <input
+        name="model"
+        class="oa-input w-full"
+        placeholder="defaults to the agent's model"
+        autocomplete="off"
+      />
+    </label>
+    <label class="block">
+      <span class="oa-label mb-1">Extra args (optional)</span>
+      <input
+        name="custom_command"
+        class="oa-input w-full"
+        placeholder={@extra_placeholder}
+        autocomplete="off"
+      />
+    </label>
+    """
+  end
+
+  attr :changes, :list, required: true
+  attr :changes_error, :any, default: nil
+  attr :changes_loading, :boolean, default: false
+
+  def files_tab(assigns) do
+    ~H"""
+    <%!-- Header: Changes label, count, refresh --%>
+    <div class="mb-3 flex items-center gap-1">
+      <span class="font-mono text-[11px] text-[var(--dim)]">Changes</span>
+      <span class="ml-auto font-mono text-[10px] text-[var(--faint)]">
+        <%= if @changes != [] do %>
+          {length(@changes)} changed
+        <% end %>
+      </span>
+      <button
+        type="button"
+        phx-click="refresh_changes"
+        title="Refresh changes"
+        class="flex-none px-1.5 text-[var(--faint)] hover:text-[var(--text)]"
+      >
+        ⟳
+      </button>
+    </div>
+
+    <%!-- Changed-files list (git status vs HEAD); a click opens the diff modal --%>
+    <%= cond do %>
+      <% @changes == [] and @changes_error -> %>
+        <p class="font-mono text-xs text-[var(--prov-red)]">{@changes_error}</p>
+      <% @changes == [] and @changes_loading -> %>
+        <p class="font-mono text-xs text-[var(--faint)]">loading…</p>
+      <% @changes == [] -> %>
+        <p class="font-mono text-xs text-[var(--faint)]">no changes</p>
+      <% true -> %>
+        <%= if @changes_error do %>
+          <p class="mb-2 font-mono text-xs text-[var(--prov-red)]">{@changes_error}</p>
+        <% end %>
+        <div class="overflow-hidden">
+          <%= for file <- @changes do %>
+            <% badge = status_badge(file["status"]) %>
+            <button
+              type="button"
+              phx-click="open_diff"
+              phx-value-path={file["path"]}
+              class="flex w-full items-center gap-2 py-1 pl-2 pr-2 text-left font-mono text-[11px] hover:bg-[var(--panel-2)]"
+            >
+              <span
+                class="w-4 flex-none text-center font-semibold"
+                style={"color: #{badge.color}"}
+              >
+                {badge.label}
+              </span>
+              <span class="truncate text-[var(--dim)]">{file["path"]}</span>
+            </button>
+          <% end %>
+        </div>
+    <% end %>
+    """
+  end
+
+  attr :reviews, :list, required: true
+  attr :auto_approve, :boolean, required: true
+
+  def reviews_tab(assigns) do
+    ~H"""
+    <div class="mb-3 flex items-center justify-between">
+      <span class="oa-label">Review gate</span>
+      <button
+        type="button"
+        phx-click="toggle_auto_approve"
+        aria-pressed={@auto_approve}
+        class={"oa-btn text-xs #{if @auto_approve, do: "ok", else: ""}"}
+      >
+        <span class={"oa-dot #{if @auto_approve, do: "on", else: ""}"}></span>
+        Auto {if @auto_approve, do: "on", else: "off"}
+      </button>
+    </div>
+    <div class="space-y-2">
+      <%= for item <- @reviews do %>
+        <div class="oa-panel p-3">
+          <div class="font-mono text-[11px] text-[var(--dim)]">
+            {item.external_id} · {item.phase} · {item.path}
+          </div>
+          <%= if item.decision do %>
+            <div class="mt-2 flex items-center gap-2 font-mono text-[11px]">
+              <span class={"oa-status #{review_decision_class(item.decision)}"}>
+                {review_decision_label(item.decision)}
+              </span>
+              <%= if item.decided_at do %>
+                <span class="text-[var(--faint)]">
+                  {Calendar.strftime(item.decided_at, "%Y-%m-%d %H:%M")}
+                </span>
+              <% end %>
+            </div>
+          <% else %>
+            <div class="mt-2 flex flex-wrap gap-2">
+              <button
+                phx-click="review_decision"
+                phx-value-id={item.external_id}
+                phx-value-action="approve"
+                class="oa-btn ok text-xs"
+              >
+                Approve
+              </button>
+              <button
+                phx-click="review_decision"
+                phx-value-id={item.external_id}
+                phx-value-action="retry"
+                class="oa-btn primary text-xs"
+              >
+                Retry
+              </button>
+              <button
+                phx-click="review_decision"
+                phx-value-id={item.external_id}
+                phx-value-action="reject"
+                class="oa-btn danger text-xs"
+              >
+                Reject
+              </button>
+            </div>
+          <% end %>
+        </div>
+      <% end %>
+      <%= if @reviews == [] do %>
+        <p class="font-mono text-xs text-[var(--faint)]">no pending reviews</p>
+      <% end %>
+    </div>
+    """
+  end
+
+  attr :artifacts, :list, required: true
+  attr :session, :map, required: true
+
+  def artifacts_tab(assigns) do
+    ~H"""
+    <div class="mb-2 oa-label">Captured artifacts</div>
+    <%= if @artifacts == [] do %>
+      <p class="font-mono text-xs text-[var(--faint)]">
+        no artifacts yet — recording, traces, and logs upload when the session ends
+      </p>
+    <% else %>
+      <ul class="space-y-2">
+        <%= for artifact <- @artifacts do %>
+          <li class="oa-panel flex items-center justify-between gap-3 p-3">
+            <div class="min-w-0">
+              <div class="truncate text-sm text-[var(--text)]">
+                {artifact_label(artifact.kind)}
+              </div>
+              <div class="mt-0.5 font-mono text-[11px] text-[var(--faint)]">
+                {format_bytes(artifact.size)} · {Calendar.strftime(
+                  artifact.inserted_at,
+                  "%Y-%m-%d %H:%M"
+                )}
+              </div>
+            </div>
+            <div class="flex flex-none items-center gap-2">
+              <%= if artifact.kind == "recording" do %>
+                <button
+                  type="button"
+                  phx-click="play_recording"
+                  phx-value-id={artifact.id}
+                  class="oa-btn primary text-xs"
+                >
+                  Play
+                </button>
+              <% end %>
+              <a
+                href={~p"/sessions/#{@session.id}/artifacts/#{artifact.id}/download"}
+                class="oa-btn text-xs"
+                download
+              >
+                Download
+              </a>
+            </div>
+          </li>
+        <% end %>
+      </ul>
+    <% end %>
+    """
+  end
+
+  attr :sessions, :list, required: true
+  attr :session, :any, required: true
+  attr :daemons, :list, required: true
+  attr :oad_instances, :list, required: true
+  attr :oad_workspaces, :list, required: true
+  attr :sidebar_collapsed, :boolean, required: true
+  attr :sessions_collapsed, :boolean, required: true
+  attr :current_user, :any, required: true
+
+  def sidebar(assigns) do
+    ~H"""
+    <aside class={[
+      "flex flex-none flex-col border-r border-[var(--line)] bg-[var(--panel)]",
+      @sidebar_collapsed && "w-12",
+      !@sidebar_collapsed && "w-[var(--left-w)]"
+    ]}>
+      <%= if @sidebar_collapsed do %>
+        <button
+          type="button"
+          phx-click="toggle_sidebar"
+          title="Expand sidebar"
+          class="flex h-[49px] w-full flex-none items-center justify-center border-b border-[var(--line)] text-[var(--faint)] hover:text-[var(--text)]"
+        >
+          »
+        </button>
+        <div class="flex flex-1 flex-col items-center gap-2 overflow-y-auto py-3">
+          <%= for session <- Enum.filter(@sessions, &active?/1) do %>
+            <.link
+              patch={~p"/sessions/#{session.id}"}
+              title={session.name || session.id}
+              class={[
+                "relative flex h-9 w-9 flex-none items-center justify-center rounded-full border text-xs font-bold uppercase transition-colors",
+                @session && @session.id == session.id &&
+                  "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]",
+                !(@session && @session.id == session.id) &&
+                  "border-[var(--line)] text-[var(--dim)] hover:bg-[var(--panel-2)]"
+              ]}
+            >
+              {session_initial(session)}
+            </.link>
+          <% end %>
+          <button
+            type="button"
+            phx-click="toggle_sidebar"
+            title="Expand to launch an agent"
+            class="flex h-9 w-9 flex-none items-center justify-center rounded-full border border-[var(--line)] text-[var(--faint)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+          >
+            +
+          </button>
+        </div>
+      <% else %>
+        <div class="flex items-center justify-between border-b border-[var(--line)] px-3 py-2.5">
+          <.link href={~p"/"} class="flex min-w-0 items-center gap-3">
+            <img src={~p"/logo.svg"} alt="" class="oa-logo" />
+            <Layouts.wordmark />
+          </.link>
+          <button
+            type="button"
+            phx-click="toggle_sidebar"
+            title="Collapse sidebar"
+            class="flex-none rounded-md px-1.5 py-1 text-sm text-[var(--faint)] hover:bg-[var(--panel-2)] hover:text-[var(--text)]"
+          >
+            «
+          </button>
+        </div>
+
+        <div class="flex-1 space-y-6 overflow-y-auto px-2 py-3">
+          <%= if @daemons == [] do %>
+            <div class="px-2 py-10 text-center">
+              <p class="text-sm text-[var(--dim)]">No daemon connected</p>
+              <p class="mt-1 font-mono text-[12px] text-[var(--faint)]">
+                run <code>omniagent daemon</code>
+              </p>
+            </div>
+          <% else %>
+            <%= for daemon <- @daemons do %>
+              <% workspaces = daemon_workspaces(daemon) %>
+              <section class="space-y-1">
+                <div class="group/daemon flex items-center gap-2 px-1 pt-1">
+                  <span class="flex-none text-[11px] font-semibold uppercase tracking-wide text-[var(--faint)]">
+                    {daemon_label(daemon)}
+                  </span>
+                  <span class="h-px flex-1 bg-[var(--line)]"></span>
+                  <button
+                    type="button"
+                    phx-click="open_new_workspace"
+                    phx-value-daemon_id={daemon.id}
+                    title="Create a new workspace on this daemon"
+                    class="flex-none rounded px-1 text-[11px] uppercase tracking-wide text-[var(--faint)] opacity-0 hover:text-[var(--accent)] focus:opacity-100 group-hover/daemon:opacity-100"
+                  >
+                    + ws
+                  </button>
+                </div>
+
+                <%= if workspaces == [] do %>
+                  <button
+                    type="button"
+                    phx-click="open_new_workspace"
+                    phx-value-daemon_id={daemon.id}
+                    class="block px-2 py-1 text-left font-mono text-[12px] text-[var(--faint)] hover:text-[var(--accent)]"
+                  >
+                    no workspaces — <span class="text-[var(--accent)]">create one</span>
+                  </button>
+                <% else %>
+                  <ul class="space-y-0.5">
+                    <%= for ws <- workspaces do %>
+                      <% ws_sessions = workspace_sessions(@sessions, ws["path"]) %>
+                      <li>
+                        <button
+                          type="button"
+                          phx-click="launch_workspace"
+                          phx-value-daemon_id={daemon.id}
+                          phx-value-path={ws["path"]}
+                          title={"Run an agent on #{ws["path"]}"}
+                          class="group/ws flex w-full items-center gap-2 rounded-md py-1.5 pl-2 pr-2 text-left hover:bg-[var(--panel-2)]"
+                        >
+                          <.icon
+                            name="hero-folder-micro"
+                            class="size-3.5 flex-none text-[var(--faint)]"
+                          />
+                          <span class="min-w-0 flex-1 truncate text-sm text-[var(--dim)] group-hover/ws:text-[var(--text)]">
+                            {workspace_label(ws["path"])}
+                          </span>
+                          <span class="flex-none text-[11px] uppercase tracking-wide text-[var(--faint)] opacity-0 group-hover/ws:text-[var(--accent)] group-hover/ws:opacity-100">
+                            + agent
+                          </span>
+                        </button>
+                        <%= if ws_sessions != [] do %>
+                          <div class="mt-px space-y-px pl-5">
+                            <%= for session <- ws_sessions do %>
+                              <.session_row
+                                session={session}
+                                active_id={@session && @session.id}
+                                compact
+                              />
+                            <% end %>
+                          </div>
+                        <% end %>
+                      </li>
+                    <% end %>
+                  </ul>
+                <% end %>
+              </section>
+            <% end %>
+          <% end %>
+
+          <section class="space-y-1">
+            <div class="flex items-center gap-2 px-1 pt-1">
+              <span class="flex-none text-[11px] font-semibold uppercase tracking-wide text-[var(--faint)]">
+                oad
+              </span>
+              <span class="h-px flex-1 bg-[var(--line)]"></span>
+              <%= if @oad_instances != [] do %>
+                <button
+                  type="button"
+                  phx-click="open_new_oad_workspace"
+                  title="Build a new oad workspace"
+                  class="flex-none rounded px-1 text-[11px] uppercase tracking-wide text-[var(--faint)] hover:text-[var(--accent)]"
+                >
+                  + ws
+                </button>
+              <% end %>
+            </div>
+
+            <%= if @oad_instances == [] do %>
+              <p class="px-2 py-1 font-mono text-[12px] text-[var(--faint)]">
+                no oad instance registered
+              </p>
+            <% else %>
+              <%= if @oad_workspaces == [] do %>
+                <button
+                  type="button"
+                  phx-click="open_new_oad_workspace"
+                  class="block px-2 py-1 text-left font-mono text-[12px] text-[var(--faint)] hover:text-[var(--accent)]"
+                >
+                  no workspaces — <span class="text-[var(--accent)]">build one</span>
+                </button>
+              <% else %>
+                <ul class="space-y-0.5">
+                  <%= for ws <- @oad_workspaces do %>
+                    <% oad_sessions = oad_workspace_sessions(@sessions, ws.name) %>
+                    <li class="group/oadws">
+                      <div class="flex items-center gap-2 rounded-md py-1.5 pl-2 pr-2 hover:bg-[var(--panel-2)]">
+                        <.icon
+                          name="hero-folder-micro"
+                          class="size-3.5 flex-none text-[var(--faint)]"
+                        />
+                        <span class="min-w-0 flex-1 truncate text-sm text-[var(--dim)]">
+                          {ws.name}
+                          <span class="text-[11px] text-[var(--faint)]">· {ws.status}</span>
+                        </span>
+                        <%= if ws.status == "ready" do %>
+                          <button
+                            type="button"
+                            phx-click="open_oad_agent"
+                            phx-value-workspace={ws.name}
+                            title={"Run an agent on #{ws.name}"}
+                            class="flex-none text-[11px] uppercase tracking-wide text-[var(--faint)] opacity-0 hover:text-[var(--accent)] group-hover/oadws:opacity-100"
+                          >
+                            + agent
+                          </button>
+                        <% end %>
+                        <button
+                          type="button"
+                          phx-click="rebuild_oad_workspace"
+                          phx-value-name={ws.name}
+                          title="Rebuild this workspace"
+                          class="flex-none text-[11px] uppercase tracking-wide text-[var(--faint)] opacity-0 hover:text-[var(--accent)] group-hover/oadws:opacity-100"
+                        >
+                          rebuild
+                        </button>
+                      </div>
+                      <%= if oad_sessions != [] do %>
+                        <div class="mt-px space-y-px pl-5">
+                          <%= for session <- oad_sessions do %>
+                            <.session_row
+                              session={session}
+                              active_id={@session && @session.id}
+                              compact
+                            />
+                          <% end %>
+                        </div>
+                      <% end %>
+                    </li>
+                  <% end %>
+                </ul>
+              <% end %>
+            <% end %>
+          </section>
+
+          <% panel = panel_sessions(@sessions, @daemons, @oad_workspaces) %>
+          <%= if panel != [] do %>
+            <section class="space-y-1">
+              <button
+                type="button"
+                phx-click="toggle_sessions"
+                class="group/sessions flex w-full items-center gap-1 pr-1 py-0.5 text-left"
+              >
+                <span class={[
+                  "inline-block w-2 flex-none text-center text-[9px] text-[var(--faint)] transition-transform",
+                  !@sessions_collapsed && "rotate-90"
+                ]}>
+                  ›
+                </span>
+                <span class="flex-1 text-[12px] font-semibold uppercase tracking-wide text-[var(--faint)] group-hover/sessions:text-[var(--dim)]">
+                  Inactive
+                </span>
+                <span class="flex-none font-mono text-[11px] text-[var(--faint)]">
+                  {length(panel)}
+                </span>
+              </button>
+              <%= unless @sessions_collapsed do %>
+                <div class="space-y-px">
+                  <%= for session <- panel do %>
+                    <.session_row session={session} active_id={@session && @session.id} compact />
+                  <% end %>
+                </div>
+              <% end %>
+            </section>
+          <% end %>
+        </div>
+
+        <div class="flex items-center gap-2 border-t border-[var(--line)] px-3 py-2.5">
+          <span class="flex h-7 w-7 flex-none items-center justify-center rounded-full border border-[var(--line)] bg-[var(--panel-2)] text-[11px] font-bold uppercase text-[var(--dim)]">
+            {user_initial(@current_user)}
+          </span>
+          <span
+            class="min-w-0 flex-1 truncate text-[12px] text-[var(--dim)]"
+            title={user_label(@current_user)}
+          >
+            {user_label(@current_user)}
+          </span>
+          <.link
+            href={~p"/logout"}
+            method="delete"
+            title="Sign out"
+            class="flex-none rounded-md px-1.5 py-1 text-[12px] text-[var(--faint)] hover:bg-[var(--panel-2)] hover:text-[var(--text)]"
+          >
+            Sign out
+          </.link>
+        </div>
+      <% end %>
+    </aside>
+    """
+  end
+
+  # Middle pane for a selected session: header, terminal/codex/ended view, and
+  # the trace stream. The empty (no-selection) state stays in the template.
+  attr :session, :map, required: true
+
+  def session_pane(assigns) do
+    ~H"""
+    <header class="flex flex-none items-center justify-between gap-3 border-b border-[var(--line)] px-4 py-3">
+      <div class="flex min-w-0 items-center gap-3">
+        <h1 class="oa-display truncate text-lg font-bold">{@session.name || @session.id}</h1>
+        <span class={"oa-status #{status_class(@session.status)}"}>{@session.status}</span>
+        <code class="hidden truncate font-mono text-[11px] text-[var(--faint)] md:block">
+          {@session.cwd}
+        </code>
+        <%= if branch = @session.metadata["branch"] do %>
+          <span class="oa-label hidden shrink-0 md:inline-flex" title="git branch">
+            ⎇ {branch}
+          </span>
+        <% end %>
+      </div>
+      <%= if @session.status != "online" do %>
+        <button
+          type="button"
+          phx-click="delete_session"
+          data-confirm="Delete this session and all its recorded data?"
+          class="oa-btn danger text-xs"
+        >
+          Delete
+        </button>
+      <% end %>
+    </header>
+
+    <div
+      class="flex min-h-0 flex-col border-b border-[var(--line)] p-2"
+      style="flex: 0 0 var(--term-basis)"
+    >
+      <%= cond do %>
+        <% Sessions.codex_native?(@session) -> %>
+          <%!-- Native codex conversation: the Codex hook owns the whole pane
+                (transcript + composer + interrupt), driven by push_event. --%>
+          <div
+            id={"codex-#{@session.id}"}
+            phx-hook="Codex"
+            phx-update="ignore"
+            data-status={@session.status}
+            class="oa-codex flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border border-[var(--line)] bg-[var(--panel)]"
+          >
+          </div>
+        <% @session.status == "online" -> %>
+          <div
+            id={"terminal-#{@session.id}"}
+            phx-hook="Terminal"
+            phx-update="ignore"
+            class="oa-terminal min-h-0 flex-1 overflow-hidden rounded-md border border-[var(--line)] bg-black p-2"
+          >
+          </div>
+        <% true -> %>
+          <div class="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-md border border-[var(--line)] bg-black text-center">
+            <p class="oa-display text-sm font-bold text-[var(--dim)]">Session ended</p>
+            <p class="font-mono text-[11px] text-[var(--faint)]">
+              open the <span class="text-[var(--accent)]">Artifacts</span>
+              tab to replay or download the recording
+            </p>
+          </div>
+      <% end %>
+    </div>
+
+    <div
+      id="gutter-term"
+      phx-hook="Resize"
+      data-axis="y"
+      data-var="--term-basis"
+      data-prop="term_pct"
+      data-unit="%"
+      data-min="20"
+      data-max="85"
+      class="oa-gutter oa-gutter-y"
+      title="Drag to resize"
+    >
+    </div>
+
+    <div class="flex min-h-0 flex-1 flex-col p-2">
+      <div class="oa-label mb-1 px-1">Traces</div>
+      <div
+        id={"traces-#{@session.id}"}
+        phx-hook="Traces"
+        phx-update="ignore"
+        class="oa-traces min-h-0 flex-1 overflow-y-auto"
+      >
+        <div class="oa-trace-empty" data-trace-empty>
+          no LLM calls yet — requests appear as the agent talks to the model
+        </div>
+      </div>
+    </div>
     """
   end
 
