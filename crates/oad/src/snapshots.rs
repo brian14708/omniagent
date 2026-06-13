@@ -8,6 +8,7 @@
 
 use std::io;
 
+use oad_cas::ChunkRecipe;
 use oad_core::{ContainerSpec, OadPaths, SandboxNetworkSpec};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -58,6 +59,38 @@ impl SnapshotManifest {
     pub fn created_at_rfc3339(&self) -> String {
         self.created_at.format(&Rfc3339).unwrap_or_default()
     }
+}
+
+/// One container's checkpoint image, chunked into a recipe for reassembly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerCheckpoint {
+    /// Container name (matches an entry in [`SnapshotManifest::container_names`]).
+    pub container: String,
+    /// Recipe describing how to reassemble the container's `checkpoint.img`.
+    pub recipe: ChunkRecipe,
+}
+
+/// A portable, node-independent description of a snapshot.
+///
+/// Stored in the content-addressed object store so any node can fetch it,
+/// materialize the checkpoint images from chunks, rebuild the rootfs from the
+/// OCI registry, and fork the sandbox. The node-local counterpart is
+/// [`SnapshotManifest`]; this adds the per-container checkpoint recipes that
+/// make the snapshot reconstructable off-node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotDescriptor {
+    pub name: String,
+    /// Pause image the source sandbox was booted with.
+    pub pause_image: String,
+    /// User container specs (excluding the reserved `pause` container).
+    pub containers: Vec<ContainerSpec>,
+    /// Network policy inherited by forks unless explicitly overridden.
+    #[serde(default)]
+    pub network: SandboxNetworkSpec,
+    pub created_at: OffsetDateTime,
+    /// Per-container checkpoint recipes, in the snapshot's container order
+    /// (`pause` first).
+    pub checkpoints: Vec<ContainerCheckpoint>,
 }
 
 /// Writes a snapshot manifest, creating the snapshot directory as needed.

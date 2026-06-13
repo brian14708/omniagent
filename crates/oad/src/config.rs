@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use oad_core::{
-    ControlPlaneConfig, DaemonConfig, HttpConfig, ManagedNetworkBackend, MountSpec,
+    CasConfig, ControlPlaneConfig, DaemonConfig, HttpConfig, ManagedNetworkBackend, MountSpec,
     NetworkRuntimeConfig, RuntimeConfig,
 };
 use serde::Deserialize;
@@ -12,6 +12,12 @@ const DEFAULT_BASE_DIR: &str = "/var/lib/omniagent";
 const DEFAULT_PAUSE_IMAGE: &str = "registry.k8s.io/pause:3.10";
 const DEFAULT_OMNIAGENT_PATH: &str = "/opt/omniagent/bin/omniagent";
 
+const DEFAULT_S3_REGION: &str = "us-east-1";
+const DEFAULT_CHUNK_MIN: u32 = 256 * 1024;
+const DEFAULT_CHUNK_AVG: u32 = 1024 * 1024;
+const DEFAULT_CHUNK_MAX: u32 = 4 * 1024 * 1024;
+const DEFAULT_ZSTD_LEVEL: i32 = 3;
+
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
     #[serde(default)]
@@ -20,6 +26,22 @@ struct FileConfig {
     runtime: FileRuntimeConfig,
     #[serde(default)]
     control_plane: FileControlPlaneConfig,
+    #[serde(default)]
+    cas: FileCasConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileCasConfig {
+    endpoint: Option<String>,
+    region: Option<String>,
+    bucket: Option<String>,
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    prefix: Option<String>,
+    chunk_min: Option<u32>,
+    chunk_avg: Option<u32>,
+    chunk_max: Option<u32>,
+    zstd_level: Option<i32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -88,6 +110,7 @@ pub async fn load_config(path: Option<PathBuf>) -> Result<DaemonConfig> {
         .bind
         .unwrap_or_else(|| DEFAULT_BIND.to_string());
     let control_plane = resolve_control_plane_config(&file_config.control_plane, &bind)?;
+    let cas = resolve_cas_config(&file_config.cas)?;
 
     Ok(DaemonConfig {
         http: HttpConfig { bind, bearer_token },
@@ -105,7 +128,44 @@ pub async fn load_config(path: Option<PathBuf>) -> Result<DaemonConfig> {
             static_mounts: file_config.runtime.static_mounts,
         },
         control_plane,
+        cas,
     })
+}
+
+/// Builds the CAS config, or `None` when no S3 endpoint is configured (legacy
+/// single-node mode). Endpoint, bucket, and credentials must be provided
+/// together; a partial configuration is an error.
+fn resolve_cas_config(file: &FileCasConfig) -> Result<Option<CasConfig>> {
+    let endpoint = file.endpoint.clone().filter(|v| !v.is_empty());
+    let bucket = file.bucket.clone().filter(|v| !v.is_empty());
+    let access_key_id = file.access_key_id.clone().filter(|v| !v.is_empty());
+    let secret_access_key = file.secret_access_key.clone().filter(|v| !v.is_empty());
+
+    match (endpoint, bucket, access_key_id, secret_access_key) {
+        (None, None, None, None) => Ok(None),
+        (Some(endpoint), Some(bucket), Some(access_key_id), Some(secret_access_key)) => {
+            Ok(Some(CasConfig {
+                endpoint,
+                region: file
+                    .region
+                    .clone()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| DEFAULT_S3_REGION.to_string()),
+                bucket,
+                access_key_id,
+                secret_access_key,
+                prefix: file.prefix.clone().unwrap_or_default(),
+                chunk_min: file.chunk_min.unwrap_or(DEFAULT_CHUNK_MIN),
+                chunk_avg: file.chunk_avg.unwrap_or(DEFAULT_CHUNK_AVG),
+                chunk_max: file.chunk_max.unwrap_or(DEFAULT_CHUNK_MAX),
+                zstd_level: file.zstd_level.unwrap_or(DEFAULT_ZSTD_LEVEL),
+            }))
+        }
+        _ => bail!(
+            "incomplete CAS config: set OAD_S3_ENDPOINT_URL, OAD_S3_BUCKET, \
+             OAD_S3_ACCESS_KEY_ID, and OAD_S3_SECRET_ACCESS_KEY together, or none"
+        ),
+    }
 }
 
 /// Builds the control-plane registration config, or `None` when no control-plane
@@ -279,7 +339,49 @@ fn apply_env_overrides(config: &mut FileConfig) -> Result<()> {
     if let Ok(value) = std::env::var("OAD_OMNIAGENT_PATH") {
         config.control_plane.omniagent_path = Some(value);
     }
+    if let Ok(value) = std::env::var("OAD_S3_ENDPOINT_URL") {
+        config.cas.endpoint = Some(value);
+    }
+    if let Ok(value) = std::env::var("OAD_S3_REGION") {
+        config.cas.region = Some(value);
+    }
+    if let Ok(value) = std::env::var("OAD_S3_BUCKET") {
+        config.cas.bucket = Some(value);
+    }
+    if let Ok(value) = std::env::var("OAD_S3_ACCESS_KEY_ID") {
+        config.cas.access_key_id = Some(value);
+    }
+    if let Ok(value) = std::env::var("OAD_S3_SECRET_ACCESS_KEY") {
+        config.cas.secret_access_key = Some(value);
+    }
+    if let Ok(value) = std::env::var("OAD_S3_PREFIX") {
+        config.cas.prefix = Some(value);
+    }
+    if let Ok(value) = std::env::var("OAD_CAS_CHUNK_MIN") {
+        config.cas.chunk_min = Some(parse_u32_env("OAD_CAS_CHUNK_MIN", &value)?);
+    }
+    if let Ok(value) = std::env::var("OAD_CAS_CHUNK_AVG") {
+        config.cas.chunk_avg = Some(parse_u32_env("OAD_CAS_CHUNK_AVG", &value)?);
+    }
+    if let Ok(value) = std::env::var("OAD_CAS_CHUNK_MAX") {
+        config.cas.chunk_max = Some(parse_u32_env("OAD_CAS_CHUNK_MAX", &value)?);
+    }
+    if let Ok(value) = std::env::var("OAD_CAS_ZSTD_LEVEL") {
+        config.cas.zstd_level = Some(parse_i32_env("OAD_CAS_ZSTD_LEVEL", &value)?);
+    }
     Ok(())
+}
+
+fn parse_u32_env(name: &str, value: &str) -> Result<u32> {
+    value
+        .parse::<u32>()
+        .with_context(|| format!("{name} must be a non-negative integer, got {value:?}"))
+}
+
+fn parse_i32_env(name: &str, value: &str) -> Result<i32> {
+    value
+        .parse::<i32>()
+        .with_context(|| format!("{name} must be an integer, got {value:?}"))
 }
 
 /// Parses an `OAD_STATIC_MOUNT` value `SRC:DST[:ro|:rw]` (read-only default).
@@ -322,5 +424,41 @@ mod tests {
     #[test]
     fn default_base_dir_is_var_lib_omniagent() {
         assert_eq!(default_base_dir(), PathBuf::from("/var/lib/omniagent"));
+    }
+
+    #[test]
+    fn cas_config_absent_when_unset() {
+        assert!(
+            resolve_cas_config(&FileCasConfig::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cas_config_resolves_with_defaults() {
+        let file = FileCasConfig {
+            endpoint: Some("http://rustfs:9000".to_string()),
+            bucket: Some("omniagent-cas".to_string()),
+            access_key_id: Some("key".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let cas = resolve_cas_config(&file).unwrap().unwrap();
+        assert_eq!(cas.region, "us-east-1");
+        assert_eq!(cas.chunk_min, 256 * 1024);
+        assert_eq!(cas.chunk_avg, 1024 * 1024);
+        assert_eq!(cas.chunk_max, 4 * 1024 * 1024);
+        assert_eq!(cas.zstd_level, 3);
+        assert!(cas.prefix.is_empty());
+    }
+
+    #[test]
+    fn cas_config_partial_is_error() {
+        let file = FileCasConfig {
+            endpoint: Some("http://rustfs:9000".to_string()),
+            ..Default::default()
+        };
+        assert!(resolve_cas_config(&file).is_err());
     }
 }

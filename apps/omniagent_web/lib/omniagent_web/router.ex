@@ -56,6 +56,7 @@ defmodule OmniagentWeb.Router do
 
     post "/register", OadController, :register
     delete "/register/:id", OadController, :delete
+    post "/cas/check", OadController, :cas_check
   end
 
   # Enable LiveDashboard in development

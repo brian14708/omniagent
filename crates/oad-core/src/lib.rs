@@ -426,6 +426,55 @@ pub struct DaemonConfig {
     /// When set, the daemon self-registers with an `OmniAgent` control plane and
     /// heartbeats for liveness.
     pub control_plane: Option<ControlPlaneConfig>,
+    /// When set, the daemon publishes snapshot artifacts to a content-addressed
+    /// object store (CAS) so they become portable across nodes. When `None`, the
+    /// daemon runs in legacy single-node mode and snapshots stay on local disk.
+    pub cas: Option<CasConfig>,
+}
+
+/// Connection and chunking settings for the content-addressed store (CAS).
+///
+/// Held as plain data here (this crate has no object-store dependency); the
+/// daemon maps it onto the `oad-cas` client and chunker.
+#[derive(Clone)]
+pub struct CasConfig {
+    /// S3-compatible endpoint URL, e.g. `http://rustfs:9000`.
+    pub endpoint: String,
+    /// Region label (`RustFS` accepts any; AWS requires the real region).
+    pub region: String,
+    /// Bucket holding chunks, recipes, and descriptors.
+    pub bucket: String,
+    /// Access key id.
+    pub access_key_id: String,
+    /// Secret access key.
+    pub secret_access_key: String,
+    /// Key prefix under which all CAS objects live (may be empty).
+    pub prefix: String,
+    /// Minimum `FastCDC` chunk size in bytes.
+    pub chunk_min: u32,
+    /// Average (target) `FastCDC` chunk size in bytes.
+    pub chunk_avg: u32,
+    /// Maximum `FastCDC` chunk size in bytes.
+    pub chunk_max: u32,
+    /// `zstd` compression level for chunk objects.
+    pub zstd_level: i32,
+}
+
+impl std::fmt::Debug for CasConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CasConfig")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("prefix", &self.prefix)
+            .field("chunk_min", &self.chunk_min)
+            .field("chunk_avg", &self.chunk_avg)
+            .field("chunk_max", &self.chunk_max)
+            .field("zstd_level", &self.zstd_level)
+            .finish()
+    }
 }
 
 /// How the daemon registers itself with the `OmniAgent` control plane so the

@@ -50,6 +50,24 @@ pub struct SnapshotInfo {
     pub containers: Vec<String>,
     /// Creation time, RFC 3339.
     pub created_at: String,
+    /// Present when the snapshot was published to the content-addressed store,
+    /// making it portable across nodes. Absent in legacy single-node mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cas: Option<CasSnapshotInfo>,
+}
+
+/// Details of a snapshot published to the content-addressed object store.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CasSnapshotInfo {
+    /// Object key of the stored snapshot descriptor.
+    pub descriptor_key: String,
+    /// Total uncompressed size of the snapshot's checkpoint images, in bytes.
+    pub total_bytes: u64,
+    /// Bytes uploaded to the store after deduplication, in bytes.
+    pub uploaded_bytes: u64,
+    /// Distinct chunk hashes (hex `blake3`) the snapshot references, so the
+    /// control plane can reference-count them.
+    pub chunk_hashes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

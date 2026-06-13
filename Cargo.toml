@@ -2,6 +2,7 @@
 members = [
     "crates/oad",
     "crates/oad-api",
+    "crates/oad-cas",
     "crates/oad-client",
     "crates/oad-core",
     "crates/oad-oci",
@@ -19,8 +20,10 @@ license = "Apache-2.0"
 anyhow = "1.0"
 axum = "0.8"
 base64 = "0.22"
+blake3 = "1"
 bytes = "1.7"
 clap = { version = "4.5", features = ["derive", "env"] }
+fastcdc = "3"
 flate2 = "1.0"
 ignore = "0.4"
 notify-debouncer-full = "0.5"
@@ -29,12 +32,14 @@ hex = "0.4"
 http = "1.1"
 libc = "0.2"
 oad-api = { path = "crates/oad-api" }
+oad-cas = { path = "crates/oad-cas" }
 oad-client = { path = "crates/oad-client" }
 oad-core = { path = "crates/oad-core" }
 oad-oci = { path = "crates/oad-oci" }
 oad-runtime = { path = "crates/oad-runtime" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rustix = { version = "1.1", features = ["process"] }
+rusty-s3 = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
@@ -64,6 +69,7 @@ url = "2.5"
 urlencoding = "2.1"
 utoipa = { version = "5.5", features = ["axum_extras", "time"] }
 uuid = { version = "1.10", features = ["serde", "v4"] }
+zstd = "0.13"
 
 [workspace.lints.rust]
 warnings = "deny"

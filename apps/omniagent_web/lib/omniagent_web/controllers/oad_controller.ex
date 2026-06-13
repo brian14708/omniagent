@@ -11,6 +11,7 @@ defmodule OmniagentWeb.OadController do
   use OmniagentWeb, :controller
 
   alias Omniagent.OadInstances
+  alias Omniagent.Oad.Snapshots
 
   def register(conn, params) do
     if authorized?(conn) do
@@ -39,6 +40,20 @@ defmodule OmniagentWeb.OadController do
     if authorized?(conn) do
       OadInstances.deregister(id)
       send_resp(conn, :no_content, "")
+    else
+      unauthorized(conn)
+    end
+  end
+
+  @doc """
+  Batched chunk existence check. The daemon posts the chunk hashes it is about
+  to upload and receives the subset the store is missing, so it transfers only
+  the delta.
+  """
+  def cas_check(conn, params) do
+    if authorized?(conn) do
+      hashes = List.wrap(params["hashes"])
+      json(conn, %{missing: Snapshots.missing_chunks(hashes)})
     else
       unauthorized(conn)
     end

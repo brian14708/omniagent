@@ -17,7 +17,7 @@ defmodule Omniagent.Oad.Builder do
   require Logger
 
   alias Omniagent.{OadInstances, OadWorkspaces}
-  alias Omniagent.Oad.{Client, Devcontainer}
+  alias Omniagent.Oad.{Client, Devcontainer, Snapshots}
   alias Omniagent.OadInstances.OadInstance
 
   @pubsub Omniagent.PubSub
@@ -256,8 +256,42 @@ defmodule Omniagent.Oad.Builder do
     snapshot_name = "#{name}-v#{revision}"
 
     case Client.snapshot(instance, sandbox_id, %{"name" => snapshot_name}) do
-      {:ok, _} -> {:ok, snapshot_name}
-      {:error, reason} -> {:error, reason}
+      {:ok, response} ->
+        register_cas_snapshot(name, snapshot_name, response)
+        {:ok, snapshot_name}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Records a CAS-published snapshot in the control-plane index (and refcounts
+  # its chunks) so it becomes discoverable for portability and GC. Non-fatal: a
+  # snapshot with no `cas` block came from a daemon without a CAS configured and
+  # stays node-local; an index failure is logged but does not fail the build.
+  defp register_cas_snapshot(workspace_name, snapshot_name, response) do
+    case get_in(response, ["snapshot", "cas"]) do
+      %{} = cas ->
+        attrs = %{
+          snapshot_name: snapshot_name,
+          workspace_name: workspace_name,
+          descriptor_key: cas["descriptor_key"],
+          total_bytes: cas["total_bytes"] || 0,
+          chunk_hashes: cas["chunk_hashes"] || []
+        }
+
+        case Snapshots.register(attrs) do
+          {:ok, _snapshot} ->
+            :ok
+
+          {:error, reason} ->
+            Logger.warning("failed to register CAS snapshot #{snapshot_name}: #{inspect(reason)}")
+
+            :ok
+        end
+
+      _ ->
+        :ok
     end
   end
 

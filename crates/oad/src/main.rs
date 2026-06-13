@@ -1,4 +1,5 @@
 mod background_exec;
+mod cas;
 mod config;
 mod network;
 mod registration;
@@ -25,7 +26,7 @@ use background_exec::BackgroundExecStore;
 use futures_util::{StreamExt, stream};
 use oad_api::{
     BackgroundExecEvent, BackgroundExecEventKind, BackgroundExecInfo, BackgroundExecResponse,
-    BackgroundExecStatus, BackgroundExecStdinRequest, BackgroundExecStdinResponse,
+    BackgroundExecStatus, BackgroundExecStdinRequest, BackgroundExecStdinResponse, CasSnapshotInfo,
     CreateSandboxRequest, CreateSnapshotRequest, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, ErrorBody,
     ErrorResponse, ExecRequest, ExecResponse, ListSnapshotsResponse, SandboxNetworkResponse,
     SandboxResponse, SnapshotInfo, SnapshotResponse, StartBackgroundExecRequest,
@@ -60,6 +61,9 @@ struct AppState {
     gvisor: GvisorManager,
     network: network::NetworkManager,
     background_execs: BackgroundExecStore,
+    /// When set, captured snapshots are published to the content-addressed store
+    /// so they become portable across nodes.
+    cas: Option<Arc<cas::CasPublisher>>,
 }
 
 const BACKGROUND_EXEC_KILL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -82,6 +86,13 @@ async fn main() -> anyhow::Result<()> {
     let gvisor = GvisorManager::new();
     let network = network::NetworkManager::new(config.runtime.network.clone())
         .context("failed to initialize network manager")?;
+    let cas = config
+        .cas
+        .as_ref()
+        .map(cas::CasPublisher::from_config)
+        .transpose()
+        .context("failed to initialize CAS publisher")?
+        .map(Arc::new);
     let state = AppState {
         config: config.clone(),
         paths,
@@ -90,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
         gvisor,
         network,
         background_execs: BackgroundExecStore::default(),
+        cas,
     };
     if let Err(err) = state.network.reconcile_all(&state.paths).await {
         warn!(error = %err, "failed to reconcile managed network state at startup");
@@ -351,6 +363,7 @@ fn router(state: AppState) -> Router {
         UdpEgressPolicy,
         CreateSnapshotRequest,
         SnapshotInfo,
+        CasSnapshotInfo,
         SnapshotResponse,
         ListSnapshotsResponse,
     )),
@@ -1893,7 +1906,35 @@ async fn snapshot_sandbox_handler(
     }
     snapshot_cleanup.disarm();
 
-    Ok((StatusCode::CREATED, Json(snapshot_response(&manifest))))
+    // Publish the snapshot to the content-addressed store so it becomes portable
+    // across nodes. A publish failure is non-fatal: the snapshot is still valid
+    // locally, it just stays node-local (no portable descriptor).
+    let cas = match &state.cas {
+        Some(publisher) => match publisher.publish_snapshot(&state.paths, &manifest).await {
+            Ok(outcome) => Some(CasSnapshotInfo {
+                descriptor_key: outcome.descriptor_key,
+                total_bytes: outcome.total_bytes,
+                uploaded_bytes: outcome.uploaded_bytes,
+                chunk_hashes: outcome.chunk_hashes,
+            }),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    snapshot = %manifest.name,
+                    "CAS publish failed; snapshot remains node-local"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
+    let mut info = snapshot_info(&manifest);
+    info.cas = cas;
+    Ok((
+        StatusCode::CREATED,
+        Json(SnapshotResponse { snapshot: info }),
+    ))
 }
 
 /// List all stored snapshots.
@@ -1951,12 +1992,7 @@ fn snapshot_info(manifest: &snapshots::SnapshotManifest) -> SnapshotInfo {
         name: manifest.name.clone(),
         containers: manifest.container_names(),
         created_at: manifest.created_at_rfc3339(),
-    }
-}
-
-fn snapshot_response(manifest: &snapshots::SnapshotManifest) -> SnapshotResponse {
-    SnapshotResponse {
-        snapshot: snapshot_info(manifest),
+        cas: None,
     }
 }
 
