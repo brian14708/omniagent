@@ -71,6 +71,10 @@ impl AgentHandle {
         }
         // `CommandBuilder` seeds itself from the current process environment, so
         // applying just the overrides lets the injected base-URL variables win.
+        // Default TERM/COLORTERM for the PTY (the browser is an xterm-256color
+        // emulator) so agents emit colour; extra_env below can still override.
+        builder.env("TERM", "xterm-256color");
+        builder.env("COLORTERM", "truecolor");
         for (key, value) in extra_env {
             builder.env(key, value);
         }

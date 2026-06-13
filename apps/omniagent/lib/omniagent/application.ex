@@ -18,6 +18,7 @@ defmodule Omniagent.Application do
       %{id: :pg, start: {:pg, :start_link, [Omniagent.PG]}},
       Omniagent.Repo,
       {Phoenix.PubSub, name: Omniagent.PubSub},
+      {Task.Supervisor, name: Omniagent.TaskSupervisor},
       Omniagent.ClientCommands,
       Omniagent.Daemons
       # Start a worker by calling: Omniagent.Worker.start_link(arg)

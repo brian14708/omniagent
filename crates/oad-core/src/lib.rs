@@ -324,6 +324,27 @@ pub struct RuntimeConfig {
     pub network_namespace: Option<PathBuf>,
     pub network: NetworkRuntimeConfig,
     pub observability: ObservabilityConfig,
+    /// Host directories/files bind-mounted (read-only by default) into every user
+    /// container the daemon creates — fresh or forked. Used to supply static
+    /// assets such as the `omniagent` binary without baking them into images or
+    /// persisting them per-sandbox.
+    pub static_mounts: Vec<MountSpec>,
+}
+
+/// A host path bind-mounted into a container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountSpec {
+    /// Absolute host path to mount.
+    pub source: PathBuf,
+    /// Absolute in-container destination path.
+    pub destination: String,
+    /// Mount read-only (the default; static assets should not be writable).
+    #[serde(default = "mount_read_only_default")]
+    pub read_only: bool,
+}
+
+const fn mount_read_only_default() -> bool {
+    true
 }
 
 /// Daemon-level toggle for egress observability.
@@ -383,6 +404,26 @@ pub struct HttpConfig {
 pub struct DaemonConfig {
     pub http: HttpConfig,
     pub runtime: RuntimeConfig,
+    /// When set, the daemon self-registers with an `OmniAgent` control plane and
+    /// heartbeats for liveness.
+    pub control_plane: Option<ControlPlaneConfig>,
+}
+
+/// How the daemon registers itself with the `OmniAgent` control plane so the
+/// control plane can discover it and call its `/v1` API directly.
+#[derive(Debug, Clone)]
+pub struct ControlPlaneConfig {
+    /// Control-plane base URL (e.g. `http://127.0.0.1:4000`).
+    pub url: String,
+    /// Bearer token authenticating oad → control plane registration calls.
+    pub register_token: String,
+    /// Base URL the control plane should call back to reach this oad's `/v1` API.
+    pub advertise_url: String,
+    /// Optional human-readable instance name shown in the console.
+    pub name: Option<String>,
+    /// In-container path to the `omniagent` binary (supplied via a static mount),
+    /// advertised so the control plane knows what to exec for `serve-session`.
+    pub omniagent_path: String,
 }
 
 #[derive(Debug, Clone)]

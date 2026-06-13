@@ -42,7 +42,13 @@
           ...
         }:
         let
-          rustToolchain = p: p.rust-bin.stable.latest.default;
+          rustToolchain =
+            p:
+            p.rust-bin.stable.latest.default.override {
+              targets = pkgs.lib.optionals pkgs.stdenv.isLinux [
+                "x86_64-unknown-linux-musl"
+              ];
+            };
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
           cargoSrc = pkgs.lib.cleanSourceWith {
             src = ./.;

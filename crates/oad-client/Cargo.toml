@@ -1,22 +1,16 @@
 [package]
-name = "oad-cli"
+name = "oad-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "oadctl"
-path = "src/main.rs"
-
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
-futures-util.workspace = true
 oad-api.workspace = true
-oad-client.workspace = true
 oad-core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true

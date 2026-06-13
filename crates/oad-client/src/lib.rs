@@ -1,7 +1,9 @@
-//! Thin HTTP client over the oad daemon's `/v1` API.
+//! Reusable HTTP client for the oad sandbox daemon's `/v1` API.
 //!
 //! Request and response bodies reuse the daemon's own DTO crates (`oad-api`
 //! and `oad-core`) so the client can never drift from the server contract.
+//! This crate is the shared client used by both `oadctl` and the omniagent
+//! runner; keep it free of CLI/binary concerns.
 
 use anyhow::{Context, Result, anyhow};
 use oad_api::{

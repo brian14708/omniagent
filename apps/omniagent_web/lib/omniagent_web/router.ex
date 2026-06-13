@@ -15,6 +15,12 @@ defmodule OmniagentWeb.Router do
     plug OmniagentWeb.Plugs.ApiAuth
   end
 
+  # oad self-registration: authenticated by a shared registration secret checked
+  # in the controller (not a per-user API token), so it skips ApiAuth.
+  pipeline :oad_api do
+    plug :accepts, ["json"]
+  end
+
   pipeline :require_auth do
     plug OmniagentWeb.Auth
   end
@@ -43,6 +49,13 @@ defmodule OmniagentWeb.Router do
     pipe_through :api
 
     post "/sessions/:session_id/artifacts", ArtifactController, :create
+  end
+
+  scope "/api/oad", OmniagentWeb do
+    pipe_through :oad_api
+
+    post "/register", OadController, :register
+    delete "/register/:id", OadController, :delete
   end
 
   # Enable LiveDashboard in development

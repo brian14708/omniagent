@@ -13,7 +13,7 @@ use bytes::{Bytes, BytesMut};
 use flate2::read::GzDecoder;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use oad_core::{
-    ContainerSpec, EnvVar, OadPaths, PAUSE_CONTAINER, SandboxId, publish_atomic_file,
+    ContainerSpec, EnvVar, MountSpec, OadPaths, PAUSE_CONTAINER, SandboxId, publish_atomic_file,
     write_atomic_file,
 };
 use reqwest::header::{ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
@@ -25,7 +25,7 @@ use thiserror::Error;
 use tokio::fs as async_fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tracing::debug;
+use tracing::{debug, info, warn};
 use url::{Host, Url};
 
 const DOCKER_HUB_REGISTRY: &str = "registry-1.docker.io";
@@ -108,6 +108,7 @@ impl GvisorManager {
             rootfs_overlay,
             network_namespace: network_namespace.map(Path::to_path_buf),
             resolv_conf: resolv_conf.map(Path::to_path_buf),
+            mounts: Vec::new(),
             annotations: BTreeMap::from([
                 (
                     "io.kubernetes.cri.container-type".to_string(),
@@ -135,6 +136,7 @@ impl GvisorManager {
         container: &ContainerSpec,
         network_namespace: Option<&Path>,
         resolv_conf: Option<&Path>,
+        static_mounts: &[MountSpec],
     ) -> Result<(), OciError> {
         let staging = paths.rootfs_staging_dir(sandbox_id, &container.name);
         let pulled = self
@@ -162,6 +164,7 @@ impl GvisorManager {
             rootfs_overlay,
             network_namespace: network_namespace.map(Path::to_path_buf),
             resolv_conf: resolv_conf.map(Path::to_path_buf),
+            mounts: static_mounts.to_vec(),
             annotations: BTreeMap::from([
                 (
                     "io.kubernetes.cri.container-type".to_string(),
@@ -276,7 +279,7 @@ impl RegistryClient {
         async_fs::create_dir_all(rootfs_cache).await?;
         let rootfs = rootfs_cache.join(format!("{rootfs_key}.erofs"));
         if valid_rootfs_cache_entry(&rootfs).await? {
-            debug!(rootfs = %rootfs.display(), "reusing cached rootfs");
+            info!(image, rootfs = %rootfs.display(), "reusing cached rootfs");
             return Ok(PulledImage {
                 config: image_config,
                 rootfs,
@@ -285,6 +288,11 @@ impl RegistryClient {
 
         async_fs::create_dir_all(layer_cache).await?;
 
+        info!(
+            image,
+            layers = manifest.layers.len(),
+            "fetching image layers"
+        );
         let blobs = self
             .fetch_layers_cached(&reference, &manifest.layers, layer_cache)
             .await?;
@@ -293,6 +301,9 @@ impl RegistryClient {
         // so a crashed build or a concurrent builder never yields a partial
         // image. A losing race just overwrites with byte-identical content.
         let tmp_rootfs = rootfs_cache.join(temp_name(&rootfs_key));
+        // Cleans up the partial EROFS image on any error or cancellation;
+        // disarmed once it has been published into the cache.
+        let tmp_guard = TempPathGuard::new(tmp_rootfs.clone());
         // Extract every layer into a staging directory (resolving ordering and
         // whiteouts), then build the EROFS image in one pass. We do NOT use
         // `mkfs.erofs --tar`: erofs-utils 1.9.x's incremental tar build corrupts
@@ -301,12 +312,20 @@ impl RegistryClient {
         // every later layer. The staging build normalizes everything to root
         // (`--all-root`), which matches the in-container root (uid 0) ownership.
         let build = build_erofs_from_staging(&blobs, staging, &tmp_rootfs).await;
+        // Staging is scratch space regardless of outcome.
+        let _ = remove_dir_if_exists(staging).await;
         if let Err(err) = build {
-            let _ = async_fs::remove_file(&tmp_rootfs).await;
-            let _ = remove_dir_if_exists(staging).await;
+            warn!(image, error = %err, "failed to build rootfs from image layers");
             return Err(err);
         }
         publish_atomic_file(&tmp_rootfs, &rootfs).await?;
+        tmp_guard.disarm();
+        info!(
+            image,
+            layers = manifest.layers.len(),
+            rootfs = %rootfs.display(),
+            "built rootfs"
+        );
 
         Ok(PulledImage {
             config: image_config,
@@ -595,14 +614,18 @@ impl RegistryClient {
         max_bytes: u64,
     ) -> Result<(), OciError> {
         let tmp = layer_cache.join(temp_name(&blob_filename(digest)?));
+        // Removes `tmp` on any early return *or* cancellation; disarmed only
+        // once the verified blob has been renamed into the cache.
+        let guard = TempPathGuard::new(tmp.clone());
         if let Err(err) = self
             .download_blob(reference, digest, &tmp, max_bytes, "layer")
             .await
         {
-            let _ = async_fs::remove_file(&tmp).await;
+            warn!(digest, error = %err, "failed to download layer blob");
             return Err(err);
         }
         async_fs::rename(&tmp, cached).await?;
+        guard.disarm();
         Ok(())
     }
 
@@ -974,6 +997,8 @@ struct GvisorConfig<'a> {
     rootfs_overlay: PathBuf,
     network_namespace: Option<PathBuf>,
     resolv_conf: Option<PathBuf>,
+    /// Extra host bind mounts (e.g. static assets like the `omniagent` binary).
+    mounts: Vec<MountSpec>,
     annotations: BTreeMap<String, String>,
 }
 
@@ -1056,6 +1081,21 @@ async fn write_gvisor_config_json(path: &Path, config: &GvisorConfig<'_>) -> Res
         "linux": linux,
         "annotations": annotations
     });
+
+    // Append any configured static bind mounts (e.g. the `omniagent` binary dir).
+    let mut config_json = config_json;
+    if let Some(mounts) = config_json.get_mut("mounts").and_then(|m| m.as_array_mut()) {
+        for mount in &config.mounts {
+            let mut options = vec!["rbind".to_string()];
+            options.push(if mount.read_only { "ro" } else { "rw" }.to_string());
+            mounts.push(json!({
+                "destination": mount.destination,
+                "type": "bind",
+                "source": mount.source,
+                "options": options,
+            }));
+        }
+    }
 
     let body = serde_json::to_vec_pretty(&config_json).map_err(OciError::Json)?;
     async_fs::write(path, body).await?;
@@ -1315,6 +1355,37 @@ fn temp_name(stem: &str) -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!(".{stem}.{}.{n}.tmp", std::process::id())
+}
+
+/// Removes a temp path on drop unless `disarm`ed. A layer download or rootfs
+/// build can be *cancelled* mid-flight — e.g. `buffer_unordered` drops the
+/// other in-flight layer futures the moment one sibling fails, so their
+/// explicit error-path cleanup never runs — which would leak partial `.tmp`
+/// files into the cache. This guard cleans them up on every exit path
+/// (error or cancellation) so only fully-downloaded, verified files remain.
+struct TempPathGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempPathGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    /// Keeps the file (the download/build succeeded and was published).
+    fn disarm(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempPathGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            // Best-effort, synchronous: Drop cannot await. A missing file
+            // (already renamed into place) is fine.
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 async fn build_erofs(source: &Path, image: &Path) -> Result<(), OciError> {
@@ -2303,6 +2374,7 @@ mod tests {
             rootfs_overlay: PathBuf::from("/tmp/rootfs-overlay"),
             network_namespace: None,
             resolv_conf: None,
+            mounts: Vec::new(),
             annotations: BTreeMap::new(),
         };
         let config_json = write_config_json(&config).await;
@@ -2332,6 +2404,7 @@ mod tests {
             rootfs_overlay: PathBuf::from("/tmp/rootfs-overlay"),
             network_namespace: Some(PathBuf::from("/run/netns/oad")),
             resolv_conf: None,
+            mounts: Vec::new(),
             annotations: BTreeMap::new(),
         };
         let config_json = write_config_json(&config).await;
@@ -2354,6 +2427,7 @@ mod tests {
             rootfs_overlay: PathBuf::from("/tmp/rootfs-overlay"),
             network_namespace: None,
             resolv_conf: None,
+            mounts: Vec::new(),
             annotations: BTreeMap::new(),
         };
         let config_json = write_config_json(&config).await;
@@ -2383,6 +2457,7 @@ mod tests {
             rootfs_overlay: PathBuf::from("/tmp/rootfs-overlay"),
             network_namespace: None,
             resolv_conf: Some(PathBuf::from("/run/omniagent/sandboxes/s/resolv.conf")),
+            mounts: Vec::new(),
             annotations: BTreeMap::new(),
         };
         let config_json = write_config_json(&config).await;
@@ -2394,5 +2469,43 @@ mod tests {
             .find(|mount| mount["destination"] == "/etc/resolv.conf")
             .unwrap();
         assert_eq!(resolv["source"], "/run/omniagent/sandboxes/s/resolv.conf");
+    }
+
+    #[tokio::test]
+    async fn spec_appends_static_bind_mounts() {
+        let config = GvisorConfig {
+            container_name: "web",
+            args: vec!["/bin/sh".to_string()],
+            env: vec![],
+            cwd: "/".to_string(),
+            rootfs: PathBuf::from("/tmp/rootfs.erofs"),
+            rootfs_overlay: PathBuf::from("/tmp/rootfs-overlay"),
+            network_namespace: None,
+            resolv_conf: None,
+            mounts: vec![MountSpec {
+                source: PathBuf::from("/opt/omniagent"),
+                destination: "/opt/omniagent".to_string(),
+                read_only: true,
+            }],
+            annotations: BTreeMap::new(),
+        };
+        let config_json = write_config_json(&config).await;
+
+        let mount = config_json["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["destination"] == "/opt/omniagent")
+            .expect("static mount present");
+        assert_eq!(mount["type"], "bind");
+        assert_eq!(mount["source"], "/opt/omniagent");
+        let options: Vec<&str> = mount["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o.as_str().unwrap())
+            .collect();
+        assert!(options.contains(&"rbind"));
+        assert!(options.contains(&"ro"));
     }
 }

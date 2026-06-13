@@ -469,6 +469,25 @@ impl ChannelHandle {
         )
         .await
     }
+
+    /// Waits until every enqueued replayable event has been written to the wire
+    /// (the per-connection delivered high-water reaches the produced high-water),
+    /// bounded by `timeout`. Used by single-session runners (e.g. `serve-session`)
+    /// that exit as soon as the session ends and must not drop the socket while
+    /// the trailing `pty_output`/`pty_exit` are still queued in the outbox.
+    pub async fn drain_to_wire(&self, timeout: Duration) {
+        let start = tokio::time::Instant::now();
+        loop {
+            let pending = {
+                let inner = self.state.inner.lock().expect("channel inner lock");
+                inner.seq > inner.sent_upto
+            };
+            if !pending || start.elapsed() >= timeout {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

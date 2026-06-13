@@ -39,7 +39,7 @@ use clap::{Args, Parser, Subcommand};
 use time::OffsetDateTime;
 use tokio::net::TcpListener;
 
-use crate::client::{ClientConfig, WorkspacePolicy};
+use crate::client::{ClientConfig, DEFAULT_REVIEW_TIMEOUT_SECS, SessionSpec, WorkspacePolicy};
 use crate::config::{ConfigStore, omniagent_config_dir};
 use crate::control::{ControlRequest, ControlResponse};
 use crate::proxy::ProxyState;
@@ -99,6 +99,10 @@ enum Command {
     /// Run the persistent daemon: host many sessions over one resilient
     /// connection and accept control commands on a local socket.
     Daemon(DaemonArgs),
+    /// Run a single agent session in the foreground, connected to the control
+    /// plane (used inside an oad sandbox by the runner). Internal.
+    #[command(hide = true)]
+    ServeSession(ServeSessionArgs),
     /// Stop a session hosted by the running daemon.
     Stop(StopArgs),
     /// Manage locally remembered central sessions.
@@ -131,6 +135,69 @@ struct DaemonArgs {
 struct StopArgs {
     /// Server session id to stop.
     session_id: String,
+}
+
+#[derive(Debug, Args)]
+struct ServeSessionArgs {
+    /// `OmniAgent` control-plane URL.
+    #[arg(long, env = "OMNIAGENT_SERVER_URL")]
+    server_url: Option<String>,
+
+    /// Per-session scoped token minted by the control plane (or a dev token).
+    #[arg(long, env = "OMNIAGENT_SESSION_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+
+    /// Pre-created server session id to resume/bind to.
+    #[arg(long)]
+    session_id: Option<String>,
+
+    /// Agent to run (`claude`/`codex`/`gemini`).
+    #[arg(long, default_value = "claude")]
+    agent: String,
+
+    /// Working directory for the agent (the in-sandbox workspace).
+    #[arg(long, default_value = ".")]
+    cwd: PathBuf,
+
+    /// Optional human-readable session name.
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Optional model override.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Initial PTY rows (browser terminal height); falls back to the default.
+    #[arg(long)]
+    rows: Option<u16>,
+
+    /// Initial PTY cols (browser terminal width); falls back to the default.
+    #[arg(long)]
+    cols: Option<u16>,
+
+    /// Drive codex via the native `app-server` backend instead of a PTY.
+    #[arg(long)]
+    app_server: bool,
+
+    /// Disable the human review gate.
+    #[arg(long)]
+    no_review: bool,
+
+    /// Seconds to wait for a review decision (0 = wait forever).
+    #[arg(long)]
+    review_timeout_secs: Option<u64>,
+
+    /// Setup script to run before the agent (e.g. devcontainer `postStart`).
+    #[arg(long)]
+    setup_script: Option<String>,
+
+    /// Cleanup script to run after the agent exits.
+    #[arg(long)]
+    cleanup_script: Option<String>,
+
+    /// Extra args appended to the agent's resolved launch command.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    custom_command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -243,6 +310,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Setup(args) => setup(args).await,
         Command::Login(args) => login(args),
         Command::Daemon(args) => run_daemon_cmd(cli.bind, args, trace_path).await,
+        Command::ServeSession(args) => run_serve_session_cmd(cli.bind, args).await,
         Command::Stop(args) => stop_via_daemon(args).await,
         Command::Sessions(args) => sessions(&args).await,
         Command::Workspaces(args) => workspaces(&args).await,
@@ -696,6 +764,50 @@ async fn run_daemon_cmd(bind: IpAddr, args: DaemonArgs, trace_path: Option<PathB
         policy,
     )
     .await
+}
+
+/// `omniagent serve-session`: run a single agent session in the foreground,
+/// connected directly to the control plane. Used inside an oad sandbox by the
+/// runner; exits with the agent's exit code once the session finalizes.
+async fn run_serve_session_cmd(bind: IpAddr, args: ServeSessionArgs) -> Result<()> {
+    let server_url = args.server_url.context(
+        "missing OmniAgent control-plane URL; pass --server-url or set OMNIAGENT_SERVER_URL",
+    )?;
+    let token = args
+        .token
+        .context("missing session token; pass --token or set OMNIAGENT_SESSION_TOKEN")?;
+
+    let spec = SessionSpec {
+        agent: args.agent,
+        custom_command: args.custom_command,
+        cwd: args.cwd,
+        name: args.name,
+        session_id: args.session_id,
+        bind,
+        proxy_port: 0,
+        no_review: args.no_review,
+        review_timeout_secs: args
+            .review_timeout_secs
+            .unwrap_or(DEFAULT_REVIEW_TIMEOUT_SECS),
+        // Spans are uploaded as the `raw_requests` artifact from memory at close;
+        // an on-disk archive isn't needed inside the disposable sandbox.
+        trace_path: None,
+        app_server: args.app_server,
+        model: args.model,
+        workspace: None,
+        branch: None,
+        create_worktree: false,
+        worktree: None,
+        base_branch: None,
+        setup_script: args.setup_script,
+        cleanup_script: args.cleanup_script,
+        // Both must be present to set an explicit initial size; otherwise the
+        // PTY uses the default and the browser's resize corrects it.
+        pty_size: args.rows.zip(args.cols),
+    };
+
+    let code = client::run_serve_session(ClientConfig { server_url, token }, spec).await?;
+    std::process::exit(code);
 }
 
 /// `omniagent stop`: ask the daemon to stop a session.

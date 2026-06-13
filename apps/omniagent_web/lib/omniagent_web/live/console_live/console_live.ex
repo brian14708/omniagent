@@ -13,11 +13,15 @@ defmodule OmniagentWeb.ConsoleLive do
     ClientCommands,
     Daemons,
     Events,
+    OadInstances,
+    OadWorkspaces,
     Payload,
     Reviews,
     Sessions,
     Traces
   }
+
+  alias Omniagent.Oad
 
   @impl true
   def mount(_params, _session, socket) do
@@ -26,6 +30,9 @@ defmodule OmniagentWeb.ConsoleLive do
     if connected?(socket) and user do
       Events.subscribe_user(user.id)
       Events.subscribe_daemons()
+      # oad instances register/expire out of band (HTTP heartbeat), so poll for
+      # the live set rather than relying on a push.
+      Process.send_after(self(), :refresh_oad, 30_000)
     end
 
     {:ok,
@@ -33,6 +40,16 @@ defmodule OmniagentWeb.ConsoleLive do
      |> assign(:current_user, user)
      |> assign(:sessions, list_sessions(user))
      |> assign(:daemons, Daemons.list())
+     |> assign(:oad_instances, OadInstances.list_live())
+     |> assign(:oad_workspaces, OadWorkspaces.list())
+     |> assign(:oad_build_log, [])
+     |> assign(:show_oad_build, false)
+     |> assign(:oad_build_name, nil)
+     |> assign(:oad_build_status, nil)
+     |> assign(:show_oad_agent, false)
+     |> assign(:oad_agent_workspace, nil)
+     |> assign(:term_size, nil)
+     |> assign(:show_new_oad_workspace, false)
      |> assign(:session, nil)
      |> assign(:subscribed_id, nil)
      |> assign(:reviews, [])
@@ -85,7 +102,9 @@ defmodule OmniagentWeb.ConsoleLive do
 
   def handle_event("resize", %{"rows" => rows, "cols" => cols}, socket) do
     send_command(socket, "pty_resize", %{"rows" => rows, "cols" => cols})
-    {:noreply, socket}
+    # Remember the browser terminal size so we can (a) open new oad PTYs at the
+    # right width and (b) re-assert it when a session (re)connects.
+    {:noreply, assign(socket, :term_size, %{rows: rows, cols: cols})}
   end
 
   # ── Codex app-server conversation (relayed to the connected client) ─────────
@@ -305,6 +324,115 @@ defmodule OmniagentWeb.ConsoleLive do
     {:noreply, assign(socket, :show_new_workspace, false)}
   end
 
+  # ── oad workspaces ──────────────────────────────────────────────────────────
+
+  def handle_event("open_new_oad_workspace", _params, socket) do
+    {:noreply, assign(socket, :show_new_oad_workspace, true)}
+  end
+
+  def handle_event("close_new_oad_workspace", _params, socket) do
+    {:noreply, assign(socket, :show_new_oad_workspace, false)}
+  end
+
+  # Dismisses the build-progress modal. The build keeps running in the
+  # background (it's a supervised task); progress still updates the log.
+  def handle_event("close_oad_build", _params, socket) do
+    {:noreply, assign(socket, :show_oad_build, false)}
+  end
+
+  def handle_event("create_oad_workspace", params, socket) do
+    name = String.trim(params["name"] || "")
+    image = String.trim(params["image"] || "")
+
+    cond do
+      socket.assigns.oad_instances == [] ->
+        {:noreply, put_flash(socket, :error, "No oad instance is registered.")}
+
+      name == "" or image == "" ->
+        {:noreply, put_flash(socket, :error, "Workspace name and image are required.")}
+
+      not Regex.match?(~r/^[A-Za-z0-9._-]+$/, name) ->
+        {:noreply,
+         put_flash(socket, :error, "Name may contain only letters, digits, '.', '_', or '-'.")}
+
+      true ->
+        if connected?(socket), do: Phoenix.PubSub.subscribe(Omniagent.PubSub, "oad_build:#{name}")
+
+        Oad.Builder.build_async(%{
+          name: name,
+          image: image,
+          repo: blank_to_nil(params["repo"]),
+          git_ref: blank_to_nil(params["git_ref"])
+        })
+
+        {:noreply,
+         socket
+         |> assign(:show_new_oad_workspace, false)
+         |> open_build_modal(name, ["building #{name}…"])
+         |> put_flash(:info, "Building oad workspace #{name}…")}
+    end
+  end
+
+  def handle_event("rebuild_oad_workspace", %{"name" => name}, socket) do
+    case OadWorkspaces.get_by_name(name) do
+      nil ->
+        {:noreply, put_flash(socket, :error, "Workspace not found.")}
+
+      ws ->
+        if connected?(socket), do: Phoenix.PubSub.subscribe(Omniagent.PubSub, "oad_build:#{name}")
+
+        Oad.Builder.build_async(%{
+          name: ws.name,
+          image: ws.image,
+          repo: ws.repo,
+          git_ref: ws.git_ref,
+          workspace_folder: ws.workspace_folder,
+          oad_base_url: ws.oad_base_url
+        })
+
+        {:noreply,
+         socket
+         |> open_build_modal(name, ["rebuilding #{name}…"])
+         |> put_flash(:info, "Rebuilding #{name}…")}
+    end
+  end
+
+  # Opens the oad agent-picker modal scoped to a workspace.
+  def handle_event("open_oad_agent", %{"workspace" => name}, socket) do
+    {:noreply,
+     socket
+     |> assign(:show_oad_agent, true)
+     |> assign(:oad_agent_workspace, name)}
+  end
+
+  def handle_event("close_oad_agent", _params, socket) do
+    {:noreply, assign(socket, :show_oad_agent, false)}
+  end
+
+  def handle_event("start_oad_session", params, socket) do
+    name = params["workspace"]
+    agent = params["agent"] || "claude"
+
+    opts =
+      %{user: socket.assigns.current_user, agent: agent}
+      |> put_present(:name, params["name"])
+      |> put_present(:model, params["model"])
+      |> put_present(:custom_command, params["custom_command"])
+      |> put_term_size(socket.assigns.term_size)
+
+    case Oad.Sessions.start_session(name, opts) do
+      {:ok, _session} ->
+        {:noreply,
+         socket
+         |> assign(:show_oad_agent, false)
+         |> assign(:pending_focus, true)
+         |> put_flash(:info, "Starting #{agent} on #{name}…")}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Could not start session: #{inspect(reason)}")}
+    end
+  end
+
   def handle_event("create_workspace", params, socket) do
     %{"daemon_id" => daemon_id, "name" => name} = params
     name = String.trim(name || "")
@@ -458,6 +586,11 @@ defmodule OmniagentWeb.ConsoleLive do
             do: push_event(socket, "codex_status", %{status: session.status}),
             else: socket
 
+        # Re-assert the terminal size once the session is online: an oad client
+        # often registers after the browser's first resize (which was dropped as
+        # offline), leaving the PTY at its default width until corrected here.
+        reassert_term_size(socket, session)
+
         {:noreply, socket}
 
       true ->
@@ -467,6 +600,32 @@ defmodule OmniagentWeb.ConsoleLive do
 
   def handle_info({:session_deleted, id}, socket) do
     {:noreply, assign(socket, :sessions, Enum.reject(socket.assigns.sessions, &(&1.id == id)))}
+  end
+
+  # A streamed build log line — append only. Kept cheap (no DB query) because
+  # build steps stream their output line-by-line; status changes arrive
+  # separately via {:oad_build_done, ...}.
+  def handle_info({:oad_build, _name, message}, socket) do
+    log = [message | socket.assigns.oad_build_log] |> Enum.take(200)
+    {:noreply, assign(socket, :oad_build_log, log)}
+  end
+
+  # Terminal build status — stops the modal spinner and refreshes the workspace
+  # list once (so the row shows ready/error and its actions).
+  def handle_info({:oad_build_done, _name, status}, socket) do
+    {:noreply,
+     socket
+     |> assign(:oad_build_status, status)
+     |> assign(:oad_workspaces, OadWorkspaces.list())}
+  end
+
+  def handle_info(:refresh_oad, socket) do
+    Process.send_after(self(), :refresh_oad, 30_000)
+
+    {:noreply,
+     socket
+     |> assign(:oad_instances, OadInstances.list_live())
+     |> assign(:oad_workspaces, OadWorkspaces.list())}
   end
 
   def handle_info({:daemons_updated}, socket) do
@@ -603,6 +762,23 @@ defmodule OmniagentWeb.ConsoleLive do
     end
   end
 
+  # Pushes the known browser terminal size to an online session's client, so a
+  # freshly-registered (oad) client adopts the right PTY width. Side-effecting;
+  # returns the socket unchanged.
+  defp reassert_term_size(socket, session) do
+    case socket.assigns.term_size do
+      %{rows: rows, cols: cols} ->
+        if active?(session) do
+          ClientCommands.send_command(session.id, "pty_resize", %{"rows" => rows, "cols" => cols})
+        end
+
+      _ ->
+        :ok
+    end
+
+    socket
+  end
+
   defp offline_msg, do: "agent offline — reconnect to read changes"
 
   # Lazily fetch the data a right-pane tab needs the first time it's shown.
@@ -670,6 +846,23 @@ defmodule OmniagentWeb.ConsoleLive do
   defp list_sessions(nil), do: []
   defp list_sessions(user), do: Sessions.list_sessions(user.id)
 
+  defp blank_to_nil(value) do
+    case value && String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  # Opens the build-progress modal for `name`, seeding its log and resetting it
+  # to the building state.
+  defp open_build_modal(socket, name, log) do
+    socket
+    |> assign(:show_oad_build, true)
+    |> assign(:oad_build_name, name)
+    |> assign(:oad_build_status, "building")
+    |> assign(:oad_build_log, log)
+  end
+
   defp decide(session_id, review_id, action) do
     decision = %{"action" => action}
     Reviews.decide_review(session_id, review_id, decision)
@@ -699,6 +892,13 @@ defmodule OmniagentWeb.ConsoleLive do
 
   defp put_present(map, _key, value) when value in [nil, ""], do: map
   defp put_present(map, key, value), do: Map.put(map, key, value)
+
+  # Adds the browser terminal size to oad session opts so the agent PTY opens at
+  # the right width (avoids the agent laying out wider than the visible view).
+  defp put_term_size(opts, %{rows: rows, cols: cols}) when is_integer(rows) and is_integer(cols),
+    do: Map.merge(opts, %{rows: rows, cols: cols})
+
+  defp put_term_size(opts, _), do: opts
 
   # Maps the agent dropdown value to a canonical agent name and whether the
   # codex app-server (native) backend was requested. Unknown selections yield
@@ -787,15 +987,27 @@ defmodule OmniagentWeb.ConsoleLive do
     Enum.filter(sessions, &(active?(&1) and &1.metadata["workspace"] == path))
   end
 
+  # Active sessions running on a given oad workspace (matched on the workspace
+  # name recorded in session metadata at start). These nest under the oad
+  # workspace in the sidebar, mirroring daemon workspace sessions.
+  @doc false
+  def oad_workspace_sessions(sessions, name) do
+    Enum.filter(sessions, &(active?(&1) and &1.metadata["oad_workspace"] == name))
+  end
+
   # The "Sessions" panel: everything not nested live under a visible workspace —
   # all inactive (exited/offline) sessions plus any active session whose workspace
-  # isn't advertised by a connected daemon. Kept reachable but tucked away.
+  # isn't advertised by a connected daemon or oad workspace. Kept reachable but
+  # tucked away.
   @doc false
-  def panel_sessions(sessions, daemons) do
+  def panel_sessions(sessions, daemons, oad_workspaces) do
     paths = for d <- daemons, ws <- daemon_workspaces(d), into: MapSet.new(), do: ws["path"]
+    oad_names = for w <- oad_workspaces, into: MapSet.new(), do: w.name
 
     Enum.reject(sessions, fn session ->
-      active?(session) and MapSet.member?(paths, session.metadata["workspace"])
+      active?(session) and
+        (MapSet.member?(paths, session.metadata["workspace"]) or
+           MapSet.member?(oad_names, session.metadata["oad_workspace"]))
     end)
   end
 

@@ -19,9 +19,9 @@ config :omniagent, Omniagent.Repo,
 # watchers to your application. For example, we can use it
 # to bundle .js and .css sources.
 config :omniagent_web, OmniagentWeb.Endpoint,
-  # Binding to loopback ipv4 address prevents access from other machines.
-  # Change to `ip: {0, 0, 0, 0}` to allow access from other machines.
-  http: [ip: {127, 0, 0, 1}],
+  # Bind to `::` (IPv6 any) so the control plane is reachable from other
+  # machines; dual-stack sockets accept IPv4 connections too.
+  http: [ip: {0, 0, 0, 0, 0, 0, 0, 0}],
   check_origin: false,
   code_reloader: true,
   debug_errors: true,

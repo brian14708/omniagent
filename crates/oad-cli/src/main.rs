@@ -12,7 +12,7 @@ use oad_api::{
 };
 use oad_core::{ContainerSpec, EnvVar, SandboxRecord};
 
-use oad_cli::client::{OadClient, parse_sse_event, take_sse_frame};
+use oad_client::{OadClient, parse_sse_event, take_sse_frame};
 
 /// Command-line client for the oad sandbox daemon.
 #[derive(Debug, Parser)]

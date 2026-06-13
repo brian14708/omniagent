@@ -11,6 +11,7 @@ mod supervisor;
 pub use conn::{ChannelHandle, ControlChannelHandle, PhoenixSocket, SocketHandle};
 pub use supervisor::{
     DEFAULT_REVIEW_TIMEOUT_SECS, DaemonSupervisor, SessionSpec, SessionSummary, WorkspacePolicy,
+    run_serve_session,
 };
 
 use serde_json::{Value, json};

@@ -11,6 +11,24 @@ http_port = String.to_integer(System.get_env("PORT", "4000"))
 
 config :omniagent_web, OmniagentWeb.Endpoint, http: [port: http_port]
 
+# Shared secret oad daemons present when self-registering (`POST /api/oad/register`).
+# When unset, registration is refused (no oad instances can register).
+config :omniagent, :oad_register_token, System.get_env("OMNIAGENT_OAD_REGISTER_TOKEN")
+
+# Public base URL the control plane is reachable at from inside an oad sandbox
+# (used to point `serve-session` at the control plane). This is the same address
+# the oad daemon dials to register, so it reuses OAD_CONTROL_PLANE_URL; the
+# legacy OMNIAGENT_PUBLIC_URL still works as a fallback.
+config :omniagent,
+       :public_url,
+       System.get_env("OAD_CONTROL_PLANE_URL") || System.get_env("OMNIAGENT_PUBLIC_URL")
+
+# Token the in-sandbox `serve-session` authenticates with. For now the dev/API
+# token; a per-session scoped token replaces this in the auth PR.
+config :omniagent,
+       :oad_session_token,
+       System.get_env("OMNIAGENT_OAD_SESSION_TOKEN") || System.get_env("OMNIAGENT_DEV_TOKEN")
+
 # Cluster the control-plane nodes using Postgres LISTEN/NOTIFY for discovery
 # (libcluster_postgres). Erlang distribution is still the transport; Postgres is
 # only how nodes find each other, so no extra infra beyond the DB we already run.

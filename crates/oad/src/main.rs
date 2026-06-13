@@ -2,6 +2,7 @@ mod background_exec;
 mod config;
 mod network;
 mod observability;
+mod registration;
 mod registry;
 mod snapshots;
 
@@ -125,11 +126,28 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to bind {addr}"))?;
 
+    // Self-register with the control plane (if configured) so it can discover
+    // this instance and call our `/v1` API directly.
+    let registration = config.control_plane.clone().map(|cp| {
+        Arc::new(registration::Registration::new(
+            cp,
+            config.http.bearer_token.clone(),
+            uuid::Uuid::new_v4().to_string(),
+        ))
+    });
+    let registration_task = registration.as_ref().map(|r| Arc::clone(r).spawn());
+
     info!(%addr, "oad listening");
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("http server failed");
+    if let Some(task) = registration_task {
+        task.abort();
+    }
+    if let Some(registration) = registration {
+        registration.deregister().await;
+    }
     checkpoint_running_sandboxes_for_shutdown(&shutdown_state).await;
     shutdown_state.telemetry.shutdown().await;
     result
@@ -428,7 +446,8 @@ async fn healthz() -> Json<serde_json::Value> {
     path = "/v1/sandboxes",
     request_body = CreateSandboxRequest,
     responses(
-        (status = 201, description = "Sandbox created and running", body = SandboxResponse),
+        (status = 201, description = "Sandbox forked from a snapshot and running", body = SandboxResponse),
+        (status = 202, description = "Fresh sandbox accepted; booting asynchronously (poll GET for status)", body = SandboxResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 409, description = "Sandbox already exists", body = ErrorResponse),
@@ -440,7 +459,7 @@ async fn healthz() -> Json<serde_json::Value> {
 async fn create_sandbox(
     State(state): State<AppState>,
     Json(request): Json<CreateSandboxRequest>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<axum::response::Response, AppError> {
     let from_snapshot = request.from_snapshot.clone();
     if from_snapshot.is_none() {
         validate_containers(&request.containers)?;
@@ -465,16 +484,59 @@ async fn create_sandbox(
         )));
     }
 
-    let record = if let Some(snapshot) = from_snapshot {
-        fork_from_snapshot(&state, &id, request.network.clone(), &snapshot).await?
-    } else {
-        boot_fresh_sandbox(&state, &id, &request).await?
-    };
+    // A snapshot fork is comparatively quick (cached rootfs + checkpoint
+    // restore), so it stays synchronous and returns the running record.
+    if let Some(snapshot) = from_snapshot {
+        let record = fork_from_snapshot(&state, &id, request.network.clone(), &snapshot).await?;
+        return Ok((
+            StatusCode::CREATED,
+            Json(SandboxResponse { sandbox: record }),
+        )
+            .into_response());
+    }
+
+    // A fresh boot pulls the container image, which for a cold image over a slow
+    // registry can take minutes — far longer than a client's request timeout.
+    // Validate the network synchronously (so bad input is a 400, not an async
+    // failure), insert a Pending record so an immediate poll succeeds, then boot
+    // in the background and return 202. Clients poll GET /v1/sandboxes/{id}
+    // until the status is `running` (ready) or `error` (failed, with last_error).
+    effective_fresh_network(&state, &request)?;
+    let container_names = oad_core::container_names(&request.containers);
+    let pending = SandboxRecord::new_pending(id.clone(), container_names.clone());
+    state.registry.insert(&state.paths, pending.clone()).await?;
+
+    let boot_state = state.clone();
+    let boot_id = id.clone();
+    tokio::spawn(async move {
+        // Re-acquire the lifecycle lock inside the task (the handler's guard is
+        // released when it returns 202). The Pending record inserted above keeps
+        // the id reserved until this lock is held.
+        let _guard = boot_state.registry.acquire_lifecycle(&boot_id).await;
+        if let Err(err) = boot_fresh_sandbox(&boot_state, &boot_id, &request).await {
+            error!(id = %boot_id, error = %err, "asynchronous sandbox boot failed");
+            // boot_fresh_sandbox's cleanup removes the record on a normal
+            // failure; re-persist a terminal Error record so a polling client
+            // observes the failure rather than a 404. If a record survives (the
+            // cleanup-failure retain path already set Error with a richer
+            // message), leave it untouched.
+            if boot_state.registry.get(&boot_id).await.is_none() {
+                let mut record = SandboxRecord::new_pending(boot_id.clone(), container_names);
+                record.set_error(format!("sandbox boot failed: {err}"));
+                if let Err(persist_err) =
+                    boot_state.registry.insert(&boot_state.paths, record).await
+                {
+                    error!(id = %boot_id, error = %persist_err, "failed to persist failed sandbox state");
+                }
+            }
+        }
+    });
 
     Ok((
-        StatusCode::CREATED,
-        Json(SandboxResponse { sandbox: record }),
-    ))
+        StatusCode::ACCEPTED,
+        Json(SandboxResponse { sandbox: pending }),
+    )
+        .into_response())
 }
 
 /// Boots a sandbox fresh from its container images.
@@ -489,6 +551,7 @@ async fn boot_fresh_sandbox(
     let record = SandboxRecord::new_pending(id.clone(), container_names.clone());
     state.registry.insert(&state.paths, record).await?;
     let mut cleanup = SandboxCreateGuard::new(state, id, container_names.clone());
+    info!(id = %id, "preparing sandbox network");
 
     let network_namespace = match prepare_sandbox_network(state, id, &network).await {
         Ok(network_namespace) => network_namespace,
@@ -510,6 +573,7 @@ async fn boot_fresh_sandbox(
         return Err(err);
     }
 
+    info!(id = %id, "preparing container bundles");
     if let Err(err) = prepare_bundles(
         state,
         id,
@@ -524,6 +588,7 @@ async fn boot_fresh_sandbox(
     }
 
     cleanup.delete_containers();
+    info!(id = %id, containers = ?container_names, "starting containers");
     if let Err(err) =
         start_container_sequence(&state.paths, id, &container_names, runsc_network_mode).await
     {
@@ -534,6 +599,7 @@ async fn boot_fresh_sandbox(
     match running_record(state, id).await {
         Ok(record) => {
             cleanup.disarm();
+            info!(id = %id, "sandbox running");
             Ok(record)
         }
         Err(err) => {
@@ -776,6 +842,7 @@ async fn prepare_bundles(
                 container,
                 network_namespace,
                 resolv_conf.as_deref(),
+                &state.config.runtime.static_mounts,
             )
             .await?;
     }

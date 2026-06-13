@@ -133,6 +133,9 @@ async fn spawn_session(
         create_worktree: spawn.create_worktree,
         worktree: spawn.worktree.map(PathBuf::from),
         base_branch: spawn.base_branch,
+        setup_script: None,
+        cleanup_script: None,
+        pty_size: None,
     };
     match supervisor.spawn_session(spec).await {
         Ok(summary) => ControlResponse::Spawned(summary),
@@ -199,6 +202,9 @@ fn spawn_control_listener(supervisor: Arc<DaemonSupervisor>, bind: IpAddr, persi
                         create_worktree,
                         worktree: worktree.map(PathBuf::from),
                         base_branch,
+                        setup_script: None,
+                        cleanup_script: None,
+                        pty_size: None,
                     };
                     let supervisor = Arc::clone(&supervisor);
                     tokio::spawn(async move {

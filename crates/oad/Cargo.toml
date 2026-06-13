@@ -17,6 +17,7 @@ opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 portable-pty.workspace = true
+reqwest.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

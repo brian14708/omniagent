@@ -65,10 +65,7 @@ impl Default for Config {
 fn default_agent_commands() -> BTreeMap<String, Vec<String>> {
     let cmd = |parts: &[&str]| parts.iter().map(|s| (*s).to_string()).collect();
     BTreeMap::from([
-        (
-            "claude".to_string(),
-            cmd(&["pnpm", "dlx", "@anthropic-ai/claude-code"]),
-        ),
+        ("claude".to_string(), cmd(&["claude"])),
         ("codex".to_string(), cmd(&["codex"])),
         ("gemini".to_string(), cmd(&["gemini"])),
     ])

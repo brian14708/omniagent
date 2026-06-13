@@ -140,7 +140,91 @@
           <% end %>
         <% end %>
 
-        <% panel = panel_sessions(@sessions, @daemons) %>
+        <section class="space-y-1">
+          <div class="flex items-center gap-2 px-1 pt-1">
+            <span class="flex-none text-[11px] font-semibold uppercase tracking-wide text-[var(--faint)]">
+              oad
+            </span>
+            <span class="h-px flex-1 bg-[var(--line)]"></span>
+            <%= if @oad_instances != [] do %>
+              <button
+                type="button"
+                phx-click="open_new_oad_workspace"
+                title="Build a new oad workspace"
+                class="flex-none rounded px-1 text-[11px] uppercase tracking-wide text-[var(--faint)] hover:text-[var(--accent)]"
+              >
+                + ws
+              </button>
+            <% end %>
+          </div>
+
+          <%= if @oad_instances == [] do %>
+            <p class="px-2 py-1 font-mono text-[12px] text-[var(--faint)]">
+              no oad instance registered
+            </p>
+          <% else %>
+            <%= if @oad_workspaces == [] do %>
+              <button
+                type="button"
+                phx-click="open_new_oad_workspace"
+                class="block px-2 py-1 text-left font-mono text-[12px] text-[var(--faint)] hover:text-[var(--accent)]"
+              >
+                no workspaces — <span class="text-[var(--accent)]">build one</span>
+              </button>
+            <% else %>
+              <ul class="space-y-0.5">
+                <%= for ws <- @oad_workspaces do %>
+                  <% oad_sessions = oad_workspace_sessions(@sessions, ws.name) %>
+                  <li class="group/oadws">
+                    <div class="flex items-center gap-2 rounded-md py-1.5 pl-2 pr-2 hover:bg-[var(--panel-2)]">
+                      <.icon
+                        name="hero-folder-micro"
+                        class="size-3.5 flex-none text-[var(--faint)]"
+                      />
+                      <span class="min-w-0 flex-1 truncate text-sm text-[var(--dim)]">
+                        {ws.name}
+                        <span class="text-[11px] text-[var(--faint)]">· {ws.status}</span>
+                      </span>
+                      <%= if ws.status == "ready" do %>
+                        <button
+                          type="button"
+                          phx-click="open_oad_agent"
+                          phx-value-workspace={ws.name}
+                          title={"Run an agent on #{ws.name}"}
+                          class="flex-none text-[11px] uppercase tracking-wide text-[var(--faint)] opacity-0 hover:text-[var(--accent)] group-hover/oadws:opacity-100"
+                        >
+                          + agent
+                        </button>
+                      <% end %>
+                      <button
+                        type="button"
+                        phx-click="rebuild_oad_workspace"
+                        phx-value-name={ws.name}
+                        title="Rebuild this workspace"
+                        class="flex-none text-[11px] uppercase tracking-wide text-[var(--faint)] opacity-0 hover:text-[var(--accent)] group-hover/oadws:opacity-100"
+                      >
+                        rebuild
+                      </button>
+                    </div>
+                    <%= if oad_sessions != [] do %>
+                      <div class="mt-px space-y-px pl-5">
+                        <%= for session <- oad_sessions do %>
+                          <.session_row
+                            session={session}
+                            active_id={@session && @session.id}
+                            compact
+                          />
+                        <% end %>
+                      </div>
+                    <% end %>
+                  </li>
+                <% end %>
+              </ul>
+            <% end %>
+          <% end %>
+        </section>
+
+        <% panel = panel_sessions(@sessions, @daemons, @oad_workspaces) %>
         <%= if panel != [] do %>
           <section class="space-y-1">
             <button
@@ -777,6 +861,154 @@
           </div>
         </form>
       <% end %>
+    </div>
+  </div>
+<% end %>
+
+<%= if @show_new_oad_workspace do %>
+  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+    <div class="oa-panel w-full max-w-md p-5" phx-click-away="close_new_oad_workspace">
+      <h2 class="oa-display mb-4 text-lg font-bold">New oad workspace</h2>
+      <form phx-submit="create_oad_workspace" class="space-y-3">
+        <label class="block">
+          <span class="oa-label mb-1">Name</span>
+          <input
+            name="name"
+            class="oa-input w-full"
+            placeholder="my-project"
+            autocomplete="off"
+            required
+          />
+        </label>
+        <label class="block">
+          <span class="oa-label mb-1">Image</span>
+          <input
+            name="image"
+            class="oa-input w-full"
+            placeholder="ghcr.io/org/devcontainer:latest"
+            autocomplete="off"
+            required
+          />
+        </label>
+        <label class="block">
+          <span class="oa-label mb-1">Repository (optional)</span>
+          <input
+            name="repo"
+            class="oa-input w-full"
+            placeholder="https://github.com/org/repo.git"
+            autocomplete="off"
+          />
+        </label>
+        <label class="block">
+          <span class="oa-label mb-1">Ref (optional)</span>
+          <input name="git_ref" class="oa-input w-full" placeholder="main" autocomplete="off" />
+          <span class="mt-1 block font-mono text-[11px] text-[var(--faint)]">
+            Built on a registered oad instance and snapshotted; sessions fork from the snapshot.
+          </span>
+        </label>
+        <div class="flex justify-end gap-2 pt-2">
+          <button type="button" phx-click="close_new_oad_workspace" class="oa-btn">Cancel</button>
+          <button type="submit" class="oa-btn primary">Build workspace</button>
+        </div>
+      </form>
+    </div>
+  </div>
+<% end %>
+
+<%!-- ── oad build progress ───────────────────────────────────────────── --%>
+<%= if @show_oad_build do %>
+  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+    <div
+      class="oa-panel flex max-h-[80vh] w-full max-w-lg flex-col p-5"
+      phx-click-away="close_oad_build"
+    >
+      <div class="mb-3 flex items-center gap-2">
+        <%= cond do %>
+          <% @oad_build_status == "ready" -> %>
+            <.icon name="hero-check-circle" class="size-5 flex-none text-[var(--prov-green)]" />
+          <% @oad_build_status == "error" -> %>
+            <.icon name="hero-x-circle" class="size-5 flex-none text-[var(--prov-red)]" />
+          <% true -> %>
+            <.icon
+              name="hero-arrow-path"
+              class="size-5 flex-none animate-spin text-[var(--accent)]"
+            />
+        <% end %>
+        <h2 class="oa-display flex-1 truncate text-lg font-bold">
+          Building {@oad_build_name}
+        </h2>
+        <span class="flex-none font-mono text-[11px] uppercase tracking-wide text-[var(--faint)]">
+          {@oad_build_status}
+        </span>
+      </div>
+
+      <%!-- flex-col-reverse + newest-first log keeps the view pinned to the
+            latest line without a scroll hook. --%>
+      <div class="flex min-h-0 flex-1 flex-col-reverse overflow-y-auto rounded bg-[var(--panel-2)] px-3 py-2 font-mono text-[12px] leading-relaxed text-[var(--dim)]">
+        <%= for line <- @oad_build_log do %>
+          <div class="whitespace-pre-wrap break-words">{line}</div>
+        <% end %>
+      </div>
+
+      <%= if @oad_build_status == "error" do %>
+        <p class="mt-3 font-mono text-[11px] text-[var(--prov-red)]">
+          Build failed — see the log above.
+        </p>
+      <% end %>
+
+      <div class="mt-4 flex justify-end gap-2">
+        <button type="button" phx-click="close_oad_build" class="oa-btn">
+          {if @oad_build_status == "building", do: "Hide", else: "Close"}
+        </button>
+      </div>
+    </div>
+  </div>
+<% end %>
+
+<%!-- ── oad agent picker ─────────────────────────────────────────────── --%>
+<%= if @show_oad_agent do %>
+  <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+    <div class="oa-panel w-full max-w-md p-5" phx-click-away="close_oad_agent">
+      <h2 class="oa-display mb-4 text-lg font-bold">
+        Run agent on {@oad_agent_workspace}
+      </h2>
+      <form phx-submit="start_oad_session" class="space-y-3">
+        <input type="hidden" name="workspace" value={@oad_agent_workspace} />
+        <label class="block">
+          <span class="oa-label mb-1">Agent</span>
+          <select name="agent" class="oa-input w-full">
+            <option value="claude">claude</option>
+            <option value="codex">codex</option>
+            <option value="gemini">gemini</option>
+          </select>
+        </label>
+        <label class="block">
+          <span class="oa-label mb-1">Name (optional)</span>
+          <input name="name" class="oa-input w-full" placeholder="my session" autocomplete="off" />
+        </label>
+        <label class="block">
+          <span class="oa-label mb-1">Model (optional)</span>
+          <input
+            name="model"
+            class="oa-input w-full"
+            placeholder="defaults to the agent's model"
+            autocomplete="off"
+          />
+        </label>
+        <label class="block">
+          <span class="oa-label mb-1">Extra args (optional)</span>
+          <input
+            name="custom_command"
+            class="oa-input w-full"
+            placeholder="appended to the agent command"
+            autocomplete="off"
+          />
+        </label>
+        <div class="flex justify-end gap-2 pt-2">
+          <button type="button" phx-click="close_oad_agent" class="oa-btn">Cancel</button>
+          <button type="submit" class="oa-btn primary">Start agent</button>
+        </div>
+      </form>
     </div>
   </div>
 <% end %>

@@ -68,17 +68,43 @@ defmodule Omniagent.Sessions do
     end
   end
 
+  @doc """
+  Creates an offline session row up front (before any client connects), so the
+  control plane can hand its id to an out-of-band runner (`omniagent
+  serve-session` inside an oad sandbox) which then resumes it. The session flips
+  to `online` when that process registers/resumes.
+  """
+  def create_pending_session(user, attrs) do
+    attrs = %{
+      user_id: user.id,
+      name: attrs[:name],
+      cwd: attrs[:cwd],
+      metadata: attrs[:metadata] || %{},
+      status: "offline"
+    }
+
+    with {:ok, session} <- create_session(prune(attrs)) do
+      Events.broadcast_user(session.user_id, {:session_updated, session})
+      {:ok, session}
+    end
+  end
+
+  @doc "Merges `metadata` into a session's existing metadata map."
+  def merge_metadata(%AgentSession{} = session, metadata) when is_map(metadata) do
+    update_session(session, %{metadata: Map.merge(session.metadata || %{}, metadata)})
+  end
+
   def register_or_resume_session(user, attrs) do
     now = now()
     session_id = blank_to_nil(Payload.fetch(attrs, :session_id))
+    incoming_metadata = Payload.fetch(attrs, :metadata) || %{}
 
-    attrs = %{
+    base = %{
       user_id: user.id,
       name: Payload.fetch(attrs, :name),
       cwd: Payload.fetch(attrs, :cwd),
       argv: Payload.fetch(attrs, :argv),
       client_id: Payload.fetch(attrs, :client_id),
-      metadata: Payload.fetch(attrs, :metadata),
       status: "online",
       connected_at: now,
       disconnected_at: nil
@@ -87,11 +113,18 @@ defmodule Omniagent.Sessions do
     result =
       if session_id do
         case get_user_session(user.id, session_id) do
-          nil -> {:error, :not_found}
-          session -> update_session(session, attrs)
+          nil ->
+            {:error, :not_found}
+
+          session ->
+            # Preserve control-plane metadata the client doesn't echo back (e.g.
+            # oad_workspace, set when the session was pre-created) by merging the
+            # client's metadata over the existing map rather than replacing it.
+            metadata = Map.merge(session.metadata || %{}, incoming_metadata)
+            update_session(session, Map.put(base, :metadata, metadata))
         end
       else
-        create_session(attrs)
+        create_session(Map.put(base, :metadata, incoming_metadata))
       end
 
     with {:ok, session} <- result do

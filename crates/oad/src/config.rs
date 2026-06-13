@@ -2,14 +2,15 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use oad_core::{
-    DaemonConfig, HttpConfig, ManagedNetworkBackend, NetworkRuntimeConfig, ObservabilityConfig,
-    RuntimeConfig,
+    ControlPlaneConfig, DaemonConfig, HttpConfig, ManagedNetworkBackend, MountSpec,
+    NetworkRuntimeConfig, ObservabilityConfig, RuntimeConfig,
 };
 use serde::Deserialize;
 
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
-const DEFAULT_BASE_DIR: &str = "/run/omniagent";
+const DEFAULT_BASE_DIR: &str = "/var/lib/omniagent";
 const DEFAULT_PAUSE_IMAGE: &str = "registry.k8s.io/pause:3.10";
+const DEFAULT_OMNIAGENT_PATH: &str = "/opt/omniagent/bin/omniagent";
 
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
@@ -17,6 +18,17 @@ struct FileConfig {
     http: FileHttpConfig,
     #[serde(default)]
     runtime: FileRuntimeConfig,
+    #[serde(default)]
+    control_plane: FileControlPlaneConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileControlPlaneConfig {
+    url: Option<String>,
+    register_token: Option<String>,
+    advertise_url: Option<String>,
+    name: Option<String>,
+    omniagent_path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -34,6 +46,8 @@ struct FileRuntimeConfig {
     network: FileNetworkRuntimeConfig,
     #[serde(default)]
     observability: FileObservabilityConfig,
+    #[serde(default)]
+    static_mounts: Vec<MountSpec>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -77,14 +91,14 @@ pub async fn load_config(path: Option<PathBuf>) -> Result<DaemonConfig> {
         bail!("missing bearer token; set http.bearer_token or OAD_BEARER_TOKEN");
     }
 
+    let bind = file_config
+        .http
+        .bind
+        .unwrap_or_else(|| DEFAULT_BIND.to_string());
+    let control_plane = resolve_control_plane_config(&file_config.control_plane, &bind)?;
+
     Ok(DaemonConfig {
-        http: HttpConfig {
-            bind: file_config
-                .http
-                .bind
-                .unwrap_or_else(|| DEFAULT_BIND.to_string()),
-            bearer_token,
-        },
+        http: HttpConfig { bind, bearer_token },
         runtime: RuntimeConfig {
             base_dir: file_config
                 .runtime
@@ -97,8 +111,41 @@ pub async fn load_config(path: Option<PathBuf>) -> Result<DaemonConfig> {
             network_namespace: file_config.runtime.network_namespace,
             network,
             observability,
+            static_mounts: file_config.runtime.static_mounts,
         },
+        control_plane,
     })
+}
+
+/// Builds the control-plane registration config, or `None` when no control-plane
+/// URL is configured. A URL without a register token is an error.
+fn resolve_control_plane_config(
+    file: &FileControlPlaneConfig,
+    bind: &str,
+) -> Result<Option<ControlPlaneConfig>> {
+    let Some(url) = file.url.clone().filter(|u| !u.is_empty()) else {
+        return Ok(None);
+    };
+    let register_token = file
+        .register_token
+        .clone()
+        .filter(|t| !t.is_empty())
+        .context("control_plane.url is set but control_plane.register_token is missing")?;
+    let advertise_url = file
+        .advertise_url
+        .clone()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| format!("http://{bind}"));
+    Ok(Some(ControlPlaneConfig {
+        url,
+        register_token,
+        advertise_url,
+        name: file.name.clone(),
+        omniagent_path: file
+            .omniagent_path
+            .clone()
+            .unwrap_or_else(|| DEFAULT_OMNIAGENT_PATH.to_string()),
+    }))
 }
 
 fn resolve_network_config(config: &FileConfig) -> Result<NetworkRuntimeConfig> {
@@ -164,8 +211,10 @@ fn host_dns_upstream() -> Option<String> {
     })
 }
 
-/// Default base directory when none is configured. The daemon runs privileged
-/// and writes runtime state under `/run`.
+/// Default base directory when none is configured. The daemon writes
+/// persistent state (sandbox records, the OCI layer/rootfs cache, snapshots)
+/// here, so it lives under `/var/lib` to survive reboots — `/run` is tmpfs and
+/// would discard the cache on every boot.
 fn default_base_dir() -> PathBuf {
     PathBuf::from(DEFAULT_BASE_DIR)
 }
@@ -233,7 +282,53 @@ fn apply_env_overrides(config: &mut FileConfig) -> Result<()> {
         config.runtime.observability.enabled =
             Some(parse_bool_env("OAD_OBSERVABILITY_ENABLED", &value)?);
     }
+    if let Ok(value) = std::env::var("OAD_STATIC_MOUNT") {
+        config
+            .runtime
+            .static_mounts
+            .push(parse_static_mount(&value)?);
+    }
+    if let Ok(value) = std::env::var("OAD_CONTROL_PLANE_URL") {
+        config.control_plane.url = Some(value);
+    }
+    if let Ok(value) = std::env::var("OAD_CONTROL_PLANE_TOKEN") {
+        config.control_plane.register_token = Some(value);
+    }
+    if let Ok(value) = std::env::var("OAD_ADVERTISE_URL") {
+        config.control_plane.advertise_url = Some(value);
+    }
+    if let Ok(value) = std::env::var("OAD_INSTANCE_NAME") {
+        config.control_plane.name = Some(value);
+    }
+    if let Ok(value) = std::env::var("OAD_OMNIAGENT_PATH") {
+        config.control_plane.omniagent_path = Some(value);
+    }
     Ok(())
+}
+
+/// Parses an `OAD_STATIC_MOUNT` value `SRC:DST[:ro|:rw]` (read-only default).
+fn parse_static_mount(value: &str) -> Result<MountSpec> {
+    let parts: Vec<&str> = value.splitn(3, ':').collect();
+    let (source, destination, read_only) = match parts.as_slice() {
+        [src, dst] => (*src, *dst, true),
+        [src, dst, mode] => {
+            let read_only = match mode.to_ascii_lowercase().as_str() {
+                "ro" => true,
+                "rw" => false,
+                _ => bail!("OAD_STATIC_MOUNT mode must be ro or rw, got {mode:?}"),
+            };
+            (*src, *dst, read_only)
+        }
+        _ => bail!("OAD_STATIC_MOUNT must be SRC:DST[:ro|:rw], got {value:?}"),
+    };
+    if source.is_empty() || destination.is_empty() {
+        bail!("OAD_STATIC_MOUNT source and destination must be non-empty");
+    }
+    Ok(MountSpec {
+        source: PathBuf::from(source),
+        destination: destination.to_string(),
+        read_only,
+    })
 }
 
 fn parse_bool_env(name: &str, value: &str) -> Result<bool> {
@@ -249,7 +344,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_base_dir_is_run_omniagent() {
-        assert_eq!(default_base_dir(), PathBuf::from(DEFAULT_BASE_DIR));
+    fn default_base_dir_is_var_lib_omniagent() {
+        assert_eq!(default_base_dir(), PathBuf::from("/var/lib/omniagent"));
     }
 }
